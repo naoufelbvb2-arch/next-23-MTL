@@ -1,34 +1,50 @@
 """
-test_suite.py
+tests/test_suite.py
 Strict verification suite ensuring:
-1. Zero usage of autograd / backward() in codebase and runtime.
+1. Zero usage of autograd / backward() across all organized packages (engine/, models/, benchmarks/, train_eval.py).
 2. Purely local 3-Spring-Law updates with (w, w0, k) state tuple and Top-K sparsity.
 3. Production Freeze cleanly discards w and k and retains only W_final = W_0.
 4. Pass/Fail Gate: Generative error drops to 0.0 and 100% Exact-Match accuracy on all 12 Arabic sentences.
 """
 import ast
+import os
 import pathlib
+import sys
 import unittest
 import torch
 
-from engine.spring_layer import SpringLayer
-from engine.dfa_router import DFARouter
-from engine.causal_context import CausalContext
-from model import SpringGenerativeNetwork
+# Add project root to sys.path so `python tests/test_suite.py` or `pytest` resolves packages cleanly
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from engine import SpringLayer, DFARouter, CausalContext, DynamicSpringLayer, SparseCausalAttention
+from models import (
+    SpringGenerativeNetwork,
+    SpringGenerativeNetworkV2,
+    DynamicSpringGenerativeNetwork,
+    ContinuousSpringNetwork,
+)
 from train_eval import ARABIC_CORPUS, build_dataset, train_and_evaluate
 
 
 class TestSpringMVPArchitecture(unittest.TestCase):
     def test_01_no_autograd_or_backward_in_source(self):
-        """Verify that no project source file invokes .backward() or torch.autograd.backward."""
-        root = pathlib.Path(__file__).resolve().parent
-        source_files = [
-            root / "engine" / "spring_layer.py",
-            root / "engine" / "dfa_router.py",
-            root / "engine" / "causal_context.py",
-            root / "model.py",
-            root / "train_eval.py",
+        """
+        Scan all Python source files across engine/, models/, benchmarks/, and train_eval.py
+        via AST to guarantee zero calls to .backward() or .grad().
+        """
+        scan_dirs = [
+            PROJECT_ROOT / "engine",
+            PROJECT_ROOT / "models",
+            PROJECT_ROOT / "benchmarks",
         ]
+        source_files = [PROJECT_ROOT / "train_eval.py"]
+        for d in scan_dirs:
+            source_files.extend(sorted(d.glob("*.py")))
+
+        self.assertGreaterEqual(len(source_files), 15, "Expected at least 15 Python files scanned")
+
         for file_path in source_files:
             content = file_path.read_text(encoding="utf-8")
             tree = ast.parse(content, filename=str(file_path))

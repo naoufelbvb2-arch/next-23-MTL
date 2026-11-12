@@ -5,7 +5,7 @@ tracking generative error, spring stiffness evolution, and verifying 100% Exact-
 generation after Production Freeze (W_final = W_0, discarding w and k).
 """
 import torch
-from model import SpringGenerativeNetwork
+from models import SpringGenerativeNetwork
 
 # Section 3: Structured Arabic Corpus (12 sentences, 3 words each)
 ARABIC_CORPUS = [

@@ -3,11 +3,11 @@
 
 *A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Sparse Causal Attention, and Dynamic Neurogenesis*
 
-[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(AST%20Verified)-success)](./test_suite.py)
-[![Exact Match Accuracy](https://img.shields.io/badge/Exact%20Match%20(W0%20Freeze)-100.00%25-brightgreen)](./RESEARCH_PAPER_SS_ENN.md)
+[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(AST%20Verified)-success)](./tests/test_suite.py)
+[![Exact Match Accuracy](https://img.shields.io/badge/Exact%20Match%20(W0%20Freeze)-100.00%25-brightgreen)](./docs/RESEARCH_PAPER_SS_ENN.md)
 [![Continual Retention](https://img.shields.io/badge/Zero--Replay%20Retention-100.00%25-blue)](./benchmarks/bench_continual.py)
 [![Self-Sizing Capacity Saved](https://img.shields.io/badge/Dormant%20Pruning%20Saved-56.2%25--62.5%25-orange)](./benchmarks/bench_neurogenesis.py)
-[![Python 3.12 | PyTorch](https://img.shields.io/badge/Python-3.12%20%7C%20PyTorch-informational)](https://pytorch.org/)
+[![Python 3.12 | PyTorch](https://img.shields.io/badge/Python-3.12%20%7C%20PyTorch-informational)](./requirements.txt)
 
 ---
 
@@ -70,45 +70,54 @@
 
 ```text
 next-23-MTL/
-├── engine/
-│   ├── __init__.py                 # Engine module exports
-│   ├── spring_layer.py             # Core 3-parameter spring synapse (w, w0, k) & Top-K WTA
-│   ├── dfa_router.py               # Fixed Random Direct Feedback Alignment (B^(l) matrices)
-│   ├── causal_context.py           # Autoregressive causal context processor
-│   ├── sparse_attention.py         # Zero-autograd Sparse Causal Self-Attention (Top-K = 3..5)
-│   └── dynamic_spring_layer.py     # Dormant reserve pool, frustration trigger & pruning
-├── benchmarks/
-│   ├── corpus_data.py              # Tiered Arabic corpora (12, 25, 50, 100 sentences & 8 paragraphs)
-│   ├── bench_capacity.py           # Benchmark 1: Capacity & saturation stress test
-│   ├── bench_continual.py          # Benchmark 2: Two-phase zero-replay continual learning
-│   ├── bench_sparse_attention.py   # Benchmark 3: Long-range 6-word dependency disambiguation
-│   ├── bench_neurogenesis.py       # Phase 1 Maturity: Self-sizing topology (32 -> 56 cells)
-│   └── bench_continuous_stream.py  # Phase 2 Maturity: Continuous paragraphs & 17-word free rollout
-├── model.py                        # Base SpringGenerativeNetwork (MVP)
-├── model_v2.py                     # SpringGenerativeNetworkV2 (with SparseCausalAttention)
-├── model_dynamic.py                # DynamicSpringGenerativeNetwork (with Dormant Reserve)
-├── model_continuous.py             # ContinuousSpringNetwork (Hybrid ALiBi + Attention + Dynamic Pool)
-├── train_eval.py                   # MVP training loop & W0 production freeze verification
-├── test_suite.py                   # Strict unit & AST Zero-Autograd verification suite
-├── SPEC_SPRING_MVP.md              # Core mathematical & architectural specification
-├── PAPER_SS_ENN.md                 # Full technical research paper (Arabic/English)
-├── RESEARCH_PAPER_SS_ENN.md        # Comprehensive equations, empirical tables & reproducibility guide
-└── LIMITATIONS_AND_V2_ROADMAP.md   # Critical scaling analysis & SS-ENN v2.0 execution roadmap
+├── engine/                           # النواة الفيزيائية والرياضية (الطبقات والتوجيه)
+│   ├── __init__.py
+│   ├── spring_layer.py               # Core 3-parameter spring synapse (w, w0, k) & Top-K WTA
+│   ├── dynamic_spring_layer.py       # Dormant reserve pool, frustration trigger & pruning
+│   ├── sparse_attention.py           # Zero-autograd Sparse Causal Self-Attention (Top-K = 3..5)
+│   ├── dfa_router.py                 # Fixed Random Direct Feedback Alignment (B^(l) matrices)
+│   └── causal_context.py             # Autoregressive causal context processor
+├── models/                           # حزمة النماذج المعزولة
+│   ├── __init__.py
+│   ├── model_mvp.py                  # Base SpringGenerativeNetwork (MVP)
+│   ├── model_v2_attn.py              # SpringGenerativeNetworkV2 (with SparseCausalAttention)
+│   ├── model_dynamic.py              # DynamicSpringGenerativeNetwork (with Dormant Reserve)
+│   └── model_continuous.py           # ContinuousSpringNetwork (Hybrid ALiBi + Attention + Dynamic Pool)
+├── benchmarks/                       # حزمة التجارب المعملية والبيانات
+│   ├── __init__.py
+│   ├── corpus_data.py                # Tiered Arabic corpora (12, 25, 50, 100 sentences & 8 paragraphs)
+│   ├── bench_capacity.py             # Benchmark 1: Capacity & saturation stress test
+│   ├── bench_continual.py            # Benchmark 2: Two-phase zero-replay continual learning
+│   ├── bench_sparse_attention.py     # Benchmark 3: Long-range 6-word dependency disambiguation
+│   ├── bench_neurogenesis.py         # Phase 1 Maturity: Self-sizing topology (32 -> 56 cells)
+│   └── bench_continuous_stream.py    # Phase 2 Maturity: Continuous paragraphs & 17-word free rollout
+├── tests/                            # حزمة التحقق الصارم وفحص AST
+│   ├── __init__.py
+│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite
+├── docs/                             # الأوراق البحثية والمواصفات وخارطة الطريق
+│   ├── RESEARCH_PAPER_SS_ENN.md      # Full technical paper, equations, empirical tables & reproducibility
+│   ├── LIMITATIONS_AND_V2_ROADMAP.md # Critical scaling analysis & SS-ENN v2.0 execution roadmap
+│   └── SPEC_SPRING_MVP.md            # Core mathematical & architectural specification
+├── .gitignore
+├── requirements.txt                  # اعتماديات المشروع (torch>=2.0.0, pytest>=7.0.0)
+├── train_eval.py                     # نقطة التشغيل السريع للنواة (MVP)
+└── README.md                         # الواجهة الرسمية للمستودع
 ```
 
 ---
 
 ## التشغيل السريع وإعادة الإنتاج | Quick Start & Reproducibility
 
-### 1. استنساخ المستودع (Clone Repository)
+### 1. استنساخ المستودع وتثبيت المتطلبات (Clone & Install)
 ```bash
 git clone https://github.com/naoufelbvb2-arch/next-23-MTL.git
 cd next-23-MTL
+pip install -r requirements.txt
 ```
 
 ### 2. تشغيل حزمة التحقق الصارم وفحص AST (Run Verification Suite)
 ```bash
-python test_suite.py
+python tests/test_suite.py
 python train_eval.py
 ```
 
@@ -134,10 +143,9 @@ python benchmarks/bench_continuous_stream.py
 
 ## التوثيق العلمي وخارطة الطريق | Research Documentation & v2.0 Roadmap
 
-- **[التوثيق البحثي الشامل ودليل إعادة الإنتاج (`RESEARCH_PAPER_SS_ENN.md`)](./RESEARCH_PAPER_SS_ENN.md):** الاشتقاق النظري لقوانين النابض الثلاثة، معادلات التوجيه المباشر (`DFA`)، جداول النتائج الرقمية الكاملة، ودليل إعادة الإنتاج.
-- **[الورقة البحثية التقنية (`PAPER_SS_ENN.md`)](./PAPER_SS_ENN.md):** النص الأكاديمي الكامل لمعمارية `SS-ENN v1.0` وتحليل الظواهر الفيزيائية المرصودة.
-- **[وثيقة الحدود المعمارية وخارطة طريق الإصدار الثاني (`LIMITATIONS_AND_V2_ROADMAP.md`)](./LIMITATIONS_AND_V2_ROADMAP.md):** مراجعة نقدية شاملة للسبع عقبات القياسية نحو نماذج `1B` (التعميم التركيبي، تخفيف إشارة `DFA` في القواميس الضخمة، التضمين الموضعي، طور النوم وإعادة تدوير الخلايا، والتفرق الكتلي المتوافق مع `GPU`).
-- **[مواصفات النواة الأساسية (`SPEC_SPRING_MVP.md`)](./SPEC_SPRING_MVP.md):** وثيقة المواصفات الأولية والقيود الصارمة للنظام.
+- **[الورقة البحثية المتكاملة (`docs/RESEARCH_PAPER_SS_ENN.md`)](./docs/RESEARCH_PAPER_SS_ENN.md):** الاشتقاق النظري لقوانين النابض الثلاثة، معادلات التوجيه المباشر (`DFA`)، جداول النتائج الرقمية الكاملة، وتحليل ظاهرة التشكيل الذاتي المعماري.
+- **[وثيقة الحدود المعمارية وخارطة طريق الإصدار الثاني (`docs/LIMITATIONS_AND_V2_ROADMAP.md`)](./docs/LIMITATIONS_AND_V2_ROADMAP.md):** مراجعة نقدية شاملة للسبع عقبات القياسية نحو نماذج `1B` (التعميم التركيبي، تخفيف إشارة `DFA` في القواميس الضخمة، التضمين الموضعي، طور النوم وإعادة تدوير الخلايا، والتفرق الكتلي المتوافق مع `GPU`).
+- **[مواصفات النواة الأساسية (`docs/SPEC_SPRING_MVP.md`)](./docs/SPEC_SPRING_MVP.md):** وثيقة المواصفات الأولية والقيود الصارمة للنظام.
 
 ---
 

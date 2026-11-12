@@ -22,7 +22,7 @@ import torch.nn.functional as F
 # Add project root to sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model_dynamic import DynamicSpringGenerativeNetwork
+from models import DynamicSpringGenerativeNetwork
 from benchmarks.corpus_data import CORPUS_TIERS
 
 
@@ -38,9 +38,9 @@ def verify_zero_autograd_ast() -> tuple[bool, list[str]]:
         root / "engine" / "dfa_router.py",
         root / "engine" / "causal_context.py",
         root / "engine" / "sparse_attention.py",
-        root / "model.py",
-        root / "model_v2.py",
-        root / "model_dynamic.py",
+        root / "models" / "model_mvp.py",
+        root / "models" / "model_v2_attn.py",
+        root / "models" / "model_dynamic.py",
         pathlib.Path(__file__).resolve(),
     ]
     for fpath in checked_files:

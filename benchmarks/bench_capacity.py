@@ -14,7 +14,7 @@ import torch.nn.functional as F
 # Add project root to sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model import SpringGenerativeNetwork
+from models import SpringGenerativeNetwork
 from engine.dfa_router import DFARouter
 from benchmarks.corpus_data import CORPUS_TIERS
 

@@ -24,7 +24,7 @@ import torch.nn.functional as F
 # Add project root to sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model_continuous import ContinuousSpringNetwork
+from models import ContinuousSpringNetwork
 from benchmarks.corpus_data import CONTINUOUS_PARAGRAPHS_CORPUS
 
 
@@ -36,10 +36,10 @@ def verify_all_files_zero_autograd() -> tuple[bool, list[str]]:
         root / "engine" / "dfa_router.py",
         root / "engine" / "causal_context.py",
         root / "engine" / "sparse_attention.py",
-        root / "model.py",
-        root / "model_v2.py",
-        root / "model_dynamic.py",
-        root / "model_continuous.py",
+        root / "models" / "model_mvp.py",
+        root / "models" / "model_v2_attn.py",
+        root / "models" / "model_dynamic.py",
+        root / "models" / "model_continuous.py",
         pathlib.Path(__file__).resolve(),
     ]
     for fpath in files:

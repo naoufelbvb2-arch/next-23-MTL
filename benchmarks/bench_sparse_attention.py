@@ -21,7 +21,7 @@ import torch.nn.functional as F
 # Add project root to sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model_v2 import SpringGenerativeNetworkV2
+from models import SpringGenerativeNetworkV2
 
 
 # 12 Long Arabic Sentences (6 words each) with distant subject-predicate agreement
@@ -113,7 +113,7 @@ def verify_zero_autograd_in_v2() -> bool:
     root = pathlib.Path(__file__).resolve().parent.parent
     files = [
         root / "engine" / "sparse_attention.py",
-        root / "model_v2.py",
+        root / "models" / "model_v2_attn.py",
         pathlib.Path(__file__).resolve(),
     ]
     for fpath in files:
