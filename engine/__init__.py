@@ -4,6 +4,7 @@ from .dynamic_spring_layer import DynamicSpringLayer
 from .sparse_attention import SparseCausalAttention
 from .dfa_router import DFARouter
 from .causal_context import CausalContext
+from .tokenizer import EnglishSubwordTokenizer
 
 __all__ = [
     "SpringLayer",
@@ -11,4 +12,5 @@ __all__ = [
     "SparseCausalAttention",
     "DFARouter",
     "CausalContext",
+    "EnglishSubwordTokenizer",
 ]

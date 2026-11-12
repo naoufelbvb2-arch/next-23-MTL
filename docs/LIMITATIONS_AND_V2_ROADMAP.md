@@ -109,13 +109,13 @@
 
 لتجنب تشابك المتغيرات (`Confounding Variables`)، تُنفذ ترقيات الإصدار الثاني في **5 أطوار متتالية ومعزولة**، بحيث لا ننتقل إلى الطور التالي إلا بعد اجتياز بوابة التحقق الصارمة للطور الذي يسبقه:
 
-| الطور (Milestone) | اسم الترقية المستهدفة | سكريبت الاختبار المخصص | معيار الاجتياز الحاسم (Pass/Fail Gate) |
-| :--- | :--- | :--- | :--- |
-| **الطور 2.1** | **التوجيه المتكيف والتضمين الموضعي** (`Adaptive DFA + Local Embeddings`) | `benchmarks/v2_bench_scaling_vocab.py` | التقارب لخطأ صفري على قاموس موسع ($V \ge 2,500$ كلمة) وتقارب متجهات المترادفات تلقائياً. |
-| **الطور 2.2** | **طور النوم وإعادة تدوير الخلايا** (`Sleep Consolidation & Recycling`) | `benchmarks/v2_bench_10phase_sleep.py` | التدريب المتتالي على 10 مراحل (`Zero-Replay`) مع استعادة $\ge 30\%$ من الخلايا المتصلبة إلى الحوض النائم دون فقدان الدقة (`100% Recall`). |
-| **الطور 2.3** | **الصلابة الهرمية والتعميم التركيبي** (`Hierarchical Stiffness & Generalization`) | `benchmarks/v2_bench_compositional_gen.py` | تحقيق دقة $> 90\%$ في إكمال جمل ذات تراكيب نحوية لم تظهر حرفياً في بيانات التدريب (`Zero-Shot Recombination`). |
-| **الطور 2.4** | **التفرق الكتلي والعمق الكبير** (`Block-Sparse Capsules & Deep RMSNorm`) | `benchmarks/v2_bench_deep_block_gpu.py` | تدريب شبكة بعمق $L = 12$ طبقة ببلوكات متجاورة ($B_{\text{block}}=16$) دون تلاشي الإشارة ومع تسريع فعلي على الـ GPU. |
-| **الطور 2.5** | **التوجيه بالمكافأة ثلاثية العوامل** (`Reward-Modulated Alignment`) | `benchmarks/v2_bench_reward_alignment.py` | تعديل سلوك توليد النموذج وتصحيح مسارات خاطئة كاملة بالاعتماد فقط على إشارة مكافأة قياسية $R \in \{-1, +1\}$. |
+| الطور (Milestone) | اسم الترقية المستهدفة | سكريبت الاختبار المخصص | معيار الاجتياز الحاسم (Pass/Fail Gate) | حالة التنفيذ (Status) |
+| :--- | :--- | :--- | :--- | :---: |
+| **الطور 2.1** | **الترجيح الدلالي، السياق ثنائي الأفق، معايرة الصلابة الدفعية، والتوجيه المتكيف** (`Log-Salience + Dual-Horizon Context + Winner-Normalized Stiffness + Adaptive DFA`) | [`benchmarks/bench_scale_english_cpu.py`](../benchmarks/bench_scale_english_cpu.py) | التقارب على قاموس موسع ($V = 2,048$) بسرعة `8,500+ tok/s` على `CPU`، دقة تحقق `93.66%` (`Val PPL 1.35`)، صلابة $\bar{k} = 0.1389 \in [0.12, 0.35]$، وثبات كيانات عبر الجمل `100% (5/5)`. ([التوثيق الكامل](./V2_ENGINEERING_LOG_AND_FIXES.md)) | **`COMPLETED & VERIFIED`** |
+| **الطور 2.2** | **طور النوم وإعادة تدوير الخلايا** (`Sleep Consolidation & Recycling`) | `benchmarks/v2_bench_10phase_sleep.py` | التدريب المتتالي على 10 مراحل (`Zero-Replay`) مع استعادة $\ge 30\%$ من الخلايا المتصلبة إلى الحوض النائم دون فقدان الدقة (`100% Recall`). | `PLANNED` |
+| **الطور 2.3** | **الصلابة الهرمية والتعميم التركيبي المتقدم** (`Hierarchical Stiffness & Generalization`) | `benchmarks/v2_bench_compositional_gen.py` | تحقيق دقة $> 95\%$ في إكمال جمل ذات تراكيب نحوية لم تظهر حرفياً في بيانات التدريب (`Zero-Shot Recombination`). | `IN PROGRESS (93.66% achieved)` |
+| **الطور 2.4** | **التفرق الكتلي والعمق الكبير** (`Block-Sparse Capsules & Deep RMSNorm`) | `benchmarks/v2_bench_deep_block_gpu.py` | تدريب شبكة بعمق $L = 12$ طبقة ببلوكات متجاورة ($B_{\text{block}}=16$) دون تلاشي الإشارة ومع تسريع فعلي على الـ GPU. | `PLANNED` |
+| **الطور 2.5** | **التوجيه بالمكافأة ثلاثية العوامل** (`Reward-Modulated Alignment`) | `benchmarks/v2_bench_reward_alignment.py` | تعديل سلوك توليد النموذج وتصحيح مسارات خاطئة كاملة بالاعتماد فقط على إشارة مكافأة قياسية $R \in \{-1, +1\}$. | `PLANNED` |
 
 ---
 

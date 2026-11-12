@@ -1,12 +1,13 @@
-# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0)
+# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0 & v2.0 Milestone 2.1)
 **الشبكات العصبية المرنة ذاتية التشكيل — إطار تعلم موضعي خالٍ من الانتشار العكسي للتوليد المتسلسل والتعلم المستمر**
 
-*A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Sparse Causal Attention, and Dynamic Neurogenesis*
+*A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Dual-Horizon Sparse Causal Attention, and Dynamic Neurogenesis*
 
-[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(AST%20Verified)-success)](./tests/test_suite.py)
+[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(23%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
 [![Exact Match Accuracy](https://img.shields.io/badge/Exact%20Match%20(W0%20Freeze)-100.00%25-brightgreen)](./docs/RESEARCH_PAPER_SS_ENN.md)
-[![Continual Retention](https://img.shields.io/badge/Zero--Replay%20Retention-100.00%25-blue)](./benchmarks/bench_continual.py)
-[![Self-Sizing Capacity Saved](https://img.shields.io/badge/Dormant%20Pruning%20Saved-56.2%25--62.5%25-orange)](./benchmarks/bench_neurogenesis.py)
+[![Scaled CPU Validation](https://img.shields.io/badge/1.47M%20English%20Val%20Acc-93.66%25%20(PPL%201.35)-blueviolet)](./docs/V2_ENGINEERING_LOG_AND_FIXES.md)
+[![Entity Consistency](https://img.shields.io/badge/Cross--Sentence%20Entity%20Retention-100.00%25%20(5%2F5)-blue)](./benchmarks/bench_scale_english_cpu.py)
+[![Self-Sizing Capacity Saved](https://img.shields.io/badge/RAM%20Saved%20on%20Freeze-77.4%25%20(5.69%20MB)-orange)](./benchmarks/bench_scale_english_cpu.py)
 [![Python 3.12 | PyTorch](https://img.shields.io/badge/Python-3.12%20%7C%20PyTorch-informational)](./requirements.txt)
 
 ---
@@ -51,11 +52,11 @@
 
 ---
 
-## الحصيلة المعملية للتجارب الست | Empirical Benchmark Suite (v1.0)
+## الحصيلة المعملية للتجارب السبع | Empirical Benchmark Suite (v1.0 & v2.0 Milestone 2.1)
 
-تخضع جميع ملفات المستودع لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
+تخضع جميع ملفات المستودع (23 ملفاً برمجياً) لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
 
-| # | الاختبار المعملي (`Benchmark`) | السكريبت التنفيذي | التحدي وحجم البيانات | الأبعاد النشطة النهائية ($D_{\text{active}}$) | توفير السعة (`Dormant Saved`) | الدقة بعد التجميد ($W_0$ فقط) | النتيجة الفيزيائية البارزة |
+| # | الاختبار المعملي (`Benchmark`) | السكريبت التنفيذي | التحدي وحجم البيانات | الأبعاد النشطة النهائية ($D_{\text{active}}$) | توفير السعة / الذاكرة | الدقة بعد التجميد ($W_0$ فقط) | النتيجة الفيزيائية البارزة |
 | :-: | :--- | :--- | :--- | :--- | :---: | :---: | :--- |
 | **1** | **النواة الأساسية (Core MVP)** | [`train_eval.py`](./train_eval.py) | 12 جملة ثلاثية (36 كلمة + `<BOS>`) | `[64, 64, 64, 64]` | — | **100.00%** (12/12) | تقارب كامل للخطأ التوليدي `0.0000` عند الحقبة 25 |
 | **2** | **ضغط السعة (Capacity Stress)** | [`benchmarks/bench_capacity.py`](./benchmarks/bench_capacity.py) | $12 \to 25 \to 50$ جملة (145 مفردة) | `[64, 64, 64, 64]` | — | **100.00%** (50/50) | عدالة توزيع المسارات (`Entropy = 0.8392`، استغلال `92.6%`) |
@@ -63,6 +64,7 @@
 | **4** | **الانتباه السببي المتفرق (Sparse Attention)** | [`benchmarks/bench_sparse_attention.py`](./benchmarks/bench_sparse_attention.py) | 12 جملة طويلة (6 كلمات بعبارات وسطى متطابقة) | `[64, 64, 64, 64]` | — | **100.00%** (12/12) | فك اشتباك بعيد المدى بتركيز انتباه حتى `82.0%` على المبتدأ (`Leakage = 0.0`) |
 | **5** | **التوليد العصبي الديناميكي (Neurogenesis)** | [`benchmarks/bench_neurogenesis.py`](./benchmarks/bench_neurogenesis.py) | 100 جملة (`tier_4_ultra` - 284 مفردة) | توسع ذاتي من `32` إلى **`[56, 56, 56, 56]`** | **56.2%** (`288/512` خلية) | **100.00%** (100/100) | انهار الثابت ($D=32$) عند `52%` ($\bar{k}=0.1065$) ونجح المتوسع بإجهاد مريح ($\bar{k}=0.0092$) |
 | **6** | **السلاسل الحرة المتصلة (Continuous Rollout)** | [`benchmarks/bench_continuous_stream.py`](./benchmarks/bench_continuous_stream.py) | 8 فقرات متصلة (136 كلمة، 128 انتقالاً، 48 كلمة ربط) | توسع ذاتي من `32` إلى **`[48, 48, 48, 48]`** | **62.5%** (`320/512` خلية) | **100.00%** (8/8 فقرات) | توليد ذاتي حر لـ 17 كلمة متصلة من بادئة كلمتين فقط وفك اشتباك `48/48` كلمة ربط |
+| **7** | **المحرك المليوني وفيزياء الإصدار الثاني (`v2.0 CPU Scale-Up`)** | [`benchmarks/bench_scale_english_cpu.py`](./benchmarks/bench_scale_english_cpu.py) | 394 قصة إنجليزية (`25K+` رمز، `V=2,048`، `90% Train / 10% Unseen Val`) | توسع ذاتي من `64` إلى **`[192, 192, 192, 192]`** | **77.4% RAM Saved** (`25.13 MB -> 5.69 MB`, `1.47M` معامل) | **`93.88%` Train / `93.66%` Val** (`PPL 1.35`, `100%` ثبات الكيانات) | سرعة `8,497–12,171 tok/s` على `CPU`، صلابة $\bar{k}=0.1389$، وثبات الكيانات `5/5` عبر الجمل |
 
 ---
 
@@ -70,32 +72,37 @@
 
 ```text
 next-23-MTL/
-├── engine/                           # النواة الفيزيائية والرياضية (الطبقات والتوجيه)
+├── engine/                           # النواة الفيزيائية والرياضية (الطبقات والتوجيه والمُجزئ)
 │   ├── __init__.py
 │   ├── spring_layer.py               # Core 3-parameter spring synapse (w, w0, k) & Top-K WTA
 │   ├── dynamic_spring_layer.py       # Dormant reserve pool, frustration trigger & pruning
 │   ├── sparse_attention.py           # Zero-autograd Sparse Causal Self-Attention (Top-K = 3..5)
-│   ├── dfa_router.py                 # Fixed Random Direct Feedback Alignment (B^(l) matrices)
-│   └── causal_context.py             # Autoregressive causal context processor
-├── models/                           # حزمة النماذج المعزولة
+│   ├── dfa_router.py                 # Fixed & Adaptive Direct Feedback Alignment (B^(l) matrices)
+│   ├── causal_context.py             # Autoregressive causal context processor
+│   └── tokenizer.py                  # Hybrid English Word + BPE Subword Tokenizer (V=2048..4096)
+├── models/                           # حزمة النماذج المعزولة (v1.0 & v2.0 Scaled)
 │   ├── __init__.py
 │   ├── model_mvp.py                  # Base SpringGenerativeNetwork (MVP)
 │   ├── model_v2_attn.py              # SpringGenerativeNetworkV2 (with SparseCausalAttention)
 │   ├── model_dynamic.py              # DynamicSpringGenerativeNetwork (with Dormant Reserve)
-│   └── model_continuous.py           # ContinuousSpringNetwork (Hybrid ALiBi + Attention + Dynamic Pool)
+│   ├── model_continuous.py           # ContinuousSpringNetwork (Hybrid ALiBi + Attention + Dynamic Pool)
+│   └── model_scaled.py               # ScaledSpringNetwork (1.5M-5M Vectorized + 4 Permanent v2.0 Laws)
 ├── benchmarks/                       # حزمة التجارب المعملية والبيانات
 │   ├── __init__.py
 │   ├── corpus_data.py                # Tiered Arabic corpora (12, 25, 50, 100 sentences & 8 paragraphs)
+│   ├── english_dataset.py            # TinyStories-style connected English narrative dataset (90/10 split)
 │   ├── bench_capacity.py             # Benchmark 1: Capacity & saturation stress test
 │   ├── bench_continual.py            # Benchmark 2: Two-phase zero-replay continual learning
 │   ├── bench_sparse_attention.py     # Benchmark 3: Long-range 6-word dependency disambiguation
 │   ├── bench_neurogenesis.py         # Phase 1 Maturity: Self-sizing topology (32 -> 56 cells)
-│   └── bench_continuous_stream.py    # Phase 2 Maturity: Continuous paragraphs & 17-word free rollout
+│   ├── bench_continuous_stream.py    # Phase 2 Maturity: Continuous paragraphs & 17-word free rollout
+│   └── bench_scale_english_cpu.py    # v2.0 Milestone 2.1: Million-param CPU telemetry & 6-table audit
 ├── tests/                            # حزمة التحقق الصارم وفحص AST
 │   ├── __init__.py
-│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite
-├── docs/                             # الأوراق البحثية والمواصفات وخارطة الطريق
+│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (23 files)
+├── docs/                             # الأوراق البحثية وسجل الإصلاحات وخارطة الطريق
 │   ├── RESEARCH_PAPER_SS_ENN.md      # Full technical paper, equations, empirical tables & reproducibility
+│   ├── V2_ENGINEERING_LOG_AND_FIXES.md # Detailed v2.0 Milestone 2.1 physics upgrades & before/after audit
 │   ├── LIMITATIONS_AND_V2_ROADMAP.md # Critical scaling analysis & SS-ENN v2.0 execution roadmap
 │   └── SPEC_SPRING_MVP.md            # Core mathematical & architectural specification
 ├── .gitignore
@@ -121,7 +128,7 @@ python tests/test_suite.py
 python train_eval.py
 ```
 
-### 3. تشغيل الاختبارات المعملية الخمسة (Run All Benchmarks)
+### 3. تشغيل الاختبارات المعملية الستة (Run All v1.0 & v2.0 Benchmarks)
 ```bash
 # 1. Capacity & Saturation Benchmark (12 -> 25 -> 50 sentences)
 python benchmarks/bench_capacity.py
@@ -137,14 +144,18 @@ python benchmarks/bench_neurogenesis.py
 
 # 5. Continuous Token Streams & 17-Word Free Autoregressive Rollout (8 paragraphs)
 python benchmarks/bench_continuous_stream.py
+
+# 6. Million-Parameter CPU Scale-Up & v2.0 Core Physics Benchmark (English TinyStories)
+python benchmarks/bench_scale_english_cpu.py
 ```
 
 ---
 
 ## التوثيق العلمي وخارطة الطريق | Research Documentation & v2.0 Roadmap
 
-- **[الورقة البحثية المتكاملة (`docs/RESEARCH_PAPER_SS_ENN.md`)](./docs/RESEARCH_PAPER_SS_ENN.md):** الاشتقاق النظري لقوانين النابض الثلاثة، معادلات التوجيه المباشر (`DFA`)، جداول النتائج الرقمية الكاملة، وتحليل ظاهرة التشكيل الذاتي المعماري.
-- **[وثيقة الحدود المعمارية وخارطة طريق الإصدار الثاني (`docs/LIMITATIONS_AND_V2_ROADMAP.md`)](./docs/LIMITATIONS_AND_V2_ROADMAP.md):** مراجعة نقدية شاملة للسبع عقبات القياسية نحو نماذج `1B` (التعميم التركيبي، تخفيف إشارة `DFA` في القواميس الضخمة، التضمين الموضعي، طور النوم وإعادة تدوير الخلايا، والتفرق الكتلي المتوافق مع `GPU`).
+- **[الورقة البحثية المتكاملة (`docs/RESEARCH_PAPER_SS_ENN.md`)](./docs/RESEARCH_PAPER_SS_ENN.md):** الاشتقاق النظري لقوانين النابض الثلاثة، معادلات التوجيه المباشر (`DFA`)، التجارب السبع الكاملة، وتحليل ظاهرة التشكيل الذاتي وترشيح الضوضاء عبر نقطة الارتكاز (`Anchor Denoising Effect`).
+- **[سجل الإصلاحات والترقيات الفيزيائية للإصدار الثاني (`docs/V2_ENGINEERING_LOG_AND_FIXES.md`)](./docs/V2_ENGINEERING_LOG_AND_FIXES.md):** التوثيق الرياضي والبرمجي للقوانين الفيزيائية الأربعة في `v2.0 Milestone 2.1` (معالجة انجراف الكيانات عبر الجمل وتفتت الصلابة الدفعية) مع جداول المقارنة الستة قبل وبعد الإصلاح.
+- **[وثيقة الحدود المعمارية وخارطة طريق الإصدار الثاني (`docs/LIMITATIONS_AND_V2_ROADMAP.md`)](./docs/LIMITATIONS_AND_V2_ROADMAP.md):** مراجعة نقدية شاملة للسبع عقبات القياسية نحو نماذج `1B` ومصفوفة التقدم التنفيذية لأطوار `v2.0`.
 - **[مواصفات النواة الأساسية (`docs/SPEC_SPRING_MVP.md`)](./docs/SPEC_SPRING_MVP.md):** وثيقة المواصفات الأولية والقيود الصارمة للنظام.
 
 ---

@@ -83,6 +83,7 @@ $$\delta_j^{(l)} = \left( B^{(l)} \mathbf{e} \right)_j \odot g'\left(z_j^{(l)}\r
 | **4** | **الانتباه السببي المتفرق (Sparse Attention)**<br>[`bench_sparse_attention.py`](../benchmarks/bench_sparse_attention.py) | [`model_v2_attn.py`](../models/model_v2_attn.py) | 12 جملة طويلة (6 كلمات بعبارات وسطى متطابقة) | `[64, 64, 64, 64]` | — | **100.00%** (12/12) | فك اشتباك المبتدأ والخبر عبر 5 كلمات (`Future Leakage = 0.0`، تقارب في الحقبة 29) |
 | **5** | **التوليد العصبي (Dynamic Neurogenesis)**<br>[`bench_neurogenesis.py`](../benchmarks/bench_neurogenesis.py) | [`model_dynamic.py`](../models/model_dynamic.py) | 100 جملة (`tier_4_ultra` - 284 مفردة) | توسع ذاتي من `32` إلى **`[56, 56, 56, 56]`** | **56.2%** (`288/512` خلية) | **100.00%** (100/100) | انهار النموذج الثابت ($D=32$) عند `52%` بإجهاد $\bar{k}=0.1065$، ونجح المتوسع بإجهاد مريح $\bar{k}=0.0092$ |
 | **6** | **السلاسل المتصلة (Continuous Rollout)**<br>[`bench_continuous_stream.py`](../benchmarks/bench_continuous_stream.py) | [`model_continuous.py`](../models/model_continuous.py) | 8 فقرات متصلة (136 كلمة، 128 انتقالاً، 48 كلمة ربط) | توسع ذاتي من `32` إلى **`[48, 48, 48, 48]`** | **62.5%** (`320/512` خلية) | **100.00%** (8/8 فقرات) | توليد ذاتي حر لـ 17 كلمة متصلة من بادئة كلمتين فقط وفك اشتباك `48/48` كلمة مشتركة في 8 حقب |
+| **7** | **التكبير المليوني وفيزياء الإصدار الثاني (v2.0 CPU Scale-Up)**<br>[`bench_scale_english_cpu.py`](../benchmarks/bench_scale_english_cpu.py) | [`model_scaled.py`](../models/model_scaled.py) | `394` قصة إنجليزية (`25,000+` رمز، `V=2,048`، `90% Train / 10% Unseen Val`) | توسع ذاتي من `64` إلى **`[192, 192, 192, 192]`** | **25.0%** خلايا (**77.4%** توفير `RAM` عند التجميد) | **`93.88%` Train / `93.66%` Val** (`100%` ثبات الكيانات `5/5`) | سرعة تدريب `8,497–12,171 tok/s` على `CPU`، وصلابة متزنة $\bar{k}=0.1389$، وتفوق $W_0$ المجمدة عبر ترشيح الضوضاء |
 
 ---
 
@@ -136,24 +137,74 @@ $$\delta_j^{(l)} = \left( B^{(l)} \mathbf{e} \right)_j \odot g'\left(z_j^{(l)}\r
 
 ---
 
+### 5.4 التجربة السابعة: التكبير المليوني وترقية الفيزياء الأساسية على المدونة الإنجليزية (`Million-Parameter Scale-Up & v2.0 Core Physics — Milestone 2.1`)
+
+لاختبار قابلية التوسع الحقيقية لمعمارية **SS-ENN** على المعالج المحلي (`CPU`) وقياس التعميم التركيبي (`Compositional Generalization`) على تراكيب لم يرها النموذج أثناء التدريب، تم بناء المحرك المليوني المصفوفي ([`models/model_scaled.py`](../models/model_scaled.py)) مع مجزئ إنجليزي هجين ([`engine/tokenizer.py`](../engine/tokenizer.py)، $V=2,048$) ومدونة سردية بأسلوب `TinyStories` ([`benchmarks/english_dataset.py`](../benchmarks/english_dataset.py)، `394` فقرة مقسمة إلى `90% Train` و `10% Held-out Validation`).
+
+#### أ. القوانين الفيزيائية الأربعة المرقّاة في `v2.0 Milestone 2.1`
+1. **الترجيح اللوغاريتمي المقيّد لأهمية الرموز (`Clipped Log-Salience Weighting`):**
+   تُوزن إشارة الخطأ المحلية لكل رمز $v$ بدمج الندرة اللوغاريتمية (`IDF`) مع التواتر الموضوعي داخل الفقرة (`Intra-Document Burstiness`) ضمن النطاق $s(v) \in [0.70, 1.80]$، مما يمنع الكلمات الوظيفية والروابط (`"the"`, `"."`, `"afterward"`, `"then"`) من احتكار النوابض ويمنح الكيانات المحورية (`"rabbit"`, `"bird"`, `"squirrel"`) أولوية الحفر الميكانيكي.
+2. **مكثف السياق المستمر المحكوم بالأهمية والانتباه ثنائي الأفق (`Salience-Gated EMA Capacitor + Dual-Horizon Sparse Attention`):**
+   - يحتفظ مكثف السياق السببي $\mathbf{c}_t = (1 - \alpha(x_t))\mathbf{c}_{t-1} + \alpha(x_t)\text{Embed}(x_t)$ بهوية الفاعل المحوري عبر الجمل، حيث تفتح بوابة الشحن ($\alpha \approx 0.48$) عند الكيانات عالية الأهمية ($s(v) \ge 1.45$) وتنغلق ($\alpha \le 0.004$) عند الروابط السردية وعبارات المكان.
+   - تقسم طبقة `DualHorizonCausalAttention` مقاعد الانتباه السببي ($K_{\text{attn}}=8$, `Future Leakage = 0.0`) إلى `6` مقاعد سياقية محلية + **مقعدي ارتكاز دلالي (`2 Salient Anchor Slots`)** يقتنصان أعلى رمزين أهميةً في البادئة السببية $\tau \le t$.
+3. **معايرة التحديث والتصلب بعدد مرات الفوز الفعلي (`Winner-Count Normalized Spring & Maturity-Gated Stiffening`):**
+   يُعاير تحديث الخلية $j$ وتصلبها $\Delta k_{ji}$ بعدد مرات فوزها الفعلي $N_{\text{wins}}(j) = \sum_{n=1}^{B \cdot T} m_{n,j}$ بدلاً من القسمة العمياء على حجم الدفعة الكلي $B \times T$، مع جدول نضج تدريجي $G_{\text{maturity}}(e)$ يدفع متوسط الصلابة النهائي $\bar{k}$ للاستقرار داخل النطاق الفيزيائي المستهدف **`[0.12, 0.35]`**.
+4. **التوجيه الهبي المتكيف والمطبّع صفياً (`Row-Normalized Hebbian Feedback Alignment`):**
+   تتحدث مصفوفات بث الخطأ $B^{(l)}$ محلياً عبر $\Delta B^{(l)} \propto (\mathbf{A}^{(l)})^T \mathbf{E}^{\text{salient}}$ مع تطبيع صفّي (`F.normalize`)، وتُتلف بالكامل (`B = None`) عند التجميد النهائي `production_freeze()`.
+
+#### ب. الجداول الرقمية الستة للتجربة المليونية (`benchmarks/bench_scale_english_cpu.py`)
+
+**1. تفصيل المعاملات والذاكرة (`Parameter & RAM Footprint`):**
+| المرحلة / المؤشر | إعداد `1.5M Preset` (المنفّذ) | إعداد `5M Preset` (المرجعي) |
+| :--- | :---: | :---: |
+| المعاملات الكامنة أثناء التدريب (`Latent Max at D_max`) | `6,302,720` معامل (`25.13 MB`) | `30,955,520` معامل (`124.26 MB`) |
+| المعاملات النشطة المستيقظة قبل التجميد (`Awakened Active`) | `5,041,152` معامل (`D=[192]*4`) | ديناميكي حسب الطلب |
+| **معاملات الإنتاج المجمدة (`Frozen W0 Only`)** | **`1,469,440` معامل (`5.69 MB`)** | **`4,315,136` معامل (`16.46 MB`)** |
+| **نسبة توفير الذاكرة (`RAM Memory Saved`)** | **`77.4% saved`** | **`86.1% saved`** |
+
+**2. سرعة المعالج المحلي (`CPU Throughput & Latency`):**
+- **متوسط سرعة التدريب المصفوفي (`Vectorized Training`):** **`8,497 Tokens/sec`** (تصل في الذروة إلى **`12,171 Tokens/sec`**، بزمن `1.50s / epoch`).
+- **سرعة التقييم الدفعي بعد التجميد (`Frozen W0 Batch Inference`):** **`27,088 Tokens/sec`**.
+- **سرعة التوليد التسلسلي الحر (`Autoregressive Rollout`):** **`225.7 Tokens/sec`** (`4.43 ms/token`).
+
+**3. منحنى التقارب والتعميم وظاهرة ترشيح الضوضاء عبر نقطة الارتكاز (`Anchor Denoising Effect`):**
+| المرحلة | `Train Loss` | `Train PPL` | `Train Acc` | `Val Loss` | `Val PPL` | `Val Acc` | متوسط الصلابة $\bar{k}$ | الأبعاد النشطة |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Epoch 01** | `5.8355` | `342.23` | `20.56%` | `4.2121` | `67.50` | `37.18%` | `0.0002` | `[96, 96, 96, 96]` |
+| **Epoch 04** | `0.8972` | `2.45` | `87.80%` | `0.9370` | `2.55` | `84.26%` | `0.0378` | `[128, 128, 128, 128]` |
+| **Epoch 08** | `0.4828` | `1.62` | `91.35%` | `0.4566` | `1.58` | `91.24%` | `0.1042` | `[160, 160, 160, 160]` |
+| **Epoch 12 (Pre-Freeze $w$)** | `0.3336` | `1.40` | `92.74%` | `0.3493` | `1.42` | `93.95%` | `0.1389` | `[192, 192, 192, 192]` |
+| **`FROZEN W0` (Post-Freeze)** | **`0.2864`** | **`1.33`** | **`93.88%`** | **`0.3010`** | **`1.35`** | **`93.66%`** | **`0.1389` (`PASS`)** | **`[192, 192, 192, 192]`** |
+
+> **ظاهرة ترشيح الضوضاء عبر نقطة الارتكاز (`Anchor Denoising Effect`):**  
+> يُلاحظ في الجدول أعلاه أنه فور تنفيذ `production_freeze()` وإتلاف الأوزان اللحظية المتذبذبة $w$ للاعتماد الحصري على نقاط الارتكاز $W_0$، انخفضت الخسارة من `0.3336` إلى **`0.2864`** (`Train PPL: 1.40 -> 1.33`) وفي التحقق غير المرئي من `0.3493` إلى **`0.3010`** (`Val PPL: 1.42 -> 1.35`). يبرهن هذا تجريبياً أن معادلة انزياح الارتكاز $\Delta w_0 = \eta_0(1-k)(w-w_0)$ تعمل فيزيائياً كمرشح ترددات منخفضة (`Exponential Polyak-Ruppert Averaging Filter`) يمتص التذبذبات العابرة للدفعات الصغيرة ويحتفظ بمركز الكتلة الدلالي النقي.
+
+**4. تدقيق ثبات الكيانات عبر الجمل (`Cross-Sentence Entity Consistency Audit — 100% PASS`):**
+نجح النموذج المجمد ($W_0$ فقط) في الحفاظ على هوية الفاعل بنسبة **`100.00% (5/5 PASS — NO DRIFT)`** عبر جميع البادئات القياسية الخمس بعد عبور جسور الربط السردية `". afterward"` و `". then"` (للتفصيل الكامل راجع [`docs/V2_ENGINEERING_LOG_AND_FIXES.md`](./V2_ENGINEERING_LOG_AND_FIXES.md)).
+
+---
+
 ## 6. دليل قابلية إعادة الإنتاج والتشغيل (Reproducibility Guide)
 
 ```bash
 # 1. تثبيت المتطلبات الأساسية
 pip install -r requirements.txt
 
-# 2. تشغيل حزمة التحقق الصارم وفحص AST الشامل
+# 2. تشغيل حزمة التحقق الصارم وفحص AST الشامل (23 ملفاً برمجياً)
 python tests/test_suite.py
 
 # 3. تشغيل تجربة النواة الأساسية (MVP)
 python train_eval.py
 
-# 4. تشغيل حزمة الـ Benchmarks الخمسة بالتتابع
+# 4. تشغيل حزمة الـ Benchmarks الخمسة للإصدار الأول (v1.0)
 python benchmarks/bench_capacity.py
 python benchmarks/bench_continual.py
 python benchmarks/bench_sparse_attention.py
 python benchmarks/bench_neurogenesis.py
 python benchmarks/bench_continuous_stream.py
+
+# 5. تشغيل تجربة المحرك المليوني وترقية الفيزياء الأساسية (v2.0 Milestone 2.1 on CPU)
+python benchmarks/bench_scale_english_cpu.py
 ```
 
 ---
