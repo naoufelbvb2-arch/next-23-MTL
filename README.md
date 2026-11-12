@@ -1,7 +1,9 @@
 # Self-Sizing Elastic Neural Networks (SS-ENN)
 **شبكات النوابض المرنة ذاتية التشكيل — إطار تعلم موضعي خالٍ من الانتشار العكسي (`Zero-Autograd`) للتوليد المتسلسل والتعلم المستمر**
 
+- **التوثيق البحثي الشامل ودليل إعادة الإنتاج (Comprehensive Research & Reproducibility Doc):** [RESEARCH_PAPER_SS_ENN.md](RESEARCH_PAPER_SS_ENN.md)
 - **الورقة البحثية الكاملة (Full Technical Research Paper):** [PAPER_SS_ENN.md](PAPER_SS_ENN.md)
+- **وثيقة الحدود المعمارية وخارطة طريق الإصدار الثاني (Limitations & v2.0 Roadmap):** [LIMITATIONS_AND_V2_ROADMAP.md](LIMITATIONS_AND_V2_ROADMAP.md)
 - **المواصفات الهندسية الأساسية (Architecture Spec):** [SPEC_SPRING_MVP.md](SPEC_SPRING_MVP.md)
 
 ## بنية المستودع (Repository Structure)
