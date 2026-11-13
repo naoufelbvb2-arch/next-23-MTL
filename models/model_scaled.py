@@ -25,6 +25,13 @@ Implements the 4 Permanent v2.0 Physical Laws:
        with row-wise L2 normalization to prevent numerical blowup, and destroys B^(l)
        completely upon production_freeze().
 
+Milestone 2.4 Scaling Laws (opt-in via enable_block_sparse=True):
+  - Contiguous Block-Sparse Top-K Capsules (block_size=16) with load-balanced selection
+    and Active-Slice matrix execution [:d_active, :d_eff].
+  - Depth-Scaled Residual Highway (h^(l) = RMSNorm(h^(l-1) + (alpha_res/sqrt(L)) a_block^(l)))
+    for stable 12-layer propagation (RMS variance ratio L12/L1 ~ 1.00).
+  - Highway-Anchored Deep DFA coupling B^(l) with row-normalized W_head^T + local Hebbian trace.
+
 Strictly isolated from v1.0 models; zero autograd / zero backward().
 """
 import math
@@ -71,8 +78,10 @@ class DualHorizonCausalAttention(SparseCausalAttention):
       - 2 Salient Anchor slots (highest salience-weighted scores across the prefix 0..t)
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, vectorized_topk: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
+        self.vectorized_topk = vectorized_topk
+        self._fast_d_eff: int | None = None
         self.register_buffer("token_salience", torch.ones(self.vocab_size))
 
     @torch.no_grad()
@@ -105,33 +114,42 @@ class DualHorizonCausalAttention(SparseCausalAttention):
 
         # Dual-Horizon Top-K Selection per query step t
         if self.attn_top_k is not None and self.attn_top_k < seq_len:
-            sparse_scores = torch.full_like(scores, float("-inf"))
-            # Salience-dominated anchor ranking (strictly causal: tau <= t)
             salient_rank_scores = (4.0 * key_salience + 0.15 * scores).masked_fill(
                 ~causal_mask.unsqueeze(0), float("-inf")
             )
-            k_local = max(1, self.attn_top_k - 2)
-            k_anchor = 2
+            if self.vectorized_topk:
+                k_anchor = min(2, seq_len)
+                k_local = min(max(1, self.attn_top_k - k_anchor), seq_len)
+                sparse_scores = torch.full_like(scores, float("-inf"))
+                _, anchor_idx = torch.topk(salient_rank_scores, k=k_anchor, dim=-1)
+                sparse_scores.scatter_(-1, anchor_idx, scores.gather(-1, anchor_idx))
+                _, local_idx = torch.topk(scores, k=k_local, dim=-1)
+                sparse_scores.scatter_(-1, local_idx, scores.gather(-1, local_idx))
+                scores = sparse_scores
+            else:
+                sparse_scores = torch.full_like(scores, float("-inf"))
+                k_local = max(1, self.attn_top_k - 2)
+                k_anchor = 2
 
-            for t in range(seq_len):
-                if t + 1 <= self.attn_top_k:
-                    sparse_scores[:, t, : t + 1] = scores[:, t, : t + 1]
-                else:
-                    valid_scores = scores[:, t, : t + 1]
-                    valid_sal = salient_rank_scores[:, t, : t + 1]
+                for t in range(seq_len):
+                    if t + 1 <= self.attn_top_k:
+                        sparse_scores[:, t, : t + 1] = scores[:, t, : t + 1]
+                    else:
+                        valid_scores = scores[:, t, : t + 1]
+                        valid_sal = salient_rank_scores[:, t, : t + 1]
 
-                    # 1. Pick 2 Salient Anchor slots across prefix 0..t
-                    _, anchor_idx = torch.topk(valid_sal, k=k_anchor, dim=-1)
-                    sparse_scores[:, t, : t + 1].scatter_(
-                        -1, anchor_idx, valid_scores.gather(-1, anchor_idx)
-                    )
+                        # 1. Pick 2 Salient Anchor slots across prefix 0..t
+                        _, anchor_idx = torch.topk(valid_sal, k=k_anchor, dim=-1)
+                        sparse_scores[:, t, : t + 1].scatter_(
+                            -1, anchor_idx, valid_scores.gather(-1, anchor_idx)
+                        )
 
-                    # 2. Pick (K - 2) Local/Contextual slots
-                    _, local_idx = torch.topk(valid_scores, k=k_local, dim=-1)
-                    sparse_scores[:, t, : t + 1].scatter_(
-                        -1, local_idx, valid_scores.gather(-1, local_idx)
-                    )
-            scores = sparse_scores
+                        # 2. Pick (K - 2) Local/Contextual slots
+                        _, local_idx = torch.topk(valid_scores, k=k_local, dim=-1)
+                        sparse_scores[:, t, : t + 1].scatter_(
+                            -1, local_idx, valid_scores.gather(-1, local_idx)
+                        )
+                scores = sparse_scores
 
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = attn_weights * causal_mask.unsqueeze(0).float()
@@ -169,6 +187,14 @@ class ScaledSpringNetwork(nn.Module):
         error_threshold: float = 0.02,
         cooldown_epochs: int = 2,
         enable_hierarchical_compositional: bool = True,
+        enable_block_sparse: bool = False,
+        block_size: int = 16,
+        use_depth_scaled_highway: bool | None = None,
+        alpha_res: float = 1.35,
+        use_highway_anchored_dfa: bool | None = None,
+        dfa_anchor_blend: float = 0.65,
+        block_balance_strength: float = 0.68,
+        use_role_bridge: bool | None = None,
         seed: int = 42,
     ):
         super().__init__()
@@ -188,8 +214,40 @@ class ScaledSpringNetwork(nn.Module):
         self.eta_b = eta_b
         self.enable_neurogenesis = enable_neurogenesis
         self.enable_hierarchical_compositional = enable_hierarchical_compositional
+        self.enable_block_sparse = enable_block_sparse
+        self.block_size = max(1, int(block_size))
+        self.use_depth_scaled_highway = (
+            enable_block_sparse if use_depth_scaled_highway is None else use_depth_scaled_highway
+        )
+        self.alpha_res = float(alpha_res)
+        self.use_highway_anchored_dfa = (
+            enable_block_sparse if use_highway_anchored_dfa is None else use_highway_anchored_dfa
+        )
+        self.dfa_anchor_blend = float(dfa_anchor_blend)
+        self.block_balance_strength = float(block_balance_strength)
+        self.use_role_bridge = (
+            (enable_hierarchical_compositional and (not enable_block_sparse))
+            if use_role_bridge is None
+            else use_role_bridge
+        )
         self.frozen = False
         self.current_epoch = 1
+        self._fast_d_eff: int | None = None
+
+        if self.enable_block_sparse:
+            # Align dimensions strictly to integer multiples of capsule block_size
+            self.d_max = max(
+                self.block_size,
+                ((self.d_max + self.block_size - 1) // self.block_size) * self.block_size,
+            )
+            self.d_initial = max(
+                self.block_size,
+                min(self.d_max, (self.d_initial // self.block_size) * self.block_size),
+            )
+            self.delta_d = max(
+                self.block_size,
+                ((self.delta_d + self.block_size - 1) // self.block_size) * self.block_size,
+            )
 
         # Law 1: Clipped Log-Salience Vector s(v) in [0.70, 1.80]
         self.register_buffer("token_salience", torch.ones(self.vocab_size))
@@ -209,6 +267,7 @@ class ScaledSpringNetwork(nn.Module):
             eta_0=eta_0,
             gamma=gamma,
             beta_k=beta_k,
+            vectorized_topk=self.enable_block_sparse,
             seed=seed,
         )
 
@@ -239,10 +298,12 @@ class ScaledSpringNetwork(nn.Module):
         alibi_sliding = alibi_sliding / alibi_sliding.sum(dim=-1, keepdim=True).clamp(min=1e-6)
         self.register_buffer("alibi_sliding_weights", alibi_sliding)
 
-        # Milestone 2.3: Hierarchical Top-K & Stiffness Spectrum across network depth
+        # Milestone 2.3 & 2.4: Hierarchical Top-K (element/block) & Stiffness Spectrum across depth
         half_layers = max(1, self.num_layers // 2)
         wide_k = min(self.d_max, int(math.floor(1.5 * self.top_k)))
+        n_max_blocks = max(1, self.d_max // self.block_size)
         self.hierarchical_top_ks: list[int] = []
+        self.hierarchical_top_k_blocks: list[int] = []
         self.layer_stiff_multipliers: list[float] = []
         self.layer_stiff_ceilings: list[float] = []
         for l_idx in range(self.num_layers):
@@ -252,7 +313,11 @@ class ScaledSpringNetwork(nn.Module):
                 denom = max(self.num_layers - half_layers, 1)
                 t_pos = float(l_idx - half_layers + 1) / float(denom)
                 k_l = int(round(wide_k - t_pos * float(wide_k - self.top_k)))
-            self.hierarchical_top_ks.append(max(4, min(self.d_max, k_l)))
+            k_clamped = max(4, min(self.d_max, k_l))
+            self.hierarchical_top_ks.append(k_clamped)
+            self.hierarchical_top_k_blocks.append(
+                max(1, min(n_max_blocks, int(round(k_clamped / float(self.block_size)))))
+            )
             rho_l = float(l_idx) / float(max(self.num_layers - 1, 1))
             self.layer_stiff_multipliers.append(0.45 + 1.15 * rho_l)
             self.layer_stiff_ceilings.append(0.28 + 0.57 * rho_l)
@@ -286,7 +351,10 @@ class ScaledSpringNetwork(nn.Module):
             for l_idx in range(self.num_layers)
         ])
         self.hidden_layers = self.spring_layers
-        if self.enable_hierarchical_compositional:
+        if self.enable_block_sparse:
+            for l_idx, layer in enumerate(self.spring_layers):
+                layer.top_k = min(layer.d_active, self.hierarchical_top_k_blocks[l_idx] * self.block_size)
+        elif self.enable_hierarchical_compositional:
             for l_idx, layer in enumerate(self.spring_layers):
                 layer.top_k = min(layer.d_active, self.hierarchical_top_ks[l_idx])
 
@@ -332,6 +400,21 @@ class ScaledSpringNetwork(nn.Module):
 
         self._last_layer_raw_rms: list[float] = [0.0 for _ in range(self.num_layers)]
         self._last_layer_normed_rms: list[float] = [0.0 for _ in range(self.num_layers)]
+        self.block_win_counts: list[torch.Tensor] = [
+            torch.zeros(n_max_blocks, dtype=torch.float32) for _ in range(self.num_layers)
+        ]
+        self.epoch_block_win_counts: list[torch.Tensor] = [
+            torch.zeros(n_max_blocks, dtype=torch.float32) for _ in range(self.num_layers)
+        ]
+        self._last_epoch_block_wins: list[torch.Tensor] = [
+            torch.zeros(n_max_blocks, dtype=torch.float32) for _ in range(self.num_layers)
+        ]
+        self.block_usage_ema: list[torch.Tensor] = [
+            torch.ones(n_max_blocks, dtype=torch.float32) for _ in range(self.num_layers)
+        ]
+        self._last_block_entropy: list[float] = [0.0 for _ in range(self.num_layers)]
+        self._frozen_block_wins: list[torch.Tensor] | None = None
+        self._is_training_step: bool = False
         self._last_role_probs: torch.Tensor | None = None
         self._last_ent_logits: torch.Tensor | None = None
         self._last_ent_slots: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
@@ -400,6 +483,9 @@ class ScaledSpringNetwork(nn.Module):
         self.shared_vocab_tensor: torch.Tensor | None = None
         self._rejuv_gen = torch.Generator()
         self._rejuv_gen.manual_seed(seed + 777)
+
+        if self.use_highway_anchored_dfa:
+            self._sync_highway_anchored_dfa(init_only=True)
 
         for param in self.parameters():
             param.requires_grad_(False)
@@ -563,6 +649,46 @@ class ScaledSpringNetwork(nn.Module):
         return self.spring_layers[-1].d_active
 
     @torch.no_grad()
+    def _sync_highway_anchored_dfa(self, init_only: bool = False) -> None:
+        """
+        Law 3 (Milestone 2.4): Highway-Anchored Deep Hebbian DFA.
+        Aligns feedback matrices B^(l) with the Output Head transpose (W_head^T)
+        along active residual highway coordinates while blending layer-specific
+        Hebbian specialization (1 - blend) and preserving row L2 normalization.
+        """
+        if not self.use_highway_anchored_dfa or self.frozen:
+            return
+        target_norm = math.sqrt(self.vocab_size / float(self.d_max))
+        d_eff = self._effective_context_dim()
+        w_head_src = torch.empty(self.vocab_size, self.d_max, device=self.output_head.w.device)
+        w_head_src[:, :d_eff].copy_(self.output_head.w[:, :d_eff])
+        if d_eff < self.d_max:
+            if init_only and self._head_latent_cols is not None:
+                w_head_src[:, d_eff:].copy_(self._head_latent_cols[:, d_eff:])
+            elif self._head_latent_cols is not None:
+                w_head_src[:, d_eff:].copy_(self._head_latent_cols[:, d_eff:])
+            else:
+                w_head_src[:, d_eff:].zero_()
+
+        anchor_full = w_head_src.t()  # [d_max, V]
+        anchor_unit = F.normalize(anchor_full, p=2, dim=-1, eps=1e-6)
+        blend = self.dfa_anchor_blend
+
+        for l_idx, layer in enumerate(self.spring_layers):
+            b_mat = self.dfa_router.get_matrix(l_idx)
+            if b_mat is None:
+                continue
+            d_act = self.d_max if init_only else layer.d_active
+            b_unit = F.normalize(b_mat[:d_act, :], p=2, dim=-1, eps=1e-6)
+            mixed = F.normalize(
+                blend * anchor_unit[:d_act, :] + (1.0 - blend) * b_unit,
+                p=2,
+                dim=-1,
+                eps=1e-6,
+            ) * target_norm
+            b_mat[:d_act, :].copy_(mixed)
+
+    @torch.no_grad()
     def count_parameters_breakdown(self) -> dict:
         v = self.vocab_size
         d_max = self.d_max
@@ -571,7 +697,9 @@ class ScaledSpringNetwork(nn.Module):
         d_eff = self._effective_context_dim() if not self.frozen else int(self.spring_layers[0].w0.shape[1])
         d_last = self._final_layer_dim() if not self.frozen else int(self.output_head.w0.shape[1])
 
-        emb_params = v * d_max + self.max_seq_len * d_max + 3 * (d_max * d_max)
+        fast_d = self._fast_d_eff if (self.frozen and self._fast_d_eff is not None) else d_max
+        emb_train_params = v * d_max + self.max_seq_len * d_max + 3 * (d_max * d_max)
+        emb_frozen_params = v * d_max + self.max_seq_len * d_max + 3 * (fast_d * d_max)
         attn_train_params = 3 * 3 * (d_max * d_max) + (d_max * v)
         attn_frozen_params = 3 * (d_max * d_max)
 
@@ -587,19 +715,19 @@ class ScaledSpringNetwork(nn.Module):
         head_curr_active = 3 * (v * d_last)
         head_frozen_w0 = v * d_last
 
-        role_w0 = ((4 * d_max + 1) * 3 + d_max * d_max) if self.enable_hierarchical_compositional else 0
+        role_w0 = ((4 * d_max + 1) * 3 + d_max * d_max) if self.use_role_bridge else 0
         role_train = 3 * role_w0
 
         total_latent_train_params = (
-            emb_params + attn_train_params + hidden_max_train + dfa_params + head_max_train + role_train
+            emb_train_params + attn_train_params + hidden_max_train + dfa_params + head_max_train + role_train
         )
         total_init_active_params = (
-            emb_params + attn_train_params + hidden_init_active + (self.num_layers * d_init * v) + head_init_active + role_train
+            emb_train_params + attn_train_params + hidden_init_active + (self.num_layers * d_init * v) + head_init_active + role_train
         )
         total_curr_active_params = (
-            emb_params + attn_train_params + hidden_curr_active + sum(d * v for d in d_acts) + head_curr_active + role_train
+            emb_train_params + attn_train_params + hidden_curr_active + sum(d * v for d in d_acts) + head_curr_active + role_train
         )
-        total_frozen_prod_params = emb_params + attn_frozen_params + hidden_frozen_w0 + head_frozen_w0 + role_w0
+        total_frozen_prod_params = emb_frozen_params + attn_frozen_params + hidden_frozen_w0 + head_frozen_w0 + role_w0
 
         live_bytes = sum(b.numel() * b.element_size() for b in self.buffers() if b is not None)
         live_mb = live_bytes / (1024.0 * 1024.0)
@@ -629,30 +757,26 @@ class ScaledSpringNetwork(nn.Module):
     def _build_vectorized_context(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
         Law 2: Vectorized Dual-Horizon Causal Attention + Salience-Gated EMA Context Capacitor.
-        c_t = (1 - alpha_t) * c_{t-1} + alpha_t * Embed(x_t)
-        Preserves subject/entity memory across sentence boundaries and high-frequency hub words.
+        In Block-Sparse Active-Slice mode (or frozen fast inference), computes context directly
+        on the active slice [:d_eff] to eliminate wasted dormant-column FLOPs.
         """
         bsz, seq_len = input_ids.shape
+        d_eff = self._effective_context_dim()
+        use_active_slice = (self.enable_block_sparse or (self._fast_d_eff is not None)) and (not self.continual_mode)
 
-        # 1. Dual-Horizon Sparse Causal Self-Attention [B, T, D_max]
+        # 1. Dual-Horizon Sparse Causal Self-Attention [B, T, D_eff or D_max]
         attn_out = self.sparse_attention(input_ids)
-
-        # 2. Token embeddings + Positional Phase [B, T, D_max]
         tok_emb = self.sparse_attention.token_embedding[input_ids]
-        pos_emb = self.alibi_pos_encoding[:seq_len].unsqueeze(0)
-        x_pos = tok_emb + pos_emb
 
-        # 3. ALiBi local causal window [B, T, D_max]
-        if self.enable_hierarchical_compositional and not self.continual_mode:
+        # 3. ALiBi local causal window + capacitor scaling
+        if self.enable_hierarchical_compositional and self.use_role_bridge and (not self.continual_mode):
             w_alibi = self.alibi_sliding_weights[:seq_len, :seq_len]
             cap_gain = 0.45
         else:
             w_alibi = self.alibi_causal_weights[:seq_len, :seq_len]
             cap_gain = 1.65
-        alibi_ctx = torch.matmul(w_alibi.unsqueeze(0), x_pos)
 
         # 4. Salience-Gated EMA Context Capacitor c_t [B, T, D_max]
-        # Computed causally along the sequence length T (T=36 is tiny, vectorized across B and D)
         alphas = self.capacitor_alpha[input_ids].unsqueeze(-1)  # [B, T, 1]
         c_states = torch.zeros_like(tok_emb)
         c_prev = torch.zeros(bsz, self.d_max, device=input_ids.device)
@@ -660,6 +784,24 @@ class ScaledSpringNetwork(nn.Module):
             a_t = alphas[:, t, :]
             c_prev = (1.0 - a_t) * c_prev + a_t * tok_emb[:, t, :]
             c_states[:, t, :] = c_prev
+
+        if use_active_slice:
+            out_dim = d_eff
+            attn_slice = attn_out[:, :, :out_dim] if attn_out.shape[-1] > out_dim else attn_out
+            x_pos_sub = tok_emb[:, :, :out_dim] + self.alibi_pos_encoding[:seq_len, :out_dim].unsqueeze(0)
+            alibi_ctx = torch.matmul(w_alibi.unsqueeze(0), x_pos_sub)
+            cap_ctx = F.linear(c_states, self.cap_proj[:out_dim, :])
+            lag1 = torch.zeros(bsz, seq_len, out_dim, device=input_ids.device)
+            if seq_len > 1:
+                lag1[:, 1:, :] = F.linear(tok_emb[:, :-1, :], self.lag1_proj[:out_dim, :])
+            lag2 = torch.zeros(bsz, seq_len, out_dim, device=input_ids.device)
+            if seq_len > 2:
+                lag2[:, 2:, :] = F.linear(tok_emb[:, :-2, :], self.lag2_proj[:out_dim, :])
+            return attn_slice + alibi_ctx + cap_gain * cap_ctx + lag1 + lag2
+
+        pos_emb = self.alibi_pos_encoding[:seq_len].unsqueeze(0)
+        x_pos = tok_emb + pos_emb
+        alibi_ctx = torch.matmul(w_alibi.unsqueeze(0), x_pos)
         cap_ctx = F.linear(c_states, self.cap_proj)
 
         # 5. Immediate causal lag-1 and lag-2 projections for sharp local syntax
@@ -690,6 +832,7 @@ class ScaledSpringNetwork(nn.Module):
     def _apply_subspace_rmsnorm(
         x_sub: torch.Tensor,
         target_rms: float = 1.20,
+        return_stats: bool = True,
     ) -> tuple[torch.Tensor, float, float]:
         """
         Law 2 (Milestone 2.3): Parameter-Free Layer-Subspace RMS Stabilization across depth.
@@ -697,6 +840,8 @@ class ScaledSpringNetwork(nn.Module):
         """
         raw_rms = torch.sqrt(x_sub.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
         x_normed = x_sub * (target_rms / raw_rms)
+        if not return_stats:
+            return x_normed, 0.0, target_rms
         normed_rms = torch.sqrt(x_normed.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
         return x_normed, float(raw_rms.mean().item()), float(normed_rms.mean().item())
 
@@ -820,6 +965,210 @@ class ScaledSpringNetwork(nn.Module):
         ent_gate = has_comp_flat & (p_ent_sum > 0.60)
         slots_tuple = (start_id.reshape(n_total), end_id.reshape(n_total), has_comp_flat)
         return ent_logits, ent_gate, role_probs, p_ent_sum, slots_tuple
+
+    @staticmethod
+    def _compute_block_entropy(counts: torch.Tensor) -> float:
+        total = float(counts.sum().item())
+        n = counts.numel()
+        if total <= 0.0 or n <= 1:
+            return 0.0
+        p = counts.float() / total
+        p = p[p > 0]
+        ent = -float(torch.sum(p * torch.log2(p)).item())
+        return ent / math.log2(n)
+
+    @torch.no_grad()
+    def _forward_block_sparse_layer(
+        self,
+        layer: DynamicSpringLayer,
+        a_prev_eff: torch.Tensor,
+        l_idx: int = 0,
+    ) -> torch.Tensor:
+        """
+        Laws 1, 2 & 4 (Milestone 2.4):
+        Contiguous Block-Sparse Elastic Capsules (B_block = 16) with:
+          - Active-Slice contiguous matmul on [:d_act, :d_eff]
+          - Load-Balanced Top-K_blocks capsule competition during training
+          - Depth-Scaled Residual Highway (alpha_res / sqrt(L)) + Local Active RMSNorm
+        """
+        in_dim = a_prev_eff.shape[1]
+        if self.frozen:
+            w_sub = layer.w0[:, :in_dim] if layer.w0.shape[1] != in_dim else layer.w0
+            z_act = F.linear(a_prev_eff, w_sub)
+            d_sub = z_act.shape[1]
+        else:
+            d_act = layer.d_active
+            w_sub = layer.w[:d_act, :in_dim]
+            z_act = F.linear(a_prev_eff, w_sub)
+            d_sub = d_act
+
+        n_tok = z_act.shape[0]
+        b_size = self.block_size
+        n_blocks = max(1, d_sub // b_size)
+        if self.enable_hierarchical_compositional:
+            k_blk = min(self.hierarchical_top_k_blocks[l_idx], n_blocks)
+        else:
+            k_blk = max(1, min(n_blocks, int(round(self.top_k / float(b_size)))))
+
+        z_blocks = z_act.view(n_tok, n_blocks, b_size)
+        block_energy = torch.sqrt(z_blocks.pow(2).mean(dim=-1) + 1e-6)  # [N, N_blocks]
+
+        if (
+            self._is_training_step
+            and (not self.frozen)
+            and k_blk < n_blocks
+            and self.block_balance_strength > 0.0
+        ):
+            ema = self.block_usage_ema[l_idx][:n_blocks]
+            rel_u = ema / ema.mean().clamp(min=1e-6)
+            rank_score = block_energy * (rel_u + 0.10).pow(-self.block_balance_strength)
+        else:
+            rank_score = block_energy
+
+        if k_blk < n_blocks:
+            _, top_b_idx = torch.topk(rank_score, k=k_blk, dim=-1)  # [N, k_blk]
+            idx_exp = top_b_idx.unsqueeze(-1).expand(-1, -1, b_size)
+            z_win = torch.gather(z_blocks, dim=1, index=idx_exp)
+            a_win = F.leaky_relu(z_win, negative_slope=layer.negative_slope)
+            a_blocks = torch.zeros_like(z_blocks).scatter_(1, idx_exp, a_win)
+            a_sparse = a_blocks.reshape(n_tok, d_sub)
+            block_mask = torch.zeros(n_tok, n_blocks, device=z_act.device)
+            block_mask.scatter_(1, top_b_idx, 1.0)
+        else:
+            a_sparse = F.leaky_relu(z_act, negative_slope=layer.negative_slope)
+            block_mask = torch.ones(n_tok, n_blocks, device=z_act.device)
+
+        batch_b_wins = block_mask.sum(dim=0)
+        if not self.frozen:
+            self.block_win_counts[l_idx][:n_blocks].add_(batch_b_wins)
+            self.epoch_block_win_counts[l_idx][:n_blocks].add_(batch_b_wins)
+            if self._is_training_step:
+                ema_slice = self.block_usage_ema[l_idx][:n_blocks]
+                ema_slice.mul_(0.88).add_(0.12 * (batch_b_wins / max(float(n_tok), 1.0)))
+
+            cell_wins = batch_b_wins.repeat_interleave(b_size)
+            layer.win_counts[:d_sub].add_(cell_wins)
+            layer.epoch_win_counts[:d_sub].add_(cell_wins)
+
+            if not self._is_training_step:
+                winner_blocks = batch_b_wins > 0
+                if winner_blocks.any():
+                    winner_cells = winner_blocks.repeat_interleave(b_size)
+                    layer._last_winner_k = float(layer.k[:d_sub, :in_dim][winner_cells].mean().item())
+                self._last_block_entropy[l_idx] = self._compute_block_entropy(
+                    self.block_win_counts[l_idx][:n_blocks]
+                )
+
+            layer._last_a_prev = a_prev_eff.detach()
+            layer._last_z = z_act.detach()
+            layer._last_mask = block_mask.detach()
+            layer._last_a = a_sparse.detach()
+        elif self._frozen_block_wins is not None:
+            self._frozen_block_wins[l_idx][:n_blocks].add_(batch_b_wins)
+
+        if self.use_depth_scaled_highway:
+            res_scale = self.alpha_res / math.sqrt(float(self.num_layers))
+            need_stats = not self._is_training_step
+            if d_sub == in_dim:
+                raw_out = a_prev_eff + res_scale * a_sparse
+                out, raw_rms, normed_rms = self._apply_subspace_rmsnorm(
+                    raw_out, target_rms=1.20, return_stats=need_stats
+                )
+            else:
+                raw_out = a_prev_eff.clone()
+                raw_out[:, :d_sub].add_(a_sparse, alpha=res_scale)
+                out_sub, raw_rms, normed_rms = self._apply_subspace_rmsnorm(
+                    raw_out[:, :d_sub], target_rms=1.20, return_stats=need_stats
+                )
+                out = raw_out
+                out[:, :d_sub] = out_sub
+        else:
+            if d_sub == in_dim:
+                out = a_prev_eff + a_sparse
+                raw_rms = (
+                    0.0
+                    if self._is_training_step
+                    else float(torch.sqrt(out.pow(2).mean(dim=-1, keepdim=True) + 1e-6).mean().item())
+                )
+            else:
+                out = a_prev_eff.clone()
+                out[:, :d_sub].add_(a_sparse)
+                raw_rms = (
+                    0.0
+                    if self._is_training_step
+                    else float(torch.sqrt(out[:, :d_sub].pow(2).mean(dim=-1, keepdim=True) + 1e-6).mean().item())
+                )
+            normed_rms = raw_rms
+
+        self._last_layer_raw_rms[l_idx] = raw_rms
+        self._last_layer_normed_rms[l_idx] = normed_rms
+        return out
+
+    @torch.no_grad()
+    def _update_block_sparse_layer(
+        self,
+        layer: DynamicSpringLayer,
+        projected_error: torch.Tensor,
+        n_valid: float,
+        maturity_stiff_gain: float,
+        l_idx: int = 0,
+    ) -> None:
+        """
+        Active-Slice Winner-Normalized Local Spring Update for Contiguous Block-Sparse Capsules.
+        Updates strictly [:d_act, :d_eff] without touching dormant rows or columns.
+        """
+        d_act = layer.d_active
+        a_prev_eff = layer._last_a_prev      # [N, d_eff]
+        d_eff = a_prev_eff.shape[1]
+        z_act = layer._last_z                # [N, d_act]
+        block_mask = layer._last_mask        # [N, n_blocks]
+
+        n_tok = z_act.shape[0]
+        b_size = self.block_size
+        n_blocks = max(1, d_act // b_size)
+
+        g_prime = layer._activate_derivative(z_act)  # [N, d_act]
+        delta = (
+            (projected_error[:, :d_act] * g_prime).view(n_tok, n_blocks, b_size)
+            * block_mask.unsqueeze(-1)
+        ).reshape(n_tok, d_act)
+
+        wins_per_block = block_mask.sum(dim=0).clamp(min=1.0)
+        wins_per_cell = wins_per_block.repeat_interleave(b_size).unsqueeze(1)  # [d_act, 1]
+        if self.enable_hierarchical_compositional:
+            k_blk = min(self.hierarchical_top_k_blocks[l_idx], n_blocks)
+        else:
+            k_blk = max(1, min(n_blocks, int(round(self.top_k / float(b_size)))))
+        sparsity_ratio = float(n_blocks) / float(max(k_blk, 1))
+        balanced_denom = (0.40 * max(n_valid, 1.0)) + (0.60 * wins_per_cell * sparsity_ratio)
+        driving_signal = torch.matmul(delta.t(), a_prev_eff) / balanced_denom  # [d_act, d_eff]
+
+        w_act = layer.w[:d_act, :d_eff]
+        w0_act = layer.w0[:d_act, :d_eff]
+        k_act = layer.k[:d_act, :d_eff]
+
+        stretch_diff = w_act - w0_act
+        delta_w = (layer.eta_w * driving_signal) - (layer.gamma * k_act * stretch_diff)
+        w_act.add_(delta_w)
+
+        stretch_diff_new = w_act - w0_act
+        delta_w0 = layer.eta_0 * (1.0 - k_act) * stretch_diff_new
+        w0_act.add_(delta_w0)
+
+        active_row_gate = (wins_per_block > 0).repeat_interleave(b_size).float().unsqueeze(1)
+        win_norm_factor = (max(n_valid, 1.0) / (wins_per_cell * sparsity_ratio)).clamp(1.0, 8.0)
+        stiff_mult = self.layer_stiff_multipliers[l_idx] if self.enable_hierarchical_compositional else 1.0
+        stiff_ceil = self.layer_stiff_ceilings[l_idx] if self.enable_hierarchical_compositional else 0.85
+        effective_beta_k = layer.beta_k * maturity_stiff_gain * win_norm_factor * stiff_mult
+        delta_k = effective_beta_k * stretch_diff_new.abs() * (1.0 - k_act) * active_row_gate
+        k_act.add_(delta_k).clamp_(0.0, stiff_ceil)
+
+    @torch.no_grad()
+    def reset_frozen_block_stats(self) -> None:
+        n_max_blocks = max(1, self.d_max // self.block_size)
+        self._frozen_block_wins = [
+            torch.zeros(n_max_blocks, dtype=torch.float32) for _ in range(self.num_layers)
+        ]
 
     @torch.no_grad()
     def _forward_dynamic_layer(
@@ -991,12 +1340,14 @@ class ScaledSpringNetwork(nn.Module):
             single_seq = True
 
         bsz, seq_len = input_ids.shape
-        context = self._build_vectorized_context(input_ids)  # [B, T, D_max]
+        context = self._build_vectorized_context(input_ids)  # [B, T, D_eff or D_max]
 
-        d_in = self._effective_context_dim()
-        if d_in < self.d_max:
-            context = context.clone()
-            context[:, :, d_in:] = 0.0
+        use_block_path = self.enable_block_sparse and (not self.continual_mode)
+        if not use_block_path and (self._fast_d_eff is None):
+            d_in = self._effective_context_dim()
+            if d_in < self.d_max:
+                context = context.clone()
+                context[:, :, d_in:] = 0.0
 
         if self.frozen and self.continual_mode and self.phase_resonance_profiles:
             in_dim = self.output_head.w0.shape[1]
@@ -1024,13 +1375,25 @@ class ScaledSpringNetwork(nn.Module):
                 return logits[0, -1]
             return logits
 
-        a = context.reshape(bsz * seq_len, self.d_max)
-        for l_idx, layer in enumerate(self.spring_layers):
-            a = self._forward_dynamic_layer(layer, a, l_idx=l_idx)
+        if use_block_path:
+            a = context.reshape(bsz * seq_len, context.shape[-1])
+            if self.use_depth_scaled_highway:
+                a, _, _ = self._apply_subspace_rmsnorm(a, target_rms=1.20, return_stats=False)
+            for l_idx, layer in enumerate(self.spring_layers):
+                a = self._forward_block_sparse_layer(layer, a, l_idx=l_idx)
+        else:
+            a = context.reshape(bsz * seq_len, context.shape[-1])
+            for l_idx, layer in enumerate(self.spring_layers):
+                a = self._forward_dynamic_layer(layer, a, l_idx=l_idx)
 
         if self.frozen:
             in_dim = self.output_head.w0.shape[1]
-            scene_logits = F.linear(a[:, :in_dim], self.output_head.w0)
+            scene_logits = F.linear(a[:, :in_dim] if a.shape[1] != in_dim else a, self.output_head.w0)
+        elif use_block_path:
+            d_last = self._final_layer_dim()
+            a_head = a[:, :d_last] if a.shape[1] != d_last else a
+            scene_logits = F.linear(a_head, self.output_head.w[:, :d_last])
+            self.output_head._last_a_prev = a_head.detach()
         else:
             d_last = self._final_layer_dim()
             a_masked = a.clone()
@@ -1038,7 +1401,7 @@ class ScaledSpringNetwork(nn.Module):
                 a_masked[:, d_last:] = 0.0
             scene_logits = self.output_head(a_masked)
 
-        if self.enable_hierarchical_compositional and (not self.continual_mode):
+        if self.enable_hierarchical_compositional and self.use_role_bridge and (not self.continual_mode):
             ent_logits, ent_gate, role_probs, _, slots_tuple = self._compute_role_factored_entity_logits(
                 input_ids
             )
@@ -1143,7 +1506,11 @@ class ScaledSpringNetwork(nn.Module):
         n_total = bsz * seq_len
 
         # 1. Vectorized Forward Pass: [B, T, V]
-        logits = self.forward(input_ids)
+        self._is_training_step = True
+        try:
+            logits = self.forward(input_ids)
+        finally:
+            self._is_training_step = False
         logits_flat = logits.reshape(n_total, self.vocab_size)
         targets_flat = target_ids.reshape(n_total)
         inputs_flat = input_ids.reshape(n_total)
@@ -1197,20 +1564,49 @@ class ScaledSpringNetwork(nn.Module):
         if not (self.use_cubic_shield and self.attn_armor_locked):
             self.sparse_attention.local_spring_update(e_scaled)
 
-        # 3. Law 3 & Law 4: Update Hidden DynamicSpringLayers + Adaptive Hebbian Feedback B^(l)
+        # 3. Law 3 & Law 4: Update Hidden DynamicSpringLayers + Adaptive/Anchored Hebbian Feedback B^(l)
+        use_block_path = self.enable_block_sparse and (not self.continual_mode)
+        depth_dfa_scale = (
+            ((4.0 / float(max(self.num_layers, 4))) ** 0.25)
+            if (use_block_path and self.use_depth_scaled_highway and self.num_layers > 4)
+            else 1.0
+        )
+        anchor_unit_full = None
+        if self.use_highway_anchored_dfa:
+            max_act_d = max(l.d_active for l in self.spring_layers)
+            anchor_unit_full = F.normalize(
+                self.output_head.w[:, :max_act_d].t(),
+                p=2,
+                dim=-1,
+                eps=1e-6,
+            )
+        target_row_norm = math.sqrt(self.vocab_size / float(self.d_max))
+
         for l_idx, layer in enumerate(self.spring_layers):
             d_act = layer.d_active
             B_l = self.dfa_router.get_matrix(l_idx)  # [D_max, V]
             B_l_active = B_l[:d_act, :]              # [d_active, V]
 
             delta_l_active = F.linear(salient_err_hidden, B_l_active)  # [N, d_active]
-            self._update_dynamic_layer_winner_normalized(
-                layer=layer,
-                projected_error=delta_l_active,
-                n_valid=n_valid,
-                maturity_stiff_gain=maturity_gain,
-                l_idx=l_idx,
-            )
+            if depth_dfa_scale != 1.0:
+                delta_l_active = delta_l_active * depth_dfa_scale
+
+            if use_block_path:
+                self._update_block_sparse_layer(
+                    layer=layer,
+                    projected_error=delta_l_active,
+                    n_valid=n_valid,
+                    maturity_stiff_gain=maturity_gain,
+                    l_idx=l_idx,
+                )
+            else:
+                self._update_dynamic_layer_winner_normalized(
+                    layer=layer,
+                    projected_error=delta_l_active,
+                    n_valid=n_valid,
+                    maturity_stiff_gain=maturity_gain,
+                    l_idx=l_idx,
+                )
 
             # Keep rejuvenated/dormant slots zeroed until explicitly awakened
             if self.rejuvenated_slots[l_idx]:
@@ -1227,21 +1623,47 @@ class ScaledSpringNetwork(nn.Module):
                     self.layer_w0_bedrock[l_idx][:d_act][locked_idx, : self._effective_context_dim()]
                 )
 
-            # Law 4: Row-Normalized Hebbian Feedback Alignment on B^(l) (only on unlocked rows)
-            if self.eta_b > 0.0 and layer._last_a is not None:
+            # Law 4 / Law 3 (v2.4): Row-Normalized Hebbian + Highway-Anchored Feedback Alignment on B^(l)
+            if self.use_highway_anchored_dfa and anchor_unit_full is not None and layer._last_a is not None:
+                a_act = layer._last_a[:, :d_act]
+                hebb_corr = torch.matmul(a_act.t(), salient_err_hidden) / max(n_valid, 1.0)
+                unlocked_row_gate = (~self.armor_locked_masks[l_idx][:d_act]).float().unsqueeze(1)
+                b_hebb = F.normalize(
+                    B_l_active + (self.eta_b * unlocked_row_gate) * hebb_corr,
+                    p=2,
+                    dim=-1,
+                    eps=1e-6,
+                )
+                B_blended = F.normalize(
+                    (1.0 - self.dfa_anchor_blend) * b_hebb + self.dfa_anchor_blend * anchor_unit_full[:d_act, :],
+                    p=2,
+                    dim=-1,
+                    eps=1e-6,
+                ) * target_row_norm
+                B_l[:d_act, :].copy_(B_blended)
+            elif self.eta_b > 0.0 and layer._last_a is not None:
                 a_act = layer._last_a[:, :d_act]  # [N, d_active]
                 hebb_corr = torch.matmul(a_act.t(), salient_err_hidden) / max(n_valid, 1.0)  # [d_active, V]
                 unlocked_row_gate = (~self.armor_locked_masks[l_idx][:d_act]).float().unsqueeze(1)
                 B_updated = B_l_active + (self.eta_b * unlocked_row_gate) * hebb_corr
-                target_row_norm = math.sqrt(self.vocab_size / float(self.d_max))
                 B_l[:d_act, :].copy_(F.normalize(B_updated, p=2, dim=-1) * target_row_norm)
 
-        # 4. Update Output Head locally with Cubic Anchor Shield protection on locked rows
+        # 4. Update Output Head locally (Active-Slice execution or Cubic Anchor Shielded)
         d_last = self._final_layer_dim()
-        if self.output_head._last_a_prev is not None and d_last < self.d_max:
-            self.output_head._last_a_prev[:, d_last:] = 0.0
-
-        if self.continual_mode and self.use_cubic_shield:
+        if use_block_path:
+            a_head = self.output_head._last_a_prev
+            driving_head = torch.matmul(e_scaled.t(), a_head) / float(max(n_total, 1))
+            w_h = self.output_head.w[:, :d_last]
+            w0_h = self.output_head.w0[:, :d_last]
+            k_h = self.output_head.k[:, :d_last]
+            stretch_h = w_h - w0_h
+            w_h.add_((self.output_head.eta_w * driving_head) - (self.output_head.gamma * k_h * stretch_h))
+            stretch_h_new = w_h - w0_h
+            w0_h.add_(self.output_head.eta_0 * (1.0 - k_h) * stretch_h_new)
+            k_h.add_(self.output_head.beta_k * stretch_h_new.abs() * (1.0 - k_h)).clamp_(0.0, 1.0)
+        elif self.continual_mode and self.use_cubic_shield:
+            if self.output_head._last_a_prev is not None and d_last < self.d_max:
+                self.output_head._last_a_prev[:, d_last:] = 0.0
             inactive_vocab = ~self.phase_active_vocab_mask
             e_head = e_scaled.clone()
             e_head[:, inactive_vocab] = 0.0
@@ -1255,11 +1677,14 @@ class ScaledSpringNetwork(nn.Module):
                     self.head_w0_bedrock[inactive_locked, :d_last]
                 )
         else:
+            if self.output_head._last_a_prev is not None and d_last < self.d_max:
+                self.output_head._last_a_prev[:, d_last:] = 0.0
             self.output_head.local_spring_update(e_scaled)
 
         # 5. Milestone 2.3: Unsupervised Local Spring Update of Role-Factored Bridges
         if (
             self.enable_hierarchical_compositional
+            and self.use_role_bridge
             and (not self.continual_mode)
             and self._last_ent_slots is not None
             and self._last_role_probs is not None
@@ -1443,8 +1868,11 @@ class ScaledSpringNetwork(nn.Module):
         if self.continual_mode:
             # In continual mode, per-phase rejuvenation + bounded recruitment is managed
             # deterministically by prepare_continual_phase.
-            for layer in self.spring_layers:
+            for l_idx, layer in enumerate(self.spring_layers):
                 layer.epoch_win_counts.zero_()
+                if self.enable_block_sparse:
+                    self._last_epoch_block_wins[l_idx].copy_(self.epoch_block_win_counts[l_idx])
+                    self.epoch_block_win_counts[l_idx].zero_()
             return []
 
         old_d_last = self._final_layer_dim()
@@ -1456,7 +1884,9 @@ class ScaledSpringNetwork(nn.Module):
                 token_error_rate=token_error_rate,
             )
             if ev is not None:
-                if self.enable_hierarchical_compositional:
+                if self.enable_block_sparse:
+                    layer.top_k = min(layer.d_active, self.hierarchical_top_k_blocks[l_idx] * self.block_size)
+                elif self.enable_hierarchical_compositional:
                     layer.top_k = min(layer.d_active, self.hierarchical_top_ks[l_idx])
                 ev["rejuvenated_in_place"] = 0
                 events.append(ev)
@@ -1469,6 +1899,13 @@ class ScaledSpringNetwork(nn.Module):
             self.output_head.w[unlocked_vocab, old_d_last:new_d_last] = cols[unlocked_vocab]
             self.output_head.w0[unlocked_vocab, old_d_last:new_d_last] = cols[unlocked_vocab]
             self.output_head.k[:, old_d_last:new_d_last].zero_()
+            if self.use_highway_anchored_dfa:
+                self._sync_highway_anchored_dfa(init_only=False)
+
+        if self.enable_block_sparse:
+            for l_idx in range(self.num_layers):
+                self._last_epoch_block_wins[l_idx].copy_(self.epoch_block_win_counts[l_idx])
+                self.epoch_block_win_counts[l_idx].zero_()
 
         return events
 
@@ -1785,12 +2222,15 @@ class ScaledSpringNetwork(nn.Module):
         for l_idx, layer in enumerate(self.spring_layers):
             d_act = layer.d_active
             recycled_set = set(self.rejuvenated_slots[l_idx])
-            kept_indices = [
-                j for j in range(d_act)
-                if (j not in recycled_set) and (layer.w0[j, :d_eff].norm(p=2).item() > 1e-7)
-            ]
-            if not kept_indices:
+            if self.enable_block_sparse and (not self.continual_mode):
                 kept_indices = list(range(d_act))
+            else:
+                kept_indices = [
+                    j for j in range(d_act)
+                    if (j not in recycled_set) and (layer.w0[j, :d_eff].norm(p=2).item() > 1e-7)
+                ]
+                if not kept_indices:
+                    kept_indices = list(range(d_act))
 
             orig_to_compacted = {orig_j: c_pos for c_pos, orig_j in enumerate(kept_indices)}
             for pid, p_slots in self.phase_locked_slots.items():
@@ -1820,6 +2260,13 @@ class ScaledSpringNetwork(nn.Module):
 
         for l_idx in range(self.num_layers):
             setattr(self.dfa_router, f"B_{l_idx}", None)
+
+        if prune_dormant and self.enable_block_sparse and (not self.continual_mode):
+            self._fast_d_eff = d_eff
+            self.register_buffer("cap_proj", self.cap_proj[:d_eff, :].contiguous())
+            self.register_buffer("lag1_proj", self.lag1_proj[:d_eff, :].contiguous())
+            self.register_buffer("lag2_proj", self.lag2_proj[:d_eff, :].contiguous())
+            self.reset_frozen_block_stats()
 
         self.output_head.frozen = True
         pruned_head_w0 = self.output_head.w0[:, :d_last].contiguous().clone()

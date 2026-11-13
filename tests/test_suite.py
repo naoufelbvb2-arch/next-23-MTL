@@ -210,6 +210,51 @@ class TestSpringMVPArchitecture(unittest.TestCase):
         for _, post_rms in results["v23_rms_hybrid"]:
             self.assertAlmostEqual(post_rms, 1.20, places=2)
 
+    def test_08_milestone_2_4_deep_12layer_block_sparse_capsules(self):
+        """
+        Verify Milestone 2.4 Contiguous Block-Sparse Elastic Capsules (B=16),
+        Depth-Scaled Residual Highway (12-layer stability), Highway-Anchored Deep DFA,
+        and Active-Slice CPU Execution Speedup on Frozen W_0 Only.
+        """
+        from benchmarks.bench_v2_deep_block_sparse import run_v2_deep_block_sparse_benchmark
+
+        results = run_v2_deep_block_sparse_benchmark(verbose=False)
+        self.assertTrue(results["ast_ok"])
+        self.assertGreaterEqual(results["scanned_files"], 26)
+
+        elem_4l = results["elem_4l"]
+        block_4l = results["block_4l"]
+        deep_12l = results["deep_12l"]
+        naive_12l = results["naive_12l"]
+        audit = results["rollout_audit"]
+        deep_model = results["deep_12l_model"]
+
+        # 1. Block-Sparse 4L accuracy & genuine CPU throughput speedup over Element-wise 4L
+        self.assertGreaterEqual(block_4l["frozen_val"]["acc"], 92.0)
+        self.assertGreater(block_4l["train_tok_per_sec"], elem_4l["train_tok_per_sec"])
+        self.assertGreater(block_4l["eval_tok_per_sec"], elem_4l["eval_tok_per_sec"])
+
+        # 2. 12-Layer Deep SS-ENN v2.4 stability, stiffness health & capsule entropy
+        self.assertEqual(len(deep_model.spring_layers), 12)
+        self.assertEqual(deep_model.block_size, 16)
+        self.assertGreaterEqual(deep_12l["frozen_val"]["acc"], 92.0)
+        self.assertGreater(deep_12l["frozen_val"]["acc"], naive_12l["frozen_val"]["acc"])
+        self.assertLessEqual(abs(deep_12l["ratio_post_end_l1"] - 1.0), 0.05)
+        self.assertLessEqual(abs(deep_12l["ratio_pre_end_l1"] - 1.0), 0.05)
+        self.assertGreaterEqual(deep_12l["mean_train_ent"], 0.90)
+        self.assertGreaterEqual(deep_12l["mean_frozen_ent"], 0.90)
+        self.assertGreaterEqual(deep_12l["mean_k"], 0.12)
+        self.assertLessEqual(deep_12l["mean_k"], 0.35)
+
+        # 3. Contiguous block_size=16 alignment on compacted W_0 matrices
+        for layer in deep_model.spring_layers:
+            self.assertEqual(layer.w0.shape[0] % 16, 0)
+
+        # 4. Clean 30-token rollout audit on Frozen W_0 Only
+        self.assertEqual(audit["entity_consistency_pct"], 100.0)
+        self.assertEqual(audit["adjacent_dup_rate_pct"], 0.0)
+        self.assertEqual(audit["phrase_loop_rate_pct"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
