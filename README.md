@@ -1,9 +1,10 @@
-# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0 & v2.0 Milestones 2.1–2.2)
+# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0 & v2.0 Milestones 2.1–2.3)
 **الشبكات العصبية المرنة ذاتية التشكيل — إطار تعلم موضعي خالٍ من الانتشار العكسي للتوليد المتسلسل والتعلم المستمر**
 
 *A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Dual-Horizon Sparse Causal Attention, Dynamic Neurogenesis, and Dual-Stage Sleep Consolidation*
 
-[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(24%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
+[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(25%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
+[![Milestone 2.3 Zero-Shot Recombination](https://img.shields.io/badge/Milestone%202.3-90.27%25%20Hybrid%20%7C%20100%25%20Binding-blue)](./benchmarks/bench_v2_compositional_gen.py)
 [![Exact Match Accuracy](https://img.shields.io/badge/Exact%20Match%20(W0%20Freeze)-100.00%25-brightgreen)](./docs/RESEARCH_PAPER_SS_ENN.md)
 [![Scaled CPU Validation](https://img.shields.io/badge/1.47M%20English%20Val%20Acc-93.66%25%20(PPL%201.35)-blueviolet)](./docs/V2_ENGINEERING_LOG_AND_FIXES.md)
 [![4-Phase Sleep Continual Retention](https://img.shields.io/badge/4--Phase%20Sleep%20Recall-97.22%25%20(54.7%25%20Saved)-teal)](./benchmarks/bench_v2_sleep_continual.py)
@@ -52,9 +53,9 @@
 
 ---
 
-## الحصيلة المعملية للتجارب الثماني | Empirical Benchmark Suite (v1.0 & v2.0 Milestones 2.1–2.2)
+## الحصيلة المعملية للتجارب التسع | Empirical Benchmark Suite (v1.0 & v2.0 Milestones 2.1–2.3)
 
-تخضع جميع ملفات المستودع (24 ملفاً برمجياً) لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
+تخضع جميع ملفات المستودع (25 ملفاً برمجياً) لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
 
 | # | الاختبار المعملي (`Benchmark`) | السكريبت التنفيذي | التحدي وحجم البيانات | الأبعاد النشطة النهائية ($D_{\text{active}}$) | توفير السعة / الذاكرة | الدقة بعد التجميد ($W_0$ فقط) | النتيجة الفيزيائية البارزة |
 | :-: | :--- | :--- | :--- | :--- | :---: | :---: | :--- |
@@ -66,6 +67,7 @@
 | **6** | **السلاسل الحرة المتصلة (Continuous Rollout)** | [`benchmarks/bench_continuous_stream.py`](./benchmarks/bench_continuous_stream.py) | 8 فقرات متصلة (136 كلمة، 128 انتقالاً، 48 كلمة ربط) | توسع ذاتي من `32` إلى **`[48, 48, 48, 48]`** | **62.5%** (`320/512` خلية) | **100.00%** (8/8 فقرات) | توليد ذاتي حر لـ 17 كلمة متصلة من بادئة كلمتين فقط وفك اشتباك `48/48` كلمة ربط |
 | **7** | **المحرك المليوني وفيزياء الطور 2.1 (`v2.0 CPU Scale-Up`)** | [`benchmarks/bench_scale_english_cpu.py`](./benchmarks/bench_scale_english_cpu.py) | 394 قصة إنجليزية (`25K+` رمز، `V=2,048`، `90% Train / 10% Unseen Val`) | توسع ذاتي من `64` إلى **`[192, 192, 192, 192]`** | **77.4% RAM Saved** (`25.13 MB -> 5.69 MB`, `1.47M` معامل) | **`93.84%` Train / `93.66%` Val** (`PPL 1.35`, `100%` ثبات الكيانات) | سرعة **`10,523 tok/s`** على `CPU` (الذروة `13,010 tok/s`)، صلابة $\bar{k}=0.1387$، وثبات الكيانات `5/5` عبر الجمل |
 | **8** | **طور النوم المزدوج وإعادة التدوير (`v2.0 Milestone 2.2`)** | [`benchmarks/bench_v2_sleep_continual.py`](./benchmarks/bench_v2_sleep_continual.py) | 4 مراحل سردية متتالية (`384` قصة، `Zero-Replay`، `V=2,048`) | نمو منضبط من `32` إلى **`[116, 116, 116, 116]`** (مقابل `256` الساذج) | **54.7% Cells Saved** (`464/1024`, **`4.86 MB`**, `192` خلية معاد تدويرها) | **`97.22%` Mean Recall (`PPL 1.14`)** vs `83.45%` Naive (**`+13.77%`**) | **`144`** خلية أُعيد إحياؤها موضعياً، **`100%` (`5/5`)** ثبات الكيانات، و**`0.00%`** تكرار متجاور (`"the the"`) أو حلقات عبارة |
+| **9** | **الصلابة الهرمية، تطبيع الطاقة الموضعي، والتعميم التركيبي الصفري (`v2.0 Milestone 2.3`)** | [`benchmarks/bench_v2_compositional_gen.py`](./benchmarks/bench_v2_compositional_gen.py) | تدريب قطري (`64` قصة) + تقييم صفري (`W_0`) على `24` توليفة هجينة غير مرئية `(L_j, S_i, A_k)` | طيف Top-K هرمي `[24, 24, 20, 16]` وصلابة متدرجة `k_bar = [0.0799..0.1676]` | تثبيت الطاقة الموضعي `RMS = 1.2000` عبر `L1..L4` (مقابل تضخم `1.7607` المسطح) | **`90.27%` Hybrid Full (`PPL 1.870`)**، **`97.01%` Hybrid Cont**، **`100.00%` (`48/48`)** Subject Binding (`0.00%` Reversion) | **`100.00%` (`6/6`)** توليد حر (`+30` رمزاً) بـ `0.00%` تكرار متجاور وحلقات عبارة |
 
 ---
 
@@ -87,7 +89,7 @@ next-23-MTL/
 │   ├── model_v2_attn.py              # SpringGenerativeNetworkV2 (with SparseCausalAttention)
 │   ├── model_dynamic.py              # DynamicSpringGenerativeNetwork (with Dormant Reserve)
 │   ├── model_continuous.py           # ContinuousSpringNetwork (Hybrid ALiBi + Attention + Dynamic Pool)
-│   ├── model_scaled.py               # ScaledSpringNetwork (1.5M-5M Vectorized + Milestones 2.1 & 2.2)
+│   ├── model_scaled.py               # ScaledSpringNetwork (1.5M-5M Vectorized + Milestones 2.1–2.3)
 ├── benchmarks/                       # حزمة التجارب المعملية والبيانات
 │   ├── __init__.py
 │   ├── corpus_data.py                # Tiered Arabic corpora (12, 25, 50, 100 sentences & 8 paragraphs)
@@ -98,13 +100,14 @@ next-23-MTL/
 │   ├── bench_neurogenesis.py         # Phase 1 Maturity: Self-sizing topology (32 -> 56 cells)
 │   ├── bench_continuous_stream.py    # Phase 2 Maturity: Continuous paragraphs & 17-word free rollout
 │   ├── bench_scale_english_cpu.py    # v2.0 Milestone 2.1: Million-param CPU telemetry & 6-table audit
-│   └── bench_v2_sleep_continual.py   # v2.0 Milestone 2.2: 4-phase sleep consolidation, recycling & refractory gate
+│   ├── bench_v2_sleep_continual.py   # v2.0 Milestone 2.2: 4-phase sleep consolidation, recycling & refractory gate
+│   └── bench_v2_compositional_gen.py # v2.0 Milestone 2.3: Hierarchical stiffness, Active RMSNorm & zero-shot recombination
 ├── tests/                            # حزمة التحقق الصارم وفحص AST
 │   ├── __init__.py
-│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (24 files)
+│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (25 files, 7 tests)
 ├── docs/                             # الأوراق البحثية وسجل الإصلاحات وخارطة الطريق
 │   ├── RESEARCH_PAPER_SS_ENN.md      # Full technical paper, equations, empirical tables & reproducibility
-│   ├── V2_ENGINEERING_LOG_AND_FIXES.md # Detailed v2.0 Milestones 2.1 & 2.2 physics upgrades & audit
+│   ├── V2_ENGINEERING_LOG_AND_FIXES.md # Detailed v2.0 Milestones 2.1–2.3 physics upgrades & audit
 │   ├── LIMITATIONS_AND_V2_ROADMAP.md # Critical scaling analysis & SS-ENN v2.0 execution roadmap
 │   └── SPEC_SPRING_MVP.md            # Core mathematical & architectural specification
 ├── .gitignore
@@ -130,7 +133,7 @@ python tests/test_suite.py
 python train_eval.py
 ```
 
-### 3. تشغيل الاختبارات المعملية السبعة (Run All v1.0 & v2.0 Benchmarks)
+### 3. تشغيل الاختبارات المعملية الثمانية (Run All v1.0 & v2.0 Benchmarks)
 ```bash
 # 1. Capacity & Saturation Benchmark (12 -> 25 -> 50 sentences)
 python benchmarks/bench_capacity.py
@@ -152,14 +155,17 @@ python benchmarks/bench_scale_english_cpu.py
 
 # 7. 4-Phase Zero-Replay Continual Learning, Dual-Stage Sleep & Synaptic Recycling (Milestone 2.2)
 python benchmarks/bench_v2_sleep_continual.py
+
+# 8. Hierarchical Stiffness, Local Active RMSNorm & Zero-Shot Compositional Generalization (Milestone 2.3)
+python benchmarks/bench_v2_compositional_gen.py
 ```
 
 ---
 
 ## التوثيق العلمي وخارطة الطريق | Research Documentation & v2.0 Roadmap
 
-- **[الورقة البحثية المتكاملة (`docs/RESEARCH_PAPER_SS_ENN.md`)](./docs/RESEARCH_PAPER_SS_ENN.md):** الاشتقاق النظري لقوانين النابض الثلاثة، معادلات التوجيه المباشر (`DFA`)، التجارب الثماني الكاملة، وتحليل ظاهرة التشكيل الذاتي وترشيح الضوضاء عبر نقطة الارتكاز (`Anchor Denoising Effect`).
-- **[سجل الإصلاحات والترقيات الفيزيائية للإصدار الثاني (`docs/V2_ENGINEERING_LOG_AND_FIXES.md`)](./docs/V2_ENGINEERING_LOG_AND_FIXES.md):** التوثيق الرياضي والبرمجي لقوانين **`v2.0 Milestones 2.1 & 2.2`** (معالجة انجراف الكيانات، تفتت الصلابة الدفعية، طور النوم المزدوج، إعادة تدوير الخلايا، الدرع التكعيبي، وبوابة الجموح الانتقالية).
+- **[الورقة البحثية المتكاملة (`docs/RESEARCH_PAPER_SS_ENN.md`)](./docs/RESEARCH_PAPER_SS_ENN.md):** الاشتقاق النظري لقوانين النابض الثلاثة، معادلات التوجيه المباشر (`DFA`)، التجارب التسع الكاملة، وتحليل ظاهرة التشكيل الذاتي وترشيح الضوضاء عبر نقطة الارتكاز (`Anchor Denoising Effect`).
+- **[سجل الإصلاحات والترقيات الفيزيائية للإصدار الثاني (`docs/V2_ENGINEERING_LOG_AND_FIXES.md`)](./docs/V2_ENGINEERING_LOG_AND_FIXES.md):** التوثيق الرياضي والبرمجي لقوانين **`v2.0 Milestones 2.1–2.3`** (معالجة انجراف الكيانات، تفتت الصلابة الدفعية، طور النوم المزدوج، إعادة تدوير الخلايا، الدرع التكعيبي، بوابة الجموح الانتقالية، الطيف الهرمي للصلابة، تطبيع الطاقة الموضعي، والتعميم التركيبي الصفري).
 - **[وثيقة الحدود المعمارية وخارطة طريق الإصدار الثاني (`docs/LIMITATIONS_AND_V2_ROADMAP.md`)](./docs/LIMITATIONS_AND_V2_ROADMAP.md):** مراجعة نقدية شاملة للسبع عقبات القياسية نحو نماذج `1B` ومصفوفة التقدم التنفيذية لأطوار `v2.0`.
 - **[مواصفات النواة الأساسية (`docs/SPEC_SPRING_MVP.md`)](./docs/SPEC_SPRING_MVP.md):** وثيقة المواصفات الأولية والقيود الصارمة للنظام.
 

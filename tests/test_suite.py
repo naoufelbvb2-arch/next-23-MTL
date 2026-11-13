@@ -188,6 +188,28 @@ class TestSpringMVPArchitecture(unittest.TestCase):
         for i in range(1, len(gen_ids)):
             self.assertNotEqual(gen_ids[i], gen_ids[i - 1], "Refractory gate must prevent adjacent token duplicates")
 
+    def test_07_milestone_2_3_hierarchical_compositional_generalization(self):
+        """
+        Verify Milestone 2.3 Hierarchical Top-K & Stiffness Spectrum,
+        Parameter-Free Local Active RMSNorm, and Zero-Shot Cross-Recombination
+        on Frozen W_0 Only.
+        """
+        from benchmarks.bench_v2_compositional_gen import run_v2_compositional_gen_benchmark
+
+        results = run_v2_compositional_gen_benchmark(verbose=False)
+        self.assertGreaterEqual(results["scanned_files"], 25)
+        self.assertGreaterEqual(results["v23_train"]["acc"], 90.0)
+        self.assertGreater(results["v23_recomb"]["full_acc"], 90.0)
+        self.assertGreaterEqual(results["v23_recomb"]["binding_acc"], 95.0)
+        self.assertEqual(results["v23_s2_retain_pct"], 100.0)
+        self.assertEqual(results["v23_mean_adj_dup"], 0.0)
+        self.assertEqual(results["v23_mean_loop"], 0.0)
+        # Verify hierarchical Top-K tapers with depth [24, 24, 20, 16] and RMS stabilized ~1.20
+        top_ks = [k["top_k"] for k in results["v23_k_profile"]]
+        self.assertEqual(top_ks, [24, 24, 20, 16])
+        for _, post_rms in results["v23_rms_hybrid"]:
+            self.assertAlmostEqual(post_rms, 1.20, places=2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

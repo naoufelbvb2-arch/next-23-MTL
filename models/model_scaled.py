@@ -168,6 +168,7 @@ class ScaledSpringNetwork(nn.Module):
         stiffness_threshold: float = 0.08,
         error_threshold: float = 0.02,
         cooldown_epochs: int = 2,
+        enable_hierarchical_compositional: bool = True,
         seed: int = 42,
     ):
         super().__init__()
@@ -186,6 +187,7 @@ class ScaledSpringNetwork(nn.Module):
         self.max_seq_len = max_seq_len or cfg["max_seq_len"]
         self.eta_b = eta_b
         self.enable_neurogenesis = enable_neurogenesis
+        self.enable_hierarchical_compositional = enable_hierarchical_compositional
         self.frozen = False
         self.current_epoch = 1
 
@@ -193,6 +195,9 @@ class ScaledSpringNetwork(nn.Module):
         self.register_buffer("token_salience", torch.ones(self.vocab_size))
         # Charging gate alpha(v) for the Salience-Gated EMA Context Capacitor
         self.register_buffer("capacitor_alpha", torch.full((self.vocab_size,), 0.08))
+        # Milestone 2.3: Unsupervised Recurring Content-Entity Phrase Vocabulary Mask
+        self.register_buffer("is_entity_vocab", torch.zeros(self.vocab_size, dtype=torch.bool))
+        self.has_multiword_entities: bool = False
 
         # 1. Law 2: Dual-Horizon Sparse Causal Self-Attention (Future Leakage = 0.0)
         self.sparse_attention = DualHorizonCausalAttention(
@@ -229,6 +234,29 @@ class ScaledSpringNetwork(nn.Module):
         alibi_weights = alibi_weights / alibi_weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)
         self.register_buffer("alibi_causal_weights", alibi_weights)
 
+        # Milestone 2.3: Translation-invariant sliding ALiBi causal window (without pos-0/pos-1 bias)
+        alibi_sliding = (0.60 ** dist) * causal_tril
+        alibi_sliding = alibi_sliding / alibi_sliding.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        self.register_buffer("alibi_sliding_weights", alibi_sliding)
+
+        # Milestone 2.3: Hierarchical Top-K & Stiffness Spectrum across network depth
+        half_layers = max(1, self.num_layers // 2)
+        wide_k = min(self.d_max, int(math.floor(1.5 * self.top_k)))
+        self.hierarchical_top_ks: list[int] = []
+        self.layer_stiff_multipliers: list[float] = []
+        self.layer_stiff_ceilings: list[float] = []
+        for l_idx in range(self.num_layers):
+            if l_idx < half_layers:
+                k_l = wide_k
+            else:
+                denom = max(self.num_layers - half_layers, 1)
+                t_pos = float(l_idx - half_layers + 1) / float(denom)
+                k_l = int(round(wide_k - t_pos * float(wide_k - self.top_k)))
+            self.hierarchical_top_ks.append(max(4, min(self.d_max, k_l)))
+            rho_l = float(l_idx) / float(max(self.num_layers - 1, 1))
+            self.layer_stiff_multipliers.append(0.45 + 1.15 * rho_l)
+            self.layer_stiff_ceilings.append(0.28 + 0.57 * rho_l)
+
         lag1_proj = torch.randn(self.d_max, self.d_max, generator=gen) / math.sqrt(self.d_max)
         lag2_proj = torch.randn(self.d_max, self.d_max, generator=gen) / math.sqrt(self.d_max)
         cap_proj = torch.randn(self.d_max, self.d_max, generator=gen) / math.sqrt(self.d_max)
@@ -258,6 +286,55 @@ class ScaledSpringNetwork(nn.Module):
             for l_idx in range(self.num_layers)
         ])
         self.hidden_layers = self.spring_layers
+        if self.enable_hierarchical_compositional:
+            for l_idx, layer in enumerate(self.spring_layers):
+                layer.top_k = min(layer.d_active, self.hierarchical_top_ks[l_idx])
+
+        # Milestone 2.3: Role-Factored Compositional Springs (Scene vs Entity Start / End)
+        self.role_bridge_head = SpringLayer(
+            in_features=4 * self.d_max + 1,
+            out_features=3,
+            top_k=None,
+            eta_w=0.25,
+            eta_0=0.08,
+            gamma=0.02,
+            beta_k=0.02,
+            activation="identity",
+            use_residual=False,
+            seed=seed + 888,
+        )
+        with torch.no_grad():
+            self.role_bridge_head.w.zero_()
+            self.role_bridge_head.w0.zero_()
+            # Default prior strongly favors SCENE (~91%) over Entity Recall (~9%) until bridge activates
+            scene_prior = torch.tensor([1.5, -1.5, -1.5])
+            self.role_bridge_head.w[:, -1].copy_(scene_prior)
+            self.role_bridge_head.w0[:, -1].copy_(scene_prior)
+            self.role_bridge_head.k.zero_()
+
+        self.entity_proj = SpringLayer(
+            in_features=self.d_max,
+            out_features=self.d_max,
+            top_k=None,
+            eta_w=0.05,
+            eta_0=0.02,
+            gamma=0.05,
+            beta_k=0.02,
+            activation="identity",
+            use_residual=False,
+            seed=seed + 889,
+        )
+        with torch.no_grad():
+            eye_d = torch.eye(self.d_max)
+            self.entity_proj.w.copy_(eye_d)
+            self.entity_proj.w0.copy_(eye_d)
+            self.entity_proj.k.zero_()
+
+        self._last_layer_raw_rms: list[float] = [0.0 for _ in range(self.num_layers)]
+        self._last_layer_normed_rms: list[float] = [0.0 for _ in range(self.num_layers)]
+        self._last_role_probs: torch.Tensor | None = None
+        self._last_ent_logits: torch.Tensor | None = None
+        self._last_ent_slots: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
         # 3. Law 4: Adaptive Hebbian Feedback Router B^(l) in R^{D_max x V}
         self.dfa_router = DFARouter(
@@ -350,19 +427,49 @@ class ScaledSpringNetwork(nn.Module):
         counts = torch.zeros(self.vocab_size, dtype=torch.float32)
         doc_freq = torch.zeros(self.vocab_size, dtype=torch.float32)
         burst_freq = torch.zeros(self.vocab_size, dtype=torch.float32)
+        unigram_cross_burst = torch.zeros(self.vocab_size, dtype=torch.float32)
+        bigram_df: dict[tuple[int, int], float] = {}
+        bigram_cross_burst: dict[tuple[int, int], float] = {}
         n_docs = max(len(token_sequences), 1)
 
         for seq in token_sequences:
             seq_counts: dict[int, int] = {}
-            for tid in seq:
+            uni_pos: dict[int, list[int]] = {}
+            bi_pos: dict[tuple[int, int], list[int]] = {}
+            prev_tid = -1
+            for pos, tid in enumerate(seq):
                 if 0 <= tid < self.vocab_size and tid not in (pad_id, bos_id, eos_id):
                     counts[tid] += 1.0
                     seq_counts[tid] = seq_counts.get(tid, 0) + 1
+                    uni_pos.setdefault(tid, []).append(pos)
+                    if prev_tid >= 0:
+                        bi_pos.setdefault((prev_tid, tid), []).append(pos)
+                    prev_tid = tid
+                else:
+                    prev_tid = -1
             for tid, c in seq_counts.items():
                 doc_freq[tid] += 1.0
                 if c >= 2:
-                    # Exclude ultra-ubiquitous structural tokens (appearing in >35% of docs) from burstiness
+                    # Exclude ultra-ubiquitous structural tokens (appearing in >30% of docs) from burstiness
                     burst_freq[tid] += 1.0
+                plist = uni_pos[tid]
+                if len(plist) >= 2 and (plist[-1] - plist[0]) >= 4:
+                    unigram_cross_burst[tid] += 1.0
+            for bg, plist in bi_pos.items():
+                bigram_df[bg] = bigram_df.get(bg, 0.0) + 1.0
+                if len(plist) >= 2 and (plist[-1] - plist[0]) >= 4:
+                    bigram_cross_burst[bg] = bigram_cross_burst.get(bg, 0.0) + 1.0
+
+        phrase_burst_score = torch.zeros(self.vocab_size, dtype=torch.float32)
+        df_thresh = 0.30 * float(n_docs)
+        for (u, v), b_df in bigram_df.items():
+            if b_df > 0 and doc_freq[u] < df_thresh and doc_freq[v] < df_thresh:
+                ratio = bigram_cross_burst.get((u, v), 0.0) / b_df
+                if ratio >= 0.45:
+                    if ratio > float(phrase_burst_score[u].item()):
+                        phrase_burst_score[u] = ratio
+                    if ratio > float(phrase_burst_score[v].item()):
+                        phrase_burst_score[v] = ratio
 
         total_tokens = float(counts.sum().item())
         active_vocab = counts > 0
@@ -375,7 +482,12 @@ class ScaledSpringNetwork(nn.Module):
             selective_mask = (doc_freq < (0.30 * float(n_docs))).float()
             burst_ratio = (burst_freq / (doc_freq + 1.0)) * selective_mask
 
-            raw_info = 0.55 * inv_log_tf + 0.45 * idf + 1.85 * burst_ratio
+            raw_info = (
+                0.50 * inv_log_tf
+                + 0.40 * idf
+                + 1.50 * burst_ratio
+                + 2.20 * phrase_burst_score
+            )
             min_val = float(raw_info[active_vocab].min().item())
             max_val = float(raw_info[active_vocab].max().item())
             span = max(max_val - min_val, 1e-6)
@@ -392,6 +504,16 @@ class ScaledSpringNetwork(nn.Module):
 
         self.token_salience.copy_(salience)
         self.sparse_attention.set_token_salience(salience)
+
+        phrase_mask = phrase_burst_score >= 0.45
+        uni_cross_ratio = unigram_cross_burst / (doc_freq + 1e-6)
+        single_mask = (uni_cross_ratio >= 0.65) & (doc_freq < (0.25 * float(n_docs))) & (salience >= 1.45)
+        self.has_multiword_entities = bool(phrase_mask.any().item())
+        entity_mask = phrase_mask | single_mask
+        entity_mask[pad_id] = False
+        entity_mask[bos_id] = False
+        entity_mask[eos_id] = False
+        self.is_entity_vocab.copy_(entity_mask)
 
         # Salience-Gated EMA Capacitor charging rate alpha(v):
         # Discourse entities with high salience (s(v) >= 1.45) strongly latch into c_t (alpha ~ 0.46),
@@ -465,16 +587,19 @@ class ScaledSpringNetwork(nn.Module):
         head_curr_active = 3 * (v * d_last)
         head_frozen_w0 = v * d_last
 
+        role_w0 = ((4 * d_max + 1) * 3 + d_max * d_max) if self.enable_hierarchical_compositional else 0
+        role_train = 3 * role_w0
+
         total_latent_train_params = (
-            emb_params + attn_train_params + hidden_max_train + dfa_params + head_max_train
+            emb_params + attn_train_params + hidden_max_train + dfa_params + head_max_train + role_train
         )
         total_init_active_params = (
-            emb_params + attn_train_params + hidden_init_active + (self.num_layers * d_init * v) + head_init_active
+            emb_params + attn_train_params + hidden_init_active + (self.num_layers * d_init * v) + head_init_active + role_train
         )
         total_curr_active_params = (
-            emb_params + attn_train_params + hidden_curr_active + sum(d * v for d in d_acts) + head_curr_active
+            emb_params + attn_train_params + hidden_curr_active + sum(d * v for d in d_acts) + head_curr_active + role_train
         )
-        total_frozen_prod_params = emb_params + attn_frozen_params + hidden_frozen_w0 + head_frozen_w0
+        total_frozen_prod_params = emb_params + attn_frozen_params + hidden_frozen_w0 + head_frozen_w0 + role_w0
 
         live_bytes = sum(b.numel() * b.element_size() for b in self.buffers() if b is not None)
         live_mb = live_bytes / (1024.0 * 1024.0)
@@ -518,7 +643,12 @@ class ScaledSpringNetwork(nn.Module):
         x_pos = tok_emb + pos_emb
 
         # 3. ALiBi local causal window [B, T, D_max]
-        w_alibi = self.alibi_causal_weights[:seq_len, :seq_len]
+        if self.enable_hierarchical_compositional and not self.continual_mode:
+            w_alibi = self.alibi_sliding_weights[:seq_len, :seq_len]
+            cap_gain = 0.45
+        else:
+            w_alibi = self.alibi_causal_weights[:seq_len, :seq_len]
+            cap_gain = 1.65
         alibi_ctx = torch.matmul(w_alibi.unsqueeze(0), x_pos)
 
         # 4. Salience-Gated EMA Context Capacitor c_t [B, T, D_max]
@@ -541,7 +671,155 @@ class ScaledSpringNetwork(nn.Module):
         if seq_len > 2:
             lag2[:, 2:, :] = F.linear(tok_emb[:, :-2, :], self.lag2_proj)
 
-        return attn_out + alibi_ctx + 1.65 * cap_ctx + lag1 + lag2
+        return attn_out + alibi_ctx + cap_gain * cap_ctx + lag1 + lag2
+
+    @staticmethod
+    def _apply_branch_rmsnorm(
+        a_sparse: torch.Tensor,
+        mask: torch.Tensor,
+        target_rms: float = 0.65,
+    ) -> torch.Tensor:
+        """
+        Law 2 (Milestone 2.3): Parameter-Free Active Sparse RMSNorm over winning units K_wins.
+        """
+        k_wins = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        active_rms = torch.sqrt(a_sparse.pow(2).sum(dim=-1, keepdim=True) / k_wins + 1e-6)
+        return a_sparse * (target_rms / active_rms)
+
+    @staticmethod
+    def _apply_subspace_rmsnorm(
+        x_sub: torch.Tensor,
+        target_rms: float = 1.20,
+    ) -> tuple[torch.Tensor, float, float]:
+        """
+        Law 2 (Milestone 2.3): Parameter-Free Layer-Subspace RMS Stabilization across depth.
+        Returns (normalized_tensor, raw_rms_mean, normed_rms_mean).
+        """
+        raw_rms = torch.sqrt(x_sub.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        x_normed = x_sub * (target_rms / raw_rms)
+        normed_rms = torch.sqrt(x_normed.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        return x_normed, float(raw_rms.mean().item()), float(normed_rms.mean().item())
+
+    @torch.no_grad()
+    def _extract_causal_entity_slots(
+        self, input_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Causally tracks the most recently completed recurring content-entity phrase
+        (start_emb, end_emb, start_id, end_id, has_completed) across time t = 0..T-1
+        without peeking at any future tokens.
+        """
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
+        tok_emb = self.sparse_attention.token_embedding[input_ids]
+        is_ent = self.is_entity_vocab[input_ids]
+
+        last_start_emb = torch.zeros(bsz, seq_len, self.d_max, device=device)
+        last_end_emb = torch.zeros(bsz, seq_len, self.d_max, device=device)
+        last_start_id = torch.full((bsz, seq_len), -1, dtype=torch.long, device=device)
+        last_end_id = torch.full((bsz, seq_len), -1, dtype=torch.long, device=device)
+        has_completed = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device)
+
+        cur_start_emb = torch.zeros(bsz, self.d_max, device=device)
+        cur_end_emb = torch.zeros(bsz, self.d_max, device=device)
+        cur_start_id = torch.full((bsz,), -1, dtype=torch.long, device=device)
+        cur_end_id = torch.full((bsz,), -1, dtype=torch.long, device=device)
+        cur_len = torch.zeros(bsz, dtype=torch.long, device=device)
+
+        comp_start_emb = torch.zeros(bsz, self.d_max, device=device)
+        comp_end_emb = torch.zeros(bsz, self.d_max, device=device)
+        comp_start_id = torch.full((bsz,), -1, dtype=torch.long, device=device)
+        comp_end_id = torch.full((bsz,), -1, dtype=torch.long, device=device)
+        comp_ready = torch.zeros(bsz, dtype=torch.bool, device=device)
+
+        for t in range(seq_len):
+            ent_t = is_ent[:, t]
+            non_ent_t = ~ent_t
+            id_t = input_ids[:, t]
+            emb_t = tok_emb[:, t, :]
+
+            just_finished = non_ent_t & (cur_len > 0)
+            valid_commit = just_finished & (cur_len >= 2) if self.has_multiword_entities else just_finished
+            if valid_commit.any():
+                comp_start_emb[valid_commit] = cur_start_emb[valid_commit]
+                comp_end_emb[valid_commit] = cur_end_emb[valid_commit]
+                comp_start_id[valid_commit] = cur_start_id[valid_commit]
+                comp_end_id[valid_commit] = cur_end_id[valid_commit]
+                comp_ready[valid_commit] = True
+            cur_len[non_ent_t] = 0
+
+            new_phrase = ent_t & (cur_len == 0)
+            cont_phrase = ent_t & (cur_len >= 1)
+            if new_phrase.any():
+                cur_start_emb[new_phrase] = emb_t[new_phrase]
+                cur_end_emb[new_phrase] = emb_t[new_phrase]
+                cur_start_id[new_phrase] = id_t[new_phrase]
+                cur_end_id[new_phrase] = id_t[new_phrase]
+            if cont_phrase.any():
+                cur_end_emb[cont_phrase] = emb_t[cont_phrase]
+                cur_end_id[cont_phrase] = id_t[cont_phrase]
+            cur_len[ent_t] += 1
+
+            last_start_emb[:, t, :] = comp_start_emb
+            last_end_emb[:, t, :] = comp_end_emb
+            last_start_id[:, t] = comp_start_id
+            last_end_id[:, t] = comp_end_id
+            has_completed[:, t] = comp_ready
+
+        return last_start_emb, last_end_emb, last_start_id, last_end_id, has_completed
+
+    @torch.no_grad()
+    def _compute_role_factored_entity_logits(
+        self, input_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Law 3 (Milestone 2.3): Role-Factored Compositional Subject-Scene Decoupling.
+        Reads local [lag2_unit, lag1_unit, tok_unit] through `role_bridge_head` to predict
+        (P_SCENE, P_ENT_START, P_ENT_END). When entity retrieval activates after a completed
+        entity phrase, projects `ent_mix` via `entity_proj` into unit token embedding space.
+        """
+        bsz, seq_len = input_ids.shape
+        n_total = bsz * seq_len
+        tok_emb = self.sparse_attention.token_embedding[input_ids]
+        tok_unit = F.normalize(tok_emb, p=2, dim=-1, eps=1e-6)
+
+        lag1_unit = torch.zeros_like(tok_unit)
+        if seq_len > 1:
+            lag1_unit[:, 1:, :] = tok_unit[:, :-1, :]
+        lag2_unit = torch.zeros_like(tok_unit)
+        if seq_len > 2:
+            lag2_unit[:, 2:, :] = tok_unit[:, :-2, :]
+        lag3_unit = torch.zeros_like(tok_unit)
+        if seq_len > 3:
+            lag3_unit[:, 3:, :] = tok_unit[:, :-3, :]
+        bias_col = torch.ones(bsz, seq_len, 1, device=input_ids.device)
+
+        win_feat = torch.cat(
+            [lag3_unit, lag2_unit, lag1_unit, tok_unit, bias_col], dim=-1
+        ).reshape(n_total, 4 * self.d_max + 1)
+        role_logits = self.role_bridge_head(win_feat)  # [N, 3]
+        role_probs = F.softmax(role_logits, dim=-1)
+        p_ent_start = role_probs[:, 1]
+        p_ent_end = role_probs[:, 2]
+        p_ent_sum = p_ent_start + p_ent_end
+
+        start_emb, end_emb, start_id, end_id, has_comp = self._extract_causal_entity_slots(input_ids)
+        start_flat = start_emb.reshape(n_total, self.d_max)
+        end_flat = end_emb.reshape(n_total, self.d_max)
+        has_comp_flat = has_comp.reshape(n_total)
+
+        ent_mix = (
+            p_ent_start.unsqueeze(-1) * start_flat + p_ent_end.unsqueeze(-1) * end_flat
+        ) / p_ent_sum.clamp(min=1e-6).unsqueeze(-1)
+
+        ent_proj_out = self.entity_proj(ent_mix)
+        ent_vec = F.normalize(ent_proj_out, p=2, dim=-1, eps=1e-6)
+        emb_unit = F.normalize(self.sparse_attention.token_embedding, p=2, dim=-1, eps=1e-6)
+        ent_logits = 22.0 * F.linear(ent_vec, emb_unit)  # [N, V]
+
+        ent_gate = has_comp_flat & (p_ent_sum > 0.60)
+        slots_tuple = (start_id.reshape(n_total), end_id.reshape(n_total), has_comp_flat)
+        return ent_logits, ent_gate, role_probs, p_ent_sum, slots_tuple
 
     @torch.no_grad()
     def _forward_dynamic_layer(
@@ -552,78 +830,140 @@ class ScaledSpringNetwork(nn.Module):
         phase_id: int | None = None,
     ) -> torch.Tensor:
         """
-        Executes a DynamicSpringLayer, supporting compacted frozen W0 matrices and
-        Resonant Specialist Subspace Routing across continual phases.
+        Executes a DynamicSpringLayer, supporting:
+          - Compacted frozen W0 matrices & Resonant Specialist Subspace Routing (continual mode)
+          - Hierarchical Top-K Spectrum & Parameter-Free Local Active RMSNorm (Milestone 2.3)
         """
-        if self.frozen and hasattr(layer, "_compacted_indices") and layer._compacted_indices is not None:
-            idx = layer._compacted_indices
+        k_base = self.hierarchical_top_ks[l_idx] if self.enable_hierarchical_compositional else layer.top_k
+
+        if self.frozen:
+            has_comp = hasattr(layer, "_compacted_indices") and layer._compacted_indices is not None
+            if not has_comp and not self.enable_hierarchical_compositional:
+                out = layer(a_prev)
+                d_out = layer.w0.shape[0]
+                rms = float(torch.sqrt(out[:, :d_out].pow(2).mean(dim=-1, keepdim=True) + 1e-6).mean().item())
+                self._last_layer_raw_rms[l_idx] = rms
+                self._last_layer_normed_rms[l_idx] = rms
+                return out
+
             in_dim = layer.w0.shape[1]
-            if phase_id is not None and phase_id in self.phase_compacted_slots:
-                c_pos = self.phase_compacted_slots[phase_id][l_idx]
-                w_sub = layer.w0[c_pos, :]
-                orig_idx = idx[c_pos]
+            if has_comp:
+                idx = layer._compacted_indices
+                if phase_id is not None and phase_id in self.phase_compacted_slots:
+                    c_pos = self.phase_compacted_slots[phase_id][l_idx]
+                    w_sub = layer.w0[c_pos, :]
+                    orig_idx = idx[c_pos]
+                else:
+                    w_sub = layer.w0
+                    orig_idx = idx
             else:
                 w_sub = layer.w0
-                orig_idx = idx
+                orig_idx = None
 
             z_kept = F.linear(a_prev[:, :in_dim], w_sub)  # [N, D_sub]
             d_kept = z_kept.shape[1]
-            if layer.top_k is not None and layer.top_k < d_kept:
-                _, top_idx = torch.topk(z_kept.abs(), k=layer.top_k, dim=-1)
+            if self.continual_mode:
+                k_eff = min(k_base or d_kept, max(8, d_kept // 2)) if d_kept > 8 else d_kept
+            else:
+                k_eff = min(k_base, d_kept) if k_base is not None else d_kept
+
+            if k_eff is not None and 0 < k_eff < d_kept:
+                _, top_idx = torch.topk(z_kept.abs(), k=k_eff, dim=-1)
                 mask_kept = torch.zeros_like(z_kept)
                 mask_kept.scatter_(-1, top_idx, 1.0)
             else:
                 mask_kept = torch.ones_like(z_kept)
             act_kept = F.leaky_relu(z_kept, negative_slope=0.1) * mask_kept
+
             a_out = a_prev.clone()
-            a_out[:, orig_idx] = a_out[:, orig_idx] + act_kept
+            if orig_idx is not None:
+                a_out[:, orig_idx] = a_out[:, orig_idx] + act_kept
+                sub_view = a_out[:, orig_idx]
+            else:
+                a_out[:, :d_kept] = a_out[:, :d_kept] + act_kept
+                sub_view = a_out[:, :d_kept]
+
+            if self.enable_hierarchical_compositional:
+                sub_normed, raw_rms, normed_rms = self._apply_subspace_rmsnorm(sub_view, target_rms=1.20)
+                if orig_idx is not None:
+                    a_out[:, orig_idx] = sub_normed
+                else:
+                    a_out[:, :d_kept] = sub_normed
+            else:
+                raw_rms = float(torch.sqrt(sub_view.pow(2).mean(dim=-1, keepdim=True) + 1e-6).mean().item())
+                normed_rms = raw_rms
+
+            self._last_layer_raw_rms[l_idx] = raw_rms
+            self._last_layer_normed_rms[l_idx] = normed_rms
             return a_out
 
-        if self.continual_mode and not self.frozen:
+        if not self.continual_mode and not self.enable_hierarchical_compositional:
+            out = layer(a_prev)
             d_act = layer.d_active
-            w_active = layer.w[:d_act, :]
-            z_active = F.linear(a_prev, w_active)
-
-            # Restrict wakeful Top-K competition to the current phase's plastic cell pool
-            if self.current_phase_slots[l_idx]:
-                plastic_mask = torch.zeros(d_act, dtype=torch.bool, device=a_prev.device)
-                for s_idx in self.current_phase_slots[l_idx]:
-                    if s_idx < d_act:
-                        plastic_mask[s_idx] = True
-                z_for_topk = z_active.abs().masked_fill(~plastic_mask.unsqueeze(0), -1.0)
-            else:
-                z_for_topk = z_active.abs()
-
-            if layer.top_k is not None and 0 < layer.top_k < d_act:
-                _, top_indices = torch.topk(z_for_topk, k=layer.top_k, dim=-1)
-                mask_active = torch.zeros_like(z_active)
-                mask_active.scatter_(-1, top_indices, 1.0)
-            else:
-                mask_active = torch.ones_like(z_active)
-            a_active = layer._activate(z_active) * mask_active
-
-            bsz = a_prev.shape[0]
-            z_full = torch.zeros(bsz, self.d_max, device=a_prev.device)
-            mask_full = torch.zeros(bsz, self.d_max, device=a_prev.device)
-            a_full = torch.zeros(bsz, self.d_max, device=a_prev.device)
-            z_full[:, :d_act] = z_active
-            mask_full[:, :d_act] = mask_active
-            a_full[:, :d_act] = a_active
-
-            batch_wins = mask_full.sum(dim=0)
-            layer.win_counts.add_(batch_wins)
-            layer.epoch_win_counts.add_(batch_wins)
-
-            layer._last_a_prev = a_prev.detach()
-            layer._last_z = z_full.detach()
-            layer._last_mask = mask_full.detach()
-            layer._last_a = a_full.detach()
-
-            out = a_prev.clone()
-            out[:, :d_act] = a_prev[:, :d_act] + a_active
+            rms = float(torch.sqrt(out[:, :d_act].pow(2).mean(dim=-1, keepdim=True) + 1e-6).mean().item())
+            self._last_layer_raw_rms[l_idx] = rms
+            self._last_layer_normed_rms[l_idx] = rms
             return out
 
-        return layer(a_prev)
+        d_act = layer.d_active
+        w_active = layer.w[:d_act, :]
+        z_active = F.linear(a_prev, w_active)
+
+        if self.continual_mode and self.current_phase_slots[l_idx]:
+            plastic_mask = torch.zeros(d_act, dtype=torch.bool, device=a_prev.device)
+            for s_idx in self.current_phase_slots[l_idx]:
+                if s_idx < d_act:
+                    plastic_mask[s_idx] = True
+            z_for_topk = z_active.abs().masked_fill(~plastic_mask.unsqueeze(0), -1.0)
+            pool_size = int(plastic_mask.sum().item())
+            k_eff = min(k_base or d_act, max(8, pool_size // 2)) if pool_size > 8 else pool_size
+        else:
+            z_for_topk = z_active.abs()
+            k_eff = min(k_base, d_act) if k_base is not None else d_act
+
+        if k_eff is not None and 0 < k_eff < d_act:
+            _, top_indices = torch.topk(z_for_topk, k=k_eff, dim=-1)
+            mask_active = torch.zeros_like(z_active)
+            mask_active.scatter_(-1, top_indices, 1.0)
+        else:
+            mask_active = torch.ones_like(z_active)
+        a_active = layer._activate(z_active) * mask_active
+
+        bsz = a_prev.shape[0]
+        z_full = torch.zeros(bsz, self.d_max, device=a_prev.device)
+        mask_full = torch.zeros(bsz, self.d_max, device=a_prev.device)
+        a_full = torch.zeros(bsz, self.d_max, device=a_prev.device)
+        z_full[:, :d_act] = z_active
+        mask_full[:, :d_act] = mask_active
+
+        batch_wins = mask_full.sum(dim=0)
+        layer.win_counts.add_(batch_wins)
+        layer.epoch_win_counts.add_(batch_wins)
+
+        winner_rows = mask_active.sum(dim=0) > 0
+        if winner_rows.any():
+            layer._last_winner_k = float(layer.k[:d_act, :][winner_rows].mean().item())
+
+        a_full[:, :d_act] = a_active
+
+        layer._last_a_prev = a_prev.detach()
+        layer._last_z = z_full.detach()
+        layer._last_mask = mask_full.detach()
+        layer._last_a = a_full.detach()
+
+        out = a_prev.clone()
+        out[:, :d_act] = a_prev[:, :d_act] + a_active
+
+        if self.enable_hierarchical_compositional:
+            out_sub, raw_rms, normed_rms = self._apply_subspace_rmsnorm(out[:, :d_act], target_rms=1.20)
+            out[:, :d_act] = out_sub
+        else:
+            raw_rms = float(torch.sqrt(out[:, :d_act].pow(2).mean(dim=-1, keepdim=True) + 1e-6).mean().item())
+            normed_rms = raw_rms
+
+        self._last_layer_raw_rms[l_idx] = raw_rms
+        self._last_layer_normed_rms[l_idx] = normed_rms
+        return out
 
     @torch.no_grad()
     def _detect_resonant_phase(self, seq_ids: torch.Tensor) -> int:
@@ -690,13 +1030,29 @@ class ScaledSpringNetwork(nn.Module):
 
         if self.frozen:
             in_dim = self.output_head.w0.shape[1]
-            logits_flat = F.linear(a[:, :in_dim], self.output_head.w0)
+            scene_logits = F.linear(a[:, :in_dim], self.output_head.w0)
         else:
             d_last = self._final_layer_dim()
             a_masked = a.clone()
             if d_last < self.d_max:
                 a_masked[:, d_last:] = 0.0
-            logits_flat = self.output_head(a_masked)
+            scene_logits = self.output_head(a_masked)
+
+        if self.enable_hierarchical_compositional and (not self.continual_mode):
+            ent_logits, ent_gate, role_probs, _, slots_tuple = self._compute_role_factored_entity_logits(
+                input_ids
+            )
+            logits_flat = scene_logits.clone()
+            if ent_gate.any():
+                logits_flat[ent_gate] = 0.15 * scene_logits[ent_gate] + ent_logits[ent_gate]
+            self._last_role_probs = role_probs.detach()
+            self._last_ent_logits = ent_logits.detach()
+            self._last_ent_slots = slots_tuple
+        else:
+            logits_flat = scene_logits
+            self._last_role_probs = None
+            self._last_ent_logits = None
+            self._last_ent_slots = None
 
         logits = logits_flat.reshape(bsz, seq_len, self.vocab_size)
         if single_seq:
@@ -710,6 +1066,7 @@ class ScaledSpringNetwork(nn.Module):
         projected_error: torch.Tensor,
         n_valid: float,
         maturity_stiff_gain: float,
+        l_idx: int = 0,
     ) -> None:
         """
         Law 3 & Milestone 2.2 Cubic Anchor Shield:
@@ -756,13 +1113,15 @@ class ScaledSpringNetwork(nn.Module):
         delta_w0 = layer.eta_0 * shield_w0 * stretch_diff_new
         w0_act.add_(delta_w0)
 
-        # Law 3: Winner-Count Normalized & Maturity-Gated Stiffening (k)
+        # Law 3: Winner-Count Normalized & Maturity-Gated Stiffening (k) with Hierarchical Spectrum
         active_row_gate = (mask_act.sum(dim=0) > 0).float().unsqueeze(1)
         win_norm_factor = (max(n_valid, 1.0) / (wins_per_cell * sparsity_ratio)).clamp(1.0, 8.0)
-        effective_beta_k = layer.beta_k * maturity_stiff_gain * win_norm_factor
+        stiff_mult = self.layer_stiff_multipliers[l_idx] if self.enable_hierarchical_compositional else 1.0
+        stiff_ceil = self.layer_stiff_ceilings[l_idx] if self.enable_hierarchical_compositional else 0.85
+        effective_beta_k = layer.beta_k * maturity_stiff_gain * win_norm_factor * stiff_mult
         delta_k = effective_beta_k * stretch_diff_new.abs() * (1.0 - k_act) * active_row_gate
-        # Preserve sleep-armored stiffness (> 0.85) while capping normal training stiffness at 0.85
-        max_cap = torch.where(k_act >= 0.85, k_act, torch.full_like(k_act, 0.85))
+        # Preserve sleep-armored stiffness (> 0.85) while respecting hierarchical stiffness ceilings
+        max_cap = torch.where(k_act >= 0.85, k_act, torch.full_like(k_act, stiff_ceil))
         k_act.add_(delta_k).clamp_(0.0, 0.98)
         k_act.copy_(torch.minimum(k_act, max_cap))
 
@@ -850,6 +1209,7 @@ class ScaledSpringNetwork(nn.Module):
                 projected_error=delta_l_active,
                 n_valid=n_valid,
                 maturity_stiff_gain=maturity_gain,
+                l_idx=l_idx,
             )
 
             # Keep rejuvenated/dormant slots zeroed until explicitly awakened
@@ -896,6 +1256,47 @@ class ScaledSpringNetwork(nn.Module):
                 )
         else:
             self.output_head.local_spring_update(e_scaled)
+
+        # 5. Milestone 2.3: Unsupervised Local Spring Update of Role-Factored Bridges
+        if (
+            self.enable_hierarchical_compositional
+            and (not self.continual_mode)
+            and self._last_ent_slots is not None
+            and self._last_role_probs is not None
+        ):
+            last_start_id, last_end_id, has_comp = self._last_ent_slots
+            match_start = has_comp & (targets_flat == last_start_id) & (targets_flat != pad_id)
+            match_end = (
+                has_comp
+                & (~match_start)
+                & (targets_flat == last_end_id)
+                & (inputs_flat == last_start_id)
+                & (targets_flat != pad_id)
+            )
+            role_target = torch.where(
+                match_start,
+                torch.ones_like(targets_flat),
+                torch.where(match_end, torch.full_like(targets_flat, 2), torch.zeros_like(targets_flat)),
+            )
+
+            role_train_mask = valid_mask * has_comp.float()
+            n_role_valid = float(role_train_mask.sum().item())
+            if n_role_valid > 0:
+                role_onehot = F.one_hot(role_target, num_classes=3).float()
+                role_class_w = torch.where(role_target > 0, 4.5, 1.0)
+                role_err = (role_onehot - self._last_role_probs) * (role_train_mask * role_class_w).unsqueeze(-1)
+                role_err = role_err * (float(n_total) / max(n_role_valid, 1.0))
+                self.role_bridge_head.local_spring_update(role_err)
+
+            ent_step_mask = (valid_mask > 0) & has_comp & (role_target > 0)
+            n_ent = float(ent_step_mask.sum().item())
+            if n_ent > 0 and self._last_ent_logits is not None:
+                ent_probs = F.softmax(self._last_ent_logits, dim=-1)
+                ent_err = (y_onehot - ent_probs) * ent_step_mask.float().unsqueeze(-1)
+                ent_err = ent_err * (float(n_total) / max(n_ent, 1.0))
+                emb_unit = F.normalize(self.sparse_attention.token_embedding, p=2, dim=-1, eps=1e-6)
+                proj_err = torch.matmul(ent_err, emb_unit) * ent_step_mask.float().unsqueeze(-1)
+                self.entity_proj.local_spring_update(proj_err)
 
         return {
             "ce_loss": ce_loss,
@@ -1055,6 +1456,8 @@ class ScaledSpringNetwork(nn.Module):
                 token_error_rate=token_error_rate,
             )
             if ev is not None:
+                if self.enable_hierarchical_compositional:
+                    layer.top_k = min(layer.d_active, self.hierarchical_top_ks[l_idx])
                 ev["rejuvenated_in_place"] = 0
                 events.append(ev)
                 self.growth_log.append(ev)
@@ -1366,6 +1769,11 @@ class ScaledSpringNetwork(nn.Module):
 
             unlocked_vocab = ~self.locked_excl_vocab_mask
             self.output_head.w0[unlocked_vocab].lerp_(self.output_head.w[unlocked_vocab], 0.30)
+
+        self.role_bridge_head.w0.lerp_(self.role_bridge_head.w, 0.45)
+        self.role_bridge_head.production_freeze()
+        self.entity_proj.w0.lerp_(self.entity_proj.w, 0.30)
+        self.entity_proj.production_freeze()
 
         self.sparse_attention.production_freeze()
         self.sparse_attention.B_attn = None
