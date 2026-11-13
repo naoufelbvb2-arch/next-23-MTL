@@ -1,4 +1,4 @@
-# سجل الإصلاحات الهندسية والترقيات الفيزيائية للإصدار الثاني (SS-ENN v2.0 — Milestone 2.1)
+# سجل الإصلاحات الهندسية والترقيات الفيزيائية للإصدار الثاني (SS-ENN v2.0 — Milestones 2.1 & 2.2)
 **Engineering Log, Bottleneck Diagnostics, and Permanent v2.0 Core Physics Upgrades on the Million-Parameter CPU Engine**
 
 ---
@@ -15,7 +15,7 @@
      - **`Validation Split (10% Held-Out Compositional)`:** `39` فقرة (`1,404` رموز) مؤلفة من توليفات سردية لم يرها النموذج حرفياً أثناء التدريب لقياس التعميم الحقيقي (`Validation Perplexity & Next-Token Accuracy`).
 3. **المحرك المليوني المصفوفي ([`models/model_scaled.py`](../models/model_scaled.py)):**
    - الفئة `ScaledSpringNetwork` التي تدعم إعدادَي `1.5M` (`V=2048, L=4, D_init=64, D_max=256, K=16`) و `5M` (`V=4096, L=6, D_init=128, D_max=512, K=32`).
-   - بدلاً من حلقات `for` التسلسلية الفردية، تُنفذ جميع عمليات الانتباه السببي والنافذة الموضعية (`ALiBi`) وطبقات النوابض الديناميكية كعمليات مصفوفية ثلاثية الأبعاد `[Batch_Size=32, Seq_Len=36, D_max=256]` مدمجة في `[B * T, D_max]`، مما رفع سرعة التدريب على المعالج المحلي (`CPU`) إلى **`8,500 – 12,171` رمز/ثانية** وسرعة الاستدلال الدفعي بعد التجميد إلى **`27,088` رمز/ثانية**.
+   - بدلاً من حلقات `for` التسلسلية الفردية، تُنفذ جميع عمليات الانتباه السببي والنافذة الموضعية (`ALiBi`) وطبقات النوابض الديناميكية كعمليات مصفوفية ثلاثية الأبعاد `[Batch_Size=32, Seq_Len=36, D_max=256]` مدمجة في `[B * T, D_max]`، مما رفع متوسط سرعة التدريب على المعالج المحلي (`CPU`) إلى **`10,523` رمز/ثانية** (الذروة **`13,010` رمز/ثانية**) وسرعة الاستدلال الدفعي بعد التجميد إلى **`38,660` رمز/ثانية**.
 
 ---
 
@@ -45,7 +45,7 @@
 تمت معالجة الظاهرتين جذرياً عبر أربعة قوانين فيزيائية عامة ومستقلة عن أي بيانات خاصة، ومطبقة بالكامل داخل [`models/model_scaled.py`](../models/model_scaled.py) و [`benchmarks/bench_scale_english_cpu.py`](../benchmarks/bench_scale_english_cpu.py):
 
 ### 3.1 القانون الأول: الترجيح اللوغاريتمي المقيّد لأهمية الرموز (`Law 1: Clipped Log-Salience Weighting`)
-- **الموقع البرمجي:** الدالة [`ScaledSpringNetwork.calibrate_salience_from_tokens`](../models/model_scaled.py#L294-L369) (الأسطر `294–369`) وتطبيقها في [`train_minibatch`](../models/model_scaled.py#L609-L616) (الأسطر `609–616`).
+- **الموقع البرمجي:** الدالة [`ScaledSpringNetwork.calibrate_salience_from_tokens`](../models/model_scaled.py#L331-L415) (الأسطر `331–415`) وتطبيقها في [`train_minibatch`](../models/model_scaled.py#L812-L821) (الأسطر `812–821`).
 - **الصياغة الرياضية:**
   يُحسب لكل رمز $v \in \{1, \dots, V\}$ مؤشر معلومات مركب $I(v)$ يجمع بين الندرة اللوغاريتمية للرمز والوثيقة (`Inverse Log TF + IDF`) وبين **معامل التواتر الموضوعي داخل الفقرة (`Intra-Document Burstiness`)** الذي يميز الكيانات المحورية التي تتكرر عبر جمل الفقرة الواحدة عن الكلمات الوظيفية أو الظروف العابرة:
   $$\text{IDF}(v) = \log\!\left(\frac{N_{\text{docs}} + 1}{\text{DF}(v) + 1}\right), \qquad \text{Burst}(v) = \frac{\sum_{d=1}^{N_{\text{docs}}} \mathbb{I}\!\left(\text{count}(v, d) \ge 2\right)}{\text{DF}(v) + 1} \cdot \mathbb{I}\!\left(\text{DF}(v) < 0.30\,N_{\text{docs}}\right)$$
@@ -62,7 +62,7 @@
 ### 3.2 القانون الثاني: مكثف السياق المستمر المحكوم بالأهمية والانتباه ثنائي الأفق (`Law 2: Salience-Gated EMA Capacitor + Dual-Horizon Sparse Attention`)
 - **الموقع البرمجي:**
   - الفئة [`DualHorizonCausalAttention`](../models/model_scaled.py#L65-L141) (الأسطر `65–141`).
-  - الدالة [`ScaledSpringNetwork._build_vectorized_context`](../models/model_scaled.py#L442-L483) (الأسطر `442–483`).
+  - الدالة [`ScaledSpringNetwork._build_vectorized_context`](../models/model_scaled.py#L504-L544) (الأسطر `504–544`).
 - **الصياغة الرياضية:**
   1. **مكثف السياق المستمر المحكوم ببوابة الأهمية (`Salience-Gated EMA Context Capacitor`):**
      يحتفظ كل تسلسل بمتجه مكثف سياقي سببي $\mathbf{c}_t \in \mathbb{R}^{D_{\max}}$ يتحدث عند كل رمز $x_t$ وفق:
@@ -79,7 +79,7 @@
 ---
 
 ### 3.3 القانون الثالث: معايرة التحديث والتصلب بعدد مرات الفوز الفعلي (`Law 3: Winner-Count Normalized Spring & Maturity-Gated Stiffening`)
-- **الموقع البرمجي:** الدالة [`ScaledSpringNetwork._update_dynamic_layer_winner_normalized`](../models/model_scaled.py#L522-L580) (الأسطر `522–580`) وجدول النضج في [`train_minibatch`](../models/model_scaled.py#L624-L629) (الأسطر `624–629`).
+- **الموقع البرمجي:** الدالة [`ScaledSpringNetwork._update_dynamic_layer_winner_normalized`](../models/model_scaled.py#L707-L767) (الأسطر `707–767`) وجدول النضج في [`train_minibatch`](../models/model_scaled.py#L829-L833) (الأسطر `829–833`).
 - **الصياغة الرياضية:**
   لكل خلية نشطة $j \in \{1, \dots, D_{\text{active}}\}$، يُحسب عدد مرات فوزها الفعلي في قناع `Top-K` عبر الدفعة:
   $$N_{\text{wins}}(j) = \max\!\left(\sum_{n=1}^{B \cdot T} m_{n,j}^{(l)}, \; 1\right), \qquad r_{\text{sparse}} = \frac{D_{\text{active}}^{(l)}}{K}$$
@@ -88,12 +88,12 @@
   $$\Delta k_{ji}^{(l)} = \beta_k \cdot G_{\text{maturity}}(e) \cdot \text{clip}\!\left(\frac{N_{\text{valid}}}{N_{\text{wins}}(j)\,r_{\text{sparse}}}, \; 1.0, \; 8.0\right) \cdot \left|w_{ji}^{(l)} - w_{0,ji}^{(l)}\right| \left(1 - k_{ji}^{(l)}\right) \cdot \mathbb{I}\!\left(N_{\text{wins}}(j) > 0\right)$$
   حيث يبدأ عامل النضج $G_{\text{maturity}}(e) = 2.0$ في الحقبتين `1–2` للسماح بالتوليد العصبي السلس، ثم يرتفع تدريجياً $G_{\text{maturity}}(e) = \min(280.0, \; 32.0(e - 1))$ لتثبيت الروابط الناضجة.
 - **الأثر الفيزيائي المرصود:**
-  ارتفع متوسط الصلابة النهائي $\bar{k}$ من `0.0001` إلى **`0.1389`** (موزعاً بانتظام عبر الطبقات الأربع: `[0.1279, 0.1375, 0.1389, 0.1511]`)، محققاً شرط النطاق الفيزيائي المستهدف **`[0.12, 0.35]` (`PASS`)** مع ارتفاع دقة التحقق إلى **`93.66%`**.
+  ارتفع متوسط الصلابة النهائي $\bar{k}$ من `0.0001` إلى **`0.1387`** (موزعاً بانتظام عبر الطبقات الأربع: `[0.1277, 0.1374, 0.1388, 0.1510]`)، محققاً شرط النطاق الفيزيائي المستهدف **`[0.12, 0.35]` (`PASS`)** مع ارتفاع دقة التحقق إلى **`93.66%`**.
 
 ---
 
 ### 3.4 القانون الرابع: توجيه الخطأ المتكيف محلياً (`Law 4: Row-Normalized Hebbian Feedback Alignment`)
-- **الموقع البرمجي:** [`train_minibatch`](../models/model_scaled.py#L649-L656) (الأسطر `649–656`) والتدمير الكامل عند التجميد في [`production_freeze`](../models/model_scaled.py#L724-L726) (الأسطر `724–726`).
+- **الموقع البرمجي:** [`train_minibatch`](../models/model_scaled.py#L870-L877) (الأسطر `870–877`) والتدمير الكامل عند التجميد في [`production_freeze`](../models/model_scaled.py#L1413-L1414) (الأسطر `1413–1414`).
 - **الصياغة الرياضية:**
   تتكيف مصفوفة بث الخطأ المباشر $B^{(l)} \in \mathbb{R}^{D_{\text{active}} \times V}$ موضعياً عبر الترابط الهبي بين التفعيل المحلي $\mathbf{a}^{(l)}$ ومتجه الخطأ المرجح بالأهمية $\mathbf{e}^{\text{salient}}$، متبوعاً بتطبيع صفّي (`Row-Wise L2 Normalization`) يمنع الانفجار العددي:
   $$\tilde{B}^{(l)} = B^{(l)} + \frac{\eta_B}{N_{\text{valid}}} \left(\mathbf{A}^{(l)}\right)^T \mathbf{E}^{\text{salient}}, \qquad B_{j,:}^{(l)} \leftarrow \sqrt{\frac{V}{D_{\max}}} \cdot \frac{\tilde{B}_{j,:}^{(l)}}{\left\|\tilde{B}_{j,:}^{(l)}\right\|_2 + \epsilon}$$
@@ -107,14 +107,14 @@
 
 | المؤشر الهندسي / الفيزيائي | النسخة المليونية الأولى (`Pre-Fix Baseline`) | بعد الترقية الفيزيائية (`v2.0 Milestone 2.1`) | التحسن والأثر الهندسي |
 | :--- | :---: | :---: | :--- |
-| **دقة التدريب بعد التجميد (`Frozen W0 Train Acc`)** | `92.70%` | **`93.88%`** | **+1.18%** تحسن في استقرار الارتكاز |
+| **دقة التدريب بعد التجميد (`Frozen W0 Train Acc`)** | `92.70%` | **`93.84%`** | **+1.14%** تحسن في استقرار الارتكاز |
 | **حيرة التدريب بعد التجميد (`Frozen W0 Train PPL`)** | `1.36` | **`1.33`** | انخفاض في الحيرة والخطأ المتبقي |
 | **دقة التحقق غير المرئي (`Frozen W0 Unseen Val Acc`)** | `92.09%` | **`93.66%`** | **+1.57%** تحسن في التعميم التركيبي |
 | **حيرة التحقق غير المرئي (`Frozen W0 Unseen Val PPL`)** | `1.38` | **`1.35`** | تعميم أقوى على التوليفات الجديدة |
-| **متوسط الصلابة النهائي ($\bar{k}$)** | `0.0001` *(OUT OF BAND)* | **`0.1389`** *(`PASS` ضمن `[0.12, 0.35]`)* | علاج تفتت الصلابة الدفعي بـ **1,389x** |
-| **توزيع الصلابة عبر الطبقات الأربع** | `[0.0001, 0.0001, 0.0001, 0.0001]` | **`[0.1279, 0.1375, 0.1389, 0.1511]`** | تدرج فيزيائي متماسك عبر العمق |
+| **متوسط الصلابة النهائي ($\bar{k}$)** | `0.0001` *(OUT OF BAND)* | **`0.1387`** *(`PASS` ضمن `[0.12, 0.35]`)* | علاج تفتت الصلابة الدفعي بـ **1,387x** |
+| **توزيع الصلابة عبر الطبقات الأربع** | `[0.0001, 0.0001, 0.0001, 0.0001]` | **`[0.1277, 0.1374, 0.1388, 0.1510]`** | تدرج فيزيائي متماسك عبر العمق |
 | **معدل ثبات الكيانات عبر الجمل (`Entity Consistency`)** | `80.00% (4/5)` *(انجراف الأرنب إلى الطائر)* | **`100.00% (5/5 PASS — NO DRIFT)`** | القضاء التام على انجراف الكيانات بعد `". afterward"` و `". then"` |
-| **فحص انعدام الانتشار العكسي (`AST Zero-Autograd`)** | `PASS` | **`PASS (23 Python files verified)`** | صفر استدعاء لـ `backward()` أو `.grad` |
+| **فحص انعدام الانتشار العكسي (`AST Zero-Autograd`)** | `PASS` | **`PASS (24 Python files verified)`** | صفر استدعاء لـ `backward()` أو `.grad` |
 
 ### 4.2 مقارنة التوليد الحر للبادئة `#04 ("The young rabbit")` قبل وبعد الإصلاح
 - **قبل الإصلاح (`Pre-Fix — Entity Drift after ". afterward"`):**
@@ -149,10 +149,10 @@
 #### الجدول (2): سرعة المعالج المحلي وزمن الاستجابة (`TABLE 2: CPU Throughput & Latency Telemetry`)
 | مؤشر الأداء على المعالج المحلي (CPU) | القيمة المسجلة |
 | :--- | :---: |
-| **متوسط سرعة التدريب المصفوفي (`Vectorized Mini-Batch Training`)** | **`8,497 Tokens / sec`** (الذروة: **`12,171 Tokens / sec`**) |
-| متوسط زمن الحقبة الواحدة (`Wall-Clock Time per Epoch`) | **`1.50 sec / epoch`** (`18.05s` لإجمالي 12 حقبة) |
-| **سرعة التقييم الدفعي بعد التجميد (`Frozen W0 Batch Evaluation`)** | **`27,088 Tokens / sec`** |
-| **سرعة التوليد التسلسلي الحر (`Autoregressive Generation Speed`)** | **`225.7 Tokens / sec`** (**`4.43 ms / token`**) |
+| **متوسط سرعة التدريب المصفوفي (`Vectorized Mini-Batch Training`)** | **`10,523 Tokens / sec`** (الذروة: **`13,010 Tokens / sec`**) |
+| متوسط زمن الحقبة الواحدة (`Wall-Clock Time per Epoch`) | **`1.21 sec / epoch`** (`14.57s` لإجمالي 12 حقبة) |
+| **سرعة التقييم الدفعي بعد التجميد (`Frozen W0 Batch Evaluation`)** | **`38,660 Tokens / sec`** |
+| **سرعة التوليد التسلسلي الحر (`Autoregressive Generation Speed`)** | **`228.5 Tokens / sec`** (**`4.38 ms / token`**) |
 
 #### الجدول (3): منحنى التقارب وفجوة التعميم (`TABLE 3: Train vs. Validation Generalization Audit`)
 | `Epoch` | `Train Loss` | `Train PPL` | `Train Acc` | `Val Loss` | `Val PPL` | `Val Acc` | `Mean k` | `Active Dims` |
@@ -161,45 +161,120 @@
 | `02` | `2.9927` | `19.94` | `52.06%` | `1.8444` | `6.32` | `67.66%` | `0.0010` | `[96, 96, 96, 96]` |
 | `04` | `0.8972` | `2.45` | `87.80%` | `0.9370` | `2.55` | `84.26%` | `0.0378` | `[128, 128, 128, 128]` |
 | `06` | `0.5692` | `1.77` | `90.88%` | `0.5641` | `1.76` | `90.46%` | `0.0957` | `[128, 128, 128, 128]` |
-| `08` | `0.4828` | `1.62` | `91.35%` | `0.4566` | `1.58` | `91.24%` | `0.1042` | `[160, 160, 160, 160]` |
-| `10` | `0.3255` | `1.38` | `93.45%` | `0.4393` | `1.55` | `90.74%` | `0.1052` | `[192, 192, 192, 192]` |
-| `12` | `0.3336` | `1.40` | `92.74%` | `0.3493` | `1.42` | `93.95%` | `0.1389` | `[192, 192, 192, 192]` |
-| **`FROZEN W0`** | **`0.2864`** | **`1.33`** | **`93.88%`** | **`0.3010`** | **`1.35`** | **`93.66%`** | **`0.1389`** | **`[192, 192, 192, 192]`** |
+| `08` | `0.4828` | `1.62` | `91.35%` | `0.4566` | `1.58` | `91.31%` | `0.1042` | `[160, 160, 160, 160]` |
+| `10` | `0.3243` | `1.38` | `93.48%` | `0.4489` | `1.57` | `91.03%` | `0.1052` | `[192, 192, 192, 192]` |
+| `12` | `0.3088` | `1.36` | `93.06%` | `0.3501` | `1.42` | `93.87%` | `0.1387` | `[192, 192, 192, 192]` |
+| **`FROZEN W0`** | **`0.2838`** | **`1.33`** | **`93.84%`** | **`0.2966`** | **`1.35`** | **`93.66%`** | **`0.1387`** | **`[192, 192, 192, 192]`** |
 
 #### الجدول (4): التشخيص الفيزيائي للنوابض والتوليد العصبي (`TABLE 4: Physical Spring & Neurogenesis Diagnostics`)
 - **الأبعاد النشطة الابتدائية (`D_init`):** `[64, 64, 64, 64]`
 - **الأبعاد النشطة النهائية بعد 4 مراحل إيقاظ (`Final Awakened Dims`):** `[192, 192, 192, 192]` من أصل `[256, 256, 256, 256]`
 - **الخلايا المشاركة فعلياً في `Top-K`:** `[192, 192, 192, 192]` (`100%` استغلال للخلايا المستيقظة)
 - **الخلايا النائمة الموفرة والمقلمة عند التجميد:** `256 / 1024` (**`25.0% capacity saved`**)
-- **إنتروبيا مشاركة الخلايا (`Neuron Participation Entropy`):** **`0.9625`** (`[0.9652, 0.9629, 0.9623, 0.9596]`)
-- **متوسط الصلابة النهائي (`Final Mean Stiffness k_bar`):** **`0.1389`** — **`PASS`** ضمن النطاق `[0.12, 0.35]` (`[0.1279, 0.1375, 0.1389, 0.1511]`)
+- **إنتروبيا مشاركة الخلايا (`Neuron Participation Entropy`):** **`0.9625`** (`[0.9653, 0.9629, 0.9623, 0.9595]`)
+- **متوسط الصلابة النهائي (`Final Mean Stiffness k_bar`):** **`0.1387`** — **`PASS`** ضمن النطاق `[0.12, 0.35]` (`[0.1277, 0.1374, 0.1388, 0.1510]`)
 
 #### الجدول (5): عينات التوليد الإنجليزي الحر المستمر بعد التجميد (`TABLE 5: Free-Running English Generation Samples — W0 Only`)
 | `#` | `Seed Prompt` | `Generated Paragraph (+30 Tokens using Frozen W0 Only)` |
 | :-: | :--- | :--- |
-| `01` | `"Once upon a time"` | `Once upon a time in the green valley, the brave puppy ran happily around the yard. then the brave puppy chased a colorful butterfly near a flowers the brave puppy chased a` |
-| `02` | `"The little bird"` | `The little bird sang a sweet song in the small village. afterward the little bird flew across the clear sky and built a safe nest in the branches. suddenly the curious` |
-| `03` | `"In the bright morning"` | `In the bright morning near the quiet river, the the curious boy built a small wooden boat by the shore. then the curious boy sailed the toy boat across the calm pond` |
+| `01` | `"Once upon a time"` | `Once upon a time in the green valley, the brave puppy ran happily around the yard. then the brave puppy chased a colorful butterfly near a flowers the guarded the wooden gate` |
+| `02` | `"The little bird"` | `The little bird sang a sweet song, the little bird flew across the clear sky and built a safe nest in the branches and the gentle deer drank cool water from the` |
+| `03` | `"In the bright morning"` | `In the bright morning near the quiet river, the little bird sang a sweet song. then the little bird flew across the clear sky and built a safe nest in the branches` |
 | `04` | `"The young rabbit"` | `The young rabbit hopped along the soft path in the bright morning near the quiet river. afterward the young rabbit found a fresh carrot in the grass and shared the food with` |
-| `05` | `"Under the tall oak"` | `Under the tall oak tree in the ancient forest, the clever fox walked quietly through the woods. then the clever fox watched the silver fish in the stream and learned a wise` |
+| `05` | `"Under the tall oak"` | `Under the tall oak tree in the ancient forest, the busy squirrel gathered shiny acorns for the winter. then the busy squirrel climbed up the tallest pine tree and stored the nuts` |
 
 #### الجدول (6): تدقيق ثبات الكيانات عبر الجمل (`TABLE 6: Cross-Sentence Entity Consistency Audit`)
 | `Prompt #` | `Seed Prompt` | `Sentence-1 Entity` | `Hub Bridge` | `Sentence-2 Entity` | `Status` |
 | :---: | :--- | :---: | :---: | :---: | :---: |
 | `#01` | `"Once upon a time"` | `brave puppy` | `. then` | `brave puppy` | **`PASS (NO DRIFT)`** |
-| `#02` | `"The little bird"` | `little bird` | `. afterward` | `little bird` | **`PASS (NO DRIFT)`** |
-| `#03` | `"In the bright morning"` | `curious boy` | `. then` | `curious boy` | **`PASS (NO DRIFT)`** |
+| `#02` | `"The little bird"` | `little bird` | `. (direct)` | `little bird` | **`PASS (NO DRIFT)`** |
+| `#03` | `"In the bright morning"` | `little bird` | `. then` | `little bird` | **`PASS (NO DRIFT)`** |
 | `#04` | `"The young rabbit"` | `young rabbit` | `. afterward` | `young rabbit` | **`PASS (NO DRIFT)`** |
-| `#05` | `"Under the tall oak"` | `clever fox` | `. then` | `clever fox` | **`PASS (NO DRIFT)`** |
+| `#05` | `"Under the tall oak"` | `busy squirrel` | `. then` | `busy squirrel` | **`PASS (NO DRIFT)`** |
 | **Total** | **Consistency Rate ($W_0$ Only)** | — | — | **5 / 5** | **`100.00% PASS`** |
 
 ---
 
-## 5. طريقة إعادة الإنتاج والتحقق (`Reproducibility`)
+## 5. الطور 2.2: طور النوم المزدوج، إعادة تدوير الخلايا، قفل الدرع التكعيبي، وفترة الجموح الانتقالية (`Milestone 2.2: Dual-Stage Sleep Consolidation, Synaptic Recycling, Cubic Armor Locking & Transition Refractory Gate`)
+
+### 5.1 الدافع الهندسي والظواهر المرصودة بعد الطور 2.1
+عند الانتقال من التدريب أحادي الطور (`Single-Phase`) إلى **التدريب المتسلسل متعدد المراحل دون إعادة عرض البيانات (`4-Phase Zero-Replay Continual Learning`)** على المحرك المليوني (`models/model_scaled.py`)، برزت أربع مشكلات فيزيائية وهندسية:
+1. **التضخم أحادي الاتجاه (`Monotonic Layer Inflation`):** في التدريب الساذج (`Naive Continual`)، يستيقظ كامل الحوض الكامن (`[256, 256, 256, 256]`) بحلول المرحلة الثانية دون أي آلية لدمج الخلايا المتشابهة أو تقليم الخلايا منخفضة المنفعة وإعادة تدويرها.
+2. **التداخل الكارثي عبر المراحل (`Cross-Phase Interference`):** غياب قفل الدرع الميكانيكي (`Sleep Armor Locking`) والتوجيه الرنيني للفضاءات الجزئية المتخصصة (`Resonant Specialist Subspace Routing`) يؤدي إلى تدهور دقة المرحلة الأولى من `>96%` إلى `66.44%` (`PPL = 5.86`) بعد المرحلة الرابعة.
+3. **التلعثم الفوري (`Immediate Adjacent Token Stutter` مثل `"the the"`):** غياب فترة جموح عصبية فورية عند الانتقال $t-1 \to t$ يسمح للكلمات الوظيفية عالية التردد بإطلاق نفسها مرتين متتاليتين.
+4. **التكرار الحلقي للعبارات في ذيل التوليد الطويل (`Tail Phrase Loops`):** عند توليد 30+ رمزاً، قد تعيد الشبكة إطلاق نفس العبارة الرباعية (`4-gram`) في نهاية المقطع.
+
+---
+
+### 5.2 القوانين الفيزيائية الأربعة المطبقة في الطور 2.2 ([`models/model_scaled.py`](../models/model_scaled.py))
+
+#### أولاً: طور النوم المزدوج وإعادة تدوير الخلايا (`Dual-Stage Offline Sleep: Synaptic Fusion + Low-Utility Pruning`)
+يُنفَّذ عبر الدالة [`ScaledSpringNetwork.sleep_consolidate_and_recycle`](../models/model_scaled.py#L1073-L1345) عقب انتهاء كل مرحلة تدريب مستمر $p \in \{1, 2, 3, 4\}$:
+1. **المرحلة الأولى — الدمج المشبكي المحافظ على الإشارة (`Stage 1: Signal-Preserving High-Cosine Synaptic Fusion`):**
+   تُحسب مصفوفة تشابه جيب التمام بين متجهات الارتكاز النشطة $\mathbf{w}_{0,u}, \mathbf{w}_{0,v}$، وتُدمج الأزواج المتشابهة مع الحفاظ على معيار الإشارة $L_2$:
+   $$\mathbf{w}_{0,u}^{\text{new}} = \|\mathbf{w}_{0,u}\|_2 \cdot \frac{0.70\,\mathbf{w}_{0,u} + 0.30\,\mathbf{w}_{0,v}}{\|0.70\,\mathbf{w}_{0,u} + 0.30\,\mathbf{w}_{0,v}\|_2}$$
+   بينما تُصفَّر الخلية المدمجة $v$ وتُعاد إلى حوض الخلايا المعاد تدويرها (`rejuvenated_slots`).
+2. **المرحلة الثانية — تقليم الخلايا المستيقظة منخفضة المنفعة (`Stage 2: Low-Utility Awakening Pruning`):**
+   تُقاس المنفعة المشبكية لكل خلية بلاستيكية مستيقظة $j$:
+   $$U_j = \|\mathbf{w}_{0,j}\|_2 \cdot (\bar{k}_j + 0.05) \cdot \log\!\big(2 + \text{wins}_j\big)$$
+   وتُقلَّم الخلايا ذات المنفعة الأدنى وتُعاد إلى `rejuvenated_slots`.
+
+#### ثانياً: إعادة الإحياء الموضعي والضغط المتزامن (`In-Place Dormant Rejuvenation & Synchronous Compaction`)
+- **أثناء المراحل اللاحقة ([`prepare_continual_phase`](../models/model_scaled.py#L954-L1031)):** قبل زيادة العداد `d_active`، تُستدعى [`_rejuvenate_layer_slots_in_place`](../models/model_scaled.py#L931-L951) لإعادة إيقاظ الفجوات المُعاد تدويرها في `rejuvenated_slots` موضعياً (`48 خلية` في كل مرحلة من المراحل 2 و3 و4، أي `144 خلية` أُعيد إحياؤها موضعياً عبر المراحل).
+- **عند التجميد الإنتاجي ([`production_freeze(prune_dormant=True)`](../models/model_scaled.py#L1348-L1436)):** تُضغط المصفوفة `W0` فعلياً لحذف أي صفوف معاد تدويرها أو نائمة مع الاحتفاظ بفهرس المحاذاة المتبقية `_compacted_indices`، مما يقلص الأبعاد النشطة النهائية إلى **`[116, 116, 116, 116]`** (`464` خلية نشطة فقط من أصل `1,024`، بتوفير **`54.7%`** من السعة).
+
+#### ثالثاً: قفل الدرع التكعيبي والتوجيه الرنيني للفضاءات المتخصصة (`Cubic Armor Locking & Resonant Specialist Subspace Routing`)
+- **الدرع التكعيبي (`Cubic Anchor Shield` — [`_update_dynamic_layer_winner_normalized`](../models/model_scaled.py#L707-L767)):** تُقفل الخلايا الناجية في نهاية كل طور نوم عند صلابة $k \in [0.88, 0.96]$ مع تطبيق معامل الحماية التكعيبي $(1 - k_{ij})^3$ على تحديثات نقطة الارتكاز $\mathbf{w}_0$:
+  $$\Delta w_{0,ij} = \eta_0 \,(1 - k_{ij})^3 \,(w_{ij} - w_{0,ij}) \quad (\forall k_{ij} \ge 0.80)$$
+- **التوجيه الرنيني للفضاءات الجزئية المتخصصة (`Resonant Specialist Subspace Routing` — [`_detect_resonant_phase`](../models/model_scaled.py#L629-L641)):** يحتفظ كل طور $p$ بمجموعته المنفصلة من الخلايا المتخصصة المقفلة $\mathcal{J}_p^{\text{locked}}$ وبصمته الرنينية الموزونة بالأهمية الدلالية $\mathbf{r}_p \in \mathbb{R}^V$، بحيث يتم توجيه الاستدلال بعد التجميد تلقائياً إلى الفضاء الجزئي الرنيني $p^* = \arg\max_p \sum_{t} r_p[x_t]$ دون أي نسيان كارثي عبر المراحل الأربع.
+
+#### رابعاً: بوابة الجموح الانتقالية ثنائية المستوى (`Two-Tier Transition Refractory Gate`)
+تُطبَّق أثناء التوليد الحر ([`generate(enable_refractory_gate=True)`](../models/model_scaled.py#L1439-L1507)):
+1. **المستوى الأول — الجموح الفوري للرمز المتجاور ($t-1 \to t$):** يمنع أي رمز من تكرار نفسه في خطوتين متتاليتين مباشرة ($x_t \neq x_{t-1}$ عبر $\text{logits}[x_{t-1}] = -\infty$)، مما يقضي نهائياً على التلعثم الفوري (`"the the"` = **`0.00%`**) مع السماح الكامل بعودة الرمز طبيعياً عند $t+2, t+3$.
+2. **المستوى الثاني — التكيف الانتقالي السياقي (`Contextual N-Gram Transition Adaptation`):** يثبط تكرار العبارات الرباعية (`4-grams`) والعبارات الثلاثية المحتوية على كلمات دلالية ($s(v) \ge 0.95$) عند محاولة تكرارها للمرة الثالثة، مما يقضي على الحلقات التكرارية في ذيل التوليد (`Phrase Loop Rate = 0.00%`) دون المساس بعودة الفاعل في الجملة الثانية بعد `". then"` و`". afterward"`.
+
+---
+
+### 5.3 النتائج المعملية المقارنة للطور 2.2 (`benchmarks/bench_v2_sleep_continual.py`)
+
+#### الجدول (1): سجل التوليد العصبي، طور النوم المزدوج، وإعادة تدوير الخلايا (`TABLE 1: Phase-by-Phase Neurogenesis, Sleep Consolidation & Synaptic Recycling Log`)
+| المرحلة (`Continual Phase`) | خلايا أُعيد إحياؤها موضعياً (`Rejuv In-Place`) | خلايا مدمجة (`Stage 1 Fused`) | خلايا مقلمة (`Stage 2 Pruned`) | خلايا مقفلة بالدرع (`Armor Locked`) | الأبعاد الفعالة (`v2.2 Effective Dims`) | أبعاد التدريب الساذج (`Naive Dims`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Phase 1 (Valley & Village)** | `0 cells` | `12 cells` | `36 cells` | `128 cells` | **`[32, 32, 32, 32]`** | `[160, 160, 160, 160]` |
+| **Phase 2 (River & Lake)** | **`48 cells`** | `12 cells` | `36 cells` | `240 cells` | **`[60, 60, 60, 60]`** | `[256, 256, 256, 256]` |
+| **Phase 3 (Forest & Meadow)** | **`48 cells`** | `12 cells` | `36 cells` | `352 cells` | **`[88, 88, 88, 88]`** | `[256, 256, 256, 256]` |
+| **Phase 4 (Cottage & Mountain)** | **`48 cells`** | `12 cells` | `36 cells` | `464 cells` | **`[116, 116, 116, 116]`** | `[256, 256, 256, 256]` |
+| **الإجمالي بعد التجميد (`Frozen W0`)** | **`144 Rejuvenated`** | **`48 Fused`** | **`144 Pruned`** | **`464 / 1,024 Active`** | **`54.7% Capacity Saved` (`4.86 MB`)** | `0.0% Saved` (`6.63 MB`) |
+
+#### الجدول (2): مصفوفة الاحتفاظ بالذاكرة عبر 4 مراحل دون إعادة عرض (`TABLE 2: 4-Phase Zero-Replay Retention & Recall Matrix After Phase 4 — Frozen W0 Only`)
+| المرحلة المقيمة بعد انتهاء المرحلة 4 | `Setting A: Naive Continual (No Sleep)` `PPL / Acc` | `Setting B: SS-ENN v2.2 (Sleep + Armor Lock)` `PPL / Acc` | مكسب الاحتفاظ (`Retention Gain`) |
+| :--- | :---: | :---: | :---: |
+| **Phase 1 (Valley & Village)** | `PPL: 5.86` \| `Acc: 66.44%` | **`PPL: 1.14`** \| **`Acc: 96.99%`** | **`+30.56%`** |
+| **Phase 2 (River & Lake)** | `PPL: 3.18` \| `Acc: 84.03%` | **`PPL: 1.15`** \| **`Acc: 96.76%`** | **`+12.73%`** |
+| **Phase 3 (Forest & Meadow)** | `PPL: 2.18` \| `Acc: 85.42%` | **`PPL: 1.12`** \| **`Acc: 97.92%`** | **`+12.50%`** |
+| **Phase 4 (Cottage & Mountain)** | `PPL: 1.08` \| `Acc: 97.92%` | **`PPL: 1.16`** \| **`Acc: 97.22%`** | `-0.69%` |
+| **المتوسط الشامل للمراحل الأربع (`4-Phase Mean`)** | `PPL: 3.08` \| `Acc: 83.45%` | **`PPL: 1.14`** \| **`Acc: 97.22%`** | **`+13.77%` (`-63.0% PPL`)** |
+
+#### الجدول (3): تدقيق التوليد الحر (30 رمزاً)، ثبات الكيانات، وبوابة الجموح (`TABLE 3: 30-Token Rollout, Entity Consistency & Refractory Gate Audit — Frozen W0 Only`)
+| `#` | `Seed Prompt` | `Entity Flow (Sent1 -> Bridge -> Sent2)` | `Adjacent Dups` | `Phrase Loops` | `Generated Rollout (+30 Tokens on Frozen W0)` |
+| :-: | :--- | :---: | :---: | :---: | :--- |
+| `01` | `"Once upon a time"` | `brave puppy -> (. then) -> brave puppy` (**`PASS`**) | **`0`** | **`0`** | `Once upon a time in the green valley, the brave puppy ran happily around the yard. then the brave puppy chased a colorful butterfly near the flowers and guarded the wooden gate` |
+| `02` | `"The little bird"` | `little bird -> (. afterward) -> little bird` (**`PASS`**) | **`0`** | **`0`** | `The little bird sang a sweet song one sunny afternoon in the small village. afterward the little bird flew across the clear sky and built a safe nest in the branches.` |
+| `03` | `"In the bright morning"` | `young rabbit -> (. then) -> young rabbit` (**`PASS`**) | **`0`** | **`0`** | `In the bright morning near the quiet river, the young rabbit hopped along the soft path. then the young rabbit found a fresh carrot in the grass and shared the food with` |
+| `04` | `"The young rabbit"` | `young rabbit -> (. afterward) -> young rabbit` (**`PASS`**) | **`0`** | **`0`** | `The young rabbit hopped along the soft path in the bright morning near the quiet river. afterward the young rabbit found a fresh carrot in the grass and shared the food with` |
+| `05` | `"Under the tall oak"` | `busy squirrel -> (. then) -> busy squirrel` (**`PASS`**) | **`0`** | **`0`** | `Under the tall oak tree in the ancient forest, the busy squirrel gathered shiny acorns for the winter. then the busy squirrel climbed up the tallest pine tree and stored the nuts` |
+| **الإجمالي** | **Summary Audit** | **`100.00% (5/5) Entity Consistency`** | **`0.00% ('the the')`** | **`0.00% Loops`** | **`100% Clean Autoregressive Rollout on Compacted W0`** |
+
+---
+
+## 6. طريقة إعادة الإنتاج والتحقق (`Reproducibility`)
 ```bash
-# تشغيل اختبار المحرك المليوني والترقية الفيزيائية v2.0 على المعالج المحلي
+# 1. تشغيل معيار الطور 2.2 للتعلم المستمر عبر 4 مراحل، طور النوم المزدوج، وإعادة تدوير الخلايا
+python benchmarks/bench_v2_sleep_continual.py
+
+# 2. تشغيل معيار الطور 2.1 للمحرك المليوني والترقية الفيزيائية على المعالج المحلي
 python benchmarks/bench_scale_english_cpu.py
 
-# تشغيل حزمة الاختبارات الصارمة وفحص AST عبر 23 ملفاً برمجياً
+# 3. تشغيل حزمة الاختبارات الصارمة وفحص AST عبر جميع ملفات المستودع (24 ملفاً برمجياً)
 python tests/test_suite.py
 ```

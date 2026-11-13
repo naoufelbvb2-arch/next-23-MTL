@@ -24,6 +24,7 @@ from models import (
     SpringGenerativeNetworkV2,
     DynamicSpringGenerativeNetwork,
     ContinuousSpringNetwork,
+    ScaledSpringNetwork,
 )
 from train_eval import ARABIC_CORPUS, build_dataset, train_and_evaluate
 
@@ -149,6 +150,43 @@ class TestSpringMVPArchitecture(unittest.TestCase):
         self.assertEqual(frozen_acc, 100.0, f"Expected 100.0% Exact Match, got {frozen_acc}%")
         for item in details:
             self.assertTrue(item["match"], f"Mismatch on sentence: {item}")
+
+    def test_06_milestone_2_2_sleep_recycling_and_refractory_gate(self):
+        """
+        Verify Milestone 2.2 Dual-Stage Sleep Consolidation, Synaptic Recycling,
+        In-Place Rejuvenation, Synchronous Compaction, and Transition Refractory Gate.
+        """
+        model = ScaledSpringNetwork(preset="1.5M", vocab_size=128, max_seq_len=16, seed=42)
+        seqs_p1 = [[1, 10, 11, 12, 13, 14, 15, 2], [1, 10, 12, 14, 16, 17, 18, 2]]
+        seqs_p2 = [[1, 20, 21, 22, 23, 24, 25, 2], [1, 20, 22, 24, 26, 27, 28, 2]]
+
+        prep1 = model.prepare_continual_phase(seqs_p1, pad_id=0)
+        self.assertEqual(prep1["total_rejuvenated"], 0)
+        inp1 = torch.tensor([s[:-1] for s in seqs_p1], dtype=torch.long)
+        tgt1 = torch.tensor([s[1:] for s in seqs_p1], dtype=torch.long)
+        for _ in range(3):
+            model.train_minibatch(inp1, tgt1, pad_id=0)
+
+        sleep1 = model.sleep_consolidate_and_recycle(phase_id=1, shared_vocab_ids={1, 2})
+        self.assertGreater(sleep1["recycled_this_sleep"], 0)
+        self.assertEqual(model.get_active_dimensions(), [32, 32, 32, 32])
+
+        prep2 = model.prepare_continual_phase(seqs_p2, pad_id=0)
+        self.assertEqual(prep2["total_rejuvenated"], sleep1["recycled_this_sleep"])
+        inp2 = torch.tensor([s[:-1] for s in seqs_p2], dtype=torch.long)
+        tgt2 = torch.tensor([s[1:] for s in seqs_p2], dtype=torch.long)
+        for _ in range(3):
+            model.train_minibatch(inp2, tgt2, pad_id=0)
+
+        sleep2 = model.sleep_consolidate_and_recycle(phase_id=2, shared_vocab_ids={1, 2}, is_final_phase=True)
+        self.assertEqual(model.get_active_dimensions(), [60, 60, 60, 60])
+
+        freeze_stats = model.production_freeze(prune_dormant=True)
+        self.assertEqual(freeze_stats["active_dims"], [60, 60, 60, 60])
+
+        gen_ids = model.generate([1, 10, 11], max_new_tokens=10, enable_refractory_gate=True)
+        for i in range(1, len(gen_ids)):
+            self.assertNotEqual(gen_ids[i], gen_ids[i - 1], "Refractory gate must prevent adjacent token duplicates")
 
 
 if __name__ == "__main__":
