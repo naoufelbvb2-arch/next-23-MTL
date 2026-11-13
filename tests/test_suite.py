@@ -255,6 +255,86 @@ class TestSpringMVPArchitecture(unittest.TestCase):
         self.assertEqual(audit["adjacent_dup_rate_pct"], 0.0)
         self.assertEqual(audit["phrase_loop_rate_pct"], 0.0)
 
+    def test_09_milestone_2_5_reward_modulated_three_factor_alignment(self):
+        """
+        Verify Milestone 2.5 Reward-Modulated Three-Factor Spring Plasticity:
+        1. Critic-free, Zero-Autograd post-training behavioral flip (<=20% -> 100%).
+        2. Selective thermal k-melting on rejected paths vs reward locking on preferred paths
+           with minimal spillover onto untouched general vocabulary stiffness.
+        3. Unseen General Knowledge preservation, Local Active RMSNorm = 1.20, and zero extra W_0 MB.
+        4. Single-trajectory scalar reward + EMA baseline mode verification.
+        """
+        from benchmarks.bench_v2_reward_alignment import run_v2_reward_alignment_benchmark
+        from models import ScaledSpringNetwork
+
+        results = run_v2_reward_alignment_benchmark(verbose=False)
+        self.assertTrue(results["ast_ok"])
+        self.assertGreaterEqual(results["scanned_files"], 27)
+
+        un_beh = results["unaligned_behavior"]
+        al_beh = results["aligned_behavior"]
+        self.assertLessEqual(un_beh["aligned_rate_pct"], 20.0)
+        self.assertGreaterEqual(un_beh["rejected_rate_pct"], 75.0)
+        self.assertEqual(al_beh["aligned_rate_pct"], 100.0)
+        self.assertEqual(al_beh["rejected_rate_pct"], 0.0)
+        self.assertEqual(al_beh["entity_consistency_pct"], 100.0)
+        self.assertEqual(al_beh["adjacent_dup_rate_pct"], 0.0)
+        self.assertEqual(al_beh["phrase_loop_rate_pct"], 0.0)
+
+        self.assertGreaterEqual(results["aligned_gen_val"]["acc"], 88.0)
+        self.assertGreaterEqual(
+            results["aligned_pref_eval"]["acc"],
+            results["unaligned_pref_eval"]["acc"] + 15.0,
+        )
+        self.assertEqual(
+            results["aligned_mem"]["frozen_footprint_mb"],
+            results["unaligned_mem"]["frozen_footprint_mb"],
+        )
+
+        stiff = results["stiffness"]
+        self.assertLess(stiff["k_rej_vocab_post"], stiff["k_rej_vocab_pre"] * 0.35)
+        self.assertGreater(stiff["k_pref_vocab_post"], stiff["k_pref_vocab_pre"] * 3.0)
+        self.assertLessEqual(abs(stiff["k_gen_vocab_post"] - stiff["k_gen_vocab_pre"]), 0.02)
+        self.assertLess(stiff["k_hid_rej_melted"], stiff["k_hid_rej_before"])
+        self.assertGreater(stiff["k_hid_pref_locked"], stiff["k_hid_pref_before"])
+
+        for rms_val in results["post_freeze_normed_rms"]:
+            self.assertAlmostEqual(rms_val, 1.20, places=2)
+
+        # Standalone scalar-reward + EMA baseline mode unit test (block-sparse model)
+        torch.manual_seed(11)
+        mini = ScaledSpringNetwork(
+            preset="1.5M",
+            vocab_size=64,
+            num_layers=2,
+            d_init=64,
+            d_max=64,
+            top_k=32,
+            block_size=16,
+            enable_block_sparse=True,
+        )
+        mini.output_head.k.fill_(0.25)
+        for layer in mini.spring_layers:
+            layer.k.fill_(0.25)
+        seq_batch = torch.tensor(
+            [
+                [1, 5, 6, 7, 10, 11, 2],
+                [1, 5, 6, 7, 20, 21, 2],
+            ],
+            dtype=torch.long,
+        )
+        stat = mini.align_with_reward_modulation(
+            seq_ids=seq_batch,
+            prefix_lens=4,
+            rewards=[1.0, -0.5],
+            use_reward_baseline=True,
+        )
+        self.assertGreater(stat["valid_decisions"], 0)
+        self.assertEqual(stat["mode"], "scalar_reward")
+        self.assertGreater(mini.reward_baseline, 0.0)
+        self.assertLess(stat["k_head_rej_melted"], stat["k_head_rej_before"])
+        self.assertGreater(stat["k_head_pref_locked"], stat["k_head_pref_before"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

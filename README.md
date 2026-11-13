@@ -1,9 +1,10 @@
-# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0 & v2.0 Milestones 2.1–2.4)
+# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0 & v2.0 Complete 5/5)
 **الشبكات العصبية المرنة ذاتية التشكيل — إطار تعلم موضعي خالٍ من الانتشار العكسي للتوليد المتسلسل والتعلم المستمر**
 
-*A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Dual-Horizon Sparse Causal Attention, Dynamic Neurogenesis, and Dual-Stage Sleep Consolidation*
+*A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Dual-Horizon Sparse Causal Attention, Dynamic Neurogenesis, Dual-Stage Sleep Consolidation, and Three-Factor Reward Alignment*
 
-[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(26%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
+[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(27%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
+[![Milestone 2.5 Reward Alignment](https://img.shields.io/badge/Milestone%202.5-100%25%20Aligned%20%7C%200%25%20Rejected%20%7C%20Zero--RL-brightgreen)](./benchmarks/bench_v2_reward_alignment.py)
 [![Milestone 2.4 12-Layer Block-Sparse](https://img.shields.io/badge/Milestone%202.4-12L%2093.59%25%20%7C%201.34x%20Eval%20Speedup-purple)](./benchmarks/bench_v2_deep_block_sparse.py)
 [![Milestone 2.3 Zero-Shot Recombination](https://img.shields.io/badge/Milestone%202.3-90.27%25%20Hybrid%20%7C%20100%25%20Binding-blue)](./benchmarks/bench_v2_compositional_gen.py)
 [![Exact Match Accuracy](https://img.shields.io/badge/Exact%20Match%20(W0%20Freeze)-100.00%25-brightgreen)](./docs/RESEARCH_PAPER_SS_ENN.md)
@@ -54,9 +55,9 @@
 
 ---
 
-## الحصيلة المعملية للتجارب العشر | Empirical Benchmark Suite (v1.0 & v2.0 Milestones 2.1–2.4)
+## الحصيلة المعملية للتجارب الإحدى عشرة | Empirical Benchmark Suite (v1.0 & v2.0 Complete 5/5)
 
-تخضع جميع ملفات المستودع (26 ملفاً برمجياً) لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
+تخضع جميع ملفات المستودع (27 ملفاً برمجياً) لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
 
 | # | الاختبار المعملي (`Benchmark`) | السكريبت التنفيذي | التحدي وحجم البيانات | الأبعاد النشطة النهائية ($D_{\text{active}}$) | توفير السعة / الذاكرة | الدقة بعد التجميد ($W_0$ فقط) | النتيجة الفيزيائية البارزة |
 | :-: | :--- | :--- | :--- | :--- | :---: | :---: | :--- |
@@ -70,6 +71,7 @@
 | **8** | **طور النوم المزدوج وإعادة التدوير (`v2.0 Milestone 2.2`)** | [`benchmarks/bench_v2_sleep_continual.py`](./benchmarks/bench_v2_sleep_continual.py) | 4 مراحل سردية متتالية (`384` قصة، `Zero-Replay`، `V=2,048`) | نمو منضبط من `32` إلى **`[116, 116, 116, 116]`** (مقابل `256` الساذج) | **54.7% Cells Saved** (`464/1024`, **`4.86 MB`**, `192` خلية معاد تدويرها) | **`97.22%` Mean Recall (`PPL 1.14`)** vs `83.45%` Naive (**`+13.77%`**) | **`144`** خلية أُعيد إحياؤها موضعياً، **`100%` (`5/5`)** ثبات الكيانات، و**`0.00%`** تكرار متجاور (`"the the"`) أو حلقات عبارة |
 | **9** | **الصلابة الهرمية، تطبيع الطاقة الموضعي، والتعميم التركيبي الصفري (`v2.0 Milestone 2.3`)** | [`benchmarks/bench_v2_compositional_gen.py`](./benchmarks/bench_v2_compositional_gen.py) | تدريب قطري (`64` قصة) + تقييم صفري (`W_0`) على `24` توليفة هجينة غير مرئية `(L_j, S_i, A_k)` | طيف Top-K هرمي `[24, 24, 20, 16]` وصلابة متدرجة `k_bar = [0.0799..0.1676]` | تثبيت الطاقة الموضعي `RMS = 1.2000` عبر `L1..L4` (مقابل تضخم `1.7607` المسطح) | **`90.27%` Hybrid Full (`PPL 1.870`)**، **`97.01%` Hybrid Cont**، **`100.00%` (`48/48`)** Subject Binding (`0.00%` Reversion) | **`100.00%` (`6/6`)** توليد حر (`+30` رمزاً) بـ `0.00%` تكرار متجاور وحلقات عبارة |
 | **10** | **الكبسولات الكتلية المتفرقة والتوسع العميق لـ 12 طبقة (`v2.0 Milestone 2.4`)** | [`benchmarks/bench_v2_deep_block_sparse.py`](./benchmarks/bench_v2_deep_block_sparse.py) | `394` قصة إنجليزية (`V=2,048`) بعمق `4L` و `12L` (`B=16`) ومقارنة `Element-wise` و `Deep Naive` | كبسولات كتلية متجاورة `12x16 = 192` (`L1..L12`: `2/12` ثم `1/12` لكل طبقة) | تسريع **`1.23x`** تدريب (`10,920 tok/s`) و **`1.34x`** استدلال (`41,862 tok/s`) لـ `4L` (`5.42 MB`) | **`93.73%` (`4L`, `PPL 1.45`)** و **`93.59%` (`12L Val`, `PPL 1.48`)** مقابل `92.88%` الساذج | نسبة تباين `L12/L1` **`1.0000 / 0.9901`**، إنتروبيا كتلية **`0.9864 / 0.9133`**، صلابة $\bar{k}=0.1733$، وثبات كيانات **`100% (5/5)`** (`0.00%` تكرار/حلقات) |
+| **11** | **اللدونة ثلاثية العوامل والضبط بالمكافأة (`v2.0 Milestone 2.5`)** | [`benchmarks/bench_v2_reward_alignment.py`](./benchmarks/bench_v2_reward_alignment.py) | `12` معضلة سلوكية منحازة `5:1` + `300` قصة عامة (`Train=255`, `Val=45`, `V=2,048`) | أبعاد موحدة `[256]*4` بصلابة انتقائية وعزل عام | **`0.00 MB`** زيادة عند التجميد (`6.54 MB`) في **`3.674s`** (`Zero-RL`) | السلوك المواءم **`0.00% -> 100.00%`**، المرفوض **`91.67% -> 0.00%`**، المعرفة العامة **`91.29% Val`** (`PPL 1.51`) | إذابة `k_rej` (**`-89.1%`**) وقفل `k_pref` (**`+570.5%`**) مع عزل عام (`-0.3%`)، `RMS = 1.2000`، وكيانات **`100% (12/12)`** |
 
 ---
 
@@ -91,7 +93,7 @@ next-23-MTL/
 │   ├── model_v2_attn.py              # SpringGenerativeNetworkV2 (with SparseCausalAttention)
 │   ├── model_dynamic.py              # DynamicSpringGenerativeNetwork (with Dormant Reserve)
 │   ├── model_continuous.py           # ContinuousSpringNetwork (Hybrid ALiBi + Attention + Dynamic Pool)
-│   ├── model_scaled.py               # ScaledSpringNetwork (1.5M-5M Vectorized + Milestones 2.1–2.4)
+│   ├── model_scaled.py               # ScaledSpringNetwork (1.5M-5M Vectorized + Milestones 2.1–2.5)
 ├── benchmarks/                       # حزمة التجارب المعملية والبيانات
 │   ├── __init__.py
 │   ├── corpus_data.py                # Tiered Arabic corpora (12, 25, 50, 100 sentences & 8 paragraphs)
@@ -104,13 +106,14 @@ next-23-MTL/
 │   ├── bench_scale_english_cpu.py    # v2.0 Milestone 2.1: Million-param CPU telemetry & 6-table audit
 │   ├── bench_v2_sleep_continual.py   # v2.0 Milestone 2.2: 4-phase sleep consolidation, recycling & refractory gate
 │   ├── bench_v2_compositional_gen.py # v2.0 Milestone 2.3: Hierarchical stiffness, Active RMSNorm & zero-shot recombination
-│   └── bench_v2_deep_block_sparse.py # v2.0 Milestone 2.4: Block-sparse capsules (B=16) & 12-layer deep highway scaling
+│   ├── bench_v2_deep_block_sparse.py # v2.0 Milestone 2.4: Block-sparse capsules (B=16) & 12-layer deep highway scaling
+│   └── bench_v2_reward_alignment.py  # v2.0 Milestone 2.5: Reward-modulated three-factor plasticity & RL-free alignment
 ├── tests/                            # حزمة التحقق الصارم وفحص AST
 │   ├── __init__.py
-│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (26 files, 8 tests)
+│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (27 files, 9 tests)
 ├── docs/                             # الأوراق البحثية وسجل الإصلاحات وخارطة الطريق
 │   ├── RESEARCH_PAPER_SS_ENN.md      # Full technical paper, equations, empirical tables & reproducibility
-│   ├── V2_ENGINEERING_LOG_AND_FIXES.md # Detailed v2.0 Milestones 2.1–2.4 physics upgrades & audit
+│   ├── V2_ENGINEERING_LOG_AND_FIXES.md # Detailed v2.0 Milestones 2.1–2.5 physics upgrades & audit
 │   ├── LIMITATIONS_AND_V2_ROADMAP.md # Critical scaling analysis & SS-ENN v2.0 execution roadmap
 │   └── SPEC_SPRING_MVP.md            # Core mathematical & architectural specification
 ├── .gitignore
@@ -136,7 +139,7 @@ python tests/test_suite.py
 python train_eval.py
 ```
 
-### 3. تشغيل الاختبارات المعملية التسعة (Run All v1.0 & v2.0 Benchmarks)
+### 3. تشغيل الاختبارات المعملية الإحدى عشرة (Run All v1.0 & v2.0 Benchmarks)
 ```bash
 # 1. Capacity & Saturation Benchmark (12 -> 25 -> 50 sentences)
 python benchmarks/bench_capacity.py
@@ -164,14 +167,17 @@ python benchmarks/bench_v2_compositional_gen.py
 
 # 9. Block-Sparse Elastic Capsules (B=16), Deep Highway DFA & 12-Layer Scaling (Milestone 2.4)
 python benchmarks/bench_v2_deep_block_sparse.py
+
+# 10. Reward-Modulated Three-Factor Spring Plasticity & RL-Free Post-Training Alignment (Milestone 2.5)
+python benchmarks/bench_v2_reward_alignment.py
 ```
 
 ---
 
 ## التوثيق العلمي وخارطة الطريق | Research Documentation & v2.0 Roadmap
 
-- **[الورقة البحثية المتكاملة (`docs/RESEARCH_PAPER_SS_ENN.md`)](./docs/RESEARCH_PAPER_SS_ENN.md):** الاشتقاق النظري لقوانين النابض الثلاثة، معادلات التوجيه المباشر (`DFA`)، التجارب العشر الكاملة، وتحليل ظاهرة التشكيل الذاتي وترشيح الضوضاء عبر نقطة الارتكاز (`Anchor Denoising Effect`).
-- **[سجل الإصلاحات والترقيات الفيزيائية للإصدار الثاني (`docs/V2_ENGINEERING_LOG_AND_FIXES.md`)](./docs/V2_ENGINEERING_LOG_AND_FIXES.md):** التوثيق الرياضي والبرمجي لقوانين **`v2.0 Milestones 2.1–2.4`** (معالجة انجراف الكيانات، تفتت الصلابة الدفعية، طور النوم المزدوج، إعادة تدوير الخلايا، الدرع التكعيبي، بوابة الجموح الانتقالية، الطيف الهرمي للصلابة، تطبيع الطاقة الموضعي، التعميم التركيبي الصفري، الكبسولات الكتلية المتفرقة `B=16`، والتوسع العميق لـ 12 طبقة).
+- **[الورقة البحثية المتكاملة (`docs/RESEARCH_PAPER_SS_ENN.md`)](./docs/RESEARCH_PAPER_SS_ENN.md):** الاشتقاق النظري لقوانين النابض الثلاثة، معادلات التوجيه المباشر (`DFA`)، التجارب الإحدى عشرة الكاملة، وتحليل ظاهرة التشكيل الذاتي وترشيح الضوضاء عبر نقطة الارتكاز (`Anchor Denoising Effect`).
+- **[سجل الإصلاحات والترقيات الفيزيائية للإصدار الثاني (`docs/V2_ENGINEERING_LOG_AND_FIXES.md`)](./docs/V2_ENGINEERING_LOG_AND_FIXES.md):** التوثيق الرياضي والبرمجي الكامل لأطوار **`v2.0 Milestones 2.1–2.5`** (معالجة انجراف الكيانات، تفتت الصلابة الدفعية، طور النوم المزدوج، إعادة تدوير الخلايا، الدرع التكعيبي، بوابة الجموح الانتقالية، الطيف الهرمي للصلابة، تطبيع الطاقة الموضعي، التعميم التركيبي الصفري، الكبسولات الكتلية المتفرقة `B=16`، التوسع العميق لـ 12 طبقة، واللدونة ثلاثية العوامل بالمكافأة).
 - **[وثيقة الحدود المعمارية وخارطة طريق الإصدار الثاني (`docs/LIMITATIONS_AND_V2_ROADMAP.md`)](./docs/LIMITATIONS_AND_V2_ROADMAP.md):** مراجعة نقدية شاملة للسبع عقبات القياسية نحو نماذج `1B` ومصفوفة التقدم التنفيذية لأطوار `v2.0`.
 - **[مواصفات النواة الأساسية (`docs/SPEC_SPRING_MVP.md`)](./docs/SPEC_SPRING_MVP.md):** وثيقة المواصفات الأولية والقيود الصارمة للنظام.
 

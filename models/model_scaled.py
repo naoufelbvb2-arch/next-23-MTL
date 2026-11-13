@@ -32,6 +32,13 @@ Milestone 2.4 Scaling Laws (opt-in via enable_block_sparse=True):
     for stable 12-layer propagation (RMS variance ratio L12/L1 ~ 1.00).
   - Highway-Anchored Deep DFA coupling B^(l) with row-normalized W_head^T + local Hebbian trace.
 
+Milestone 2.5 Post-Training Behavioral Alignment Laws (Reward-Modulated Three-Factor Plasticity):
+  - Decision-Horizon & Salience-Filtered Eligibility Trace (tau > T_prefix, gamma_elig^(T-tau) * s(x_tau)).
+  - Selective Thermal Stiffness Melting on rejected paths (k_ij *= 1 - eta_melt * |R| * norm(|E^-|))
+    and Reward Anchor Locking on preferred paths (w -> w0 consolidation & k_ij up).
+  - Supports both scalar rewards R in [-1, +1] with reward baseline and contrastive preference pairs,
+    consolidating all behavioral shifts directly into Frozen W_0 (Zero-Overhead Export).
+
 Strictly isolated from v1.0 models; zero autograd / zero backward().
 """
 import math
@@ -448,6 +455,8 @@ class ScaledSpringNetwork(nn.Module):
 
         self.growth_log: list[dict] = []
         self.sleep_logs: list[dict] = []
+        self.alignment_logs: list[dict] = []
+        self.reward_baseline: float = 0.0
 
         # Milestone 2.2: Dual-Stage Sleep Consolidation, Synaptic Recycling & Armor Locking State
         self.use_cubic_shield: bool = True
@@ -2184,6 +2193,481 @@ class ScaledSpringNetwork(nn.Module):
         }
         self.sleep_logs.append(sleep_record)
         return sleep_record
+
+    @staticmethod
+    def _normalize_active_eligibility(tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Normalizes non-zero magnitudes |E_ij| into [0, 1] so selective thermal k-melting
+        and reward locking act sharply on offending/endorsed synapses while zero-eligibility
+        general knowledge synapses stay exactly at 0.0.
+        """
+        abs_t = tensor.abs()
+        nz = abs_t[abs_t > 1e-8]
+        if nz.numel() == 0:
+            return torch.zeros_like(abs_t)
+        max_val = float(nz.max().item())
+        mean_val = float(nz.mean().item())
+        ref = max(0.20 * max_val + 0.80 * (1.5 * mean_val), 1e-6)
+        return (abs_t / ref).clamp(0.0, 1.0)
+
+    def _build_decision_horizon_weights(
+        self,
+        input_ids: torch.Tensor,
+        target_ids: torch.Tensor,
+        prefix_lens: torch.Tensor | list[int] | int,
+        pad_id: int = 0,
+        gamma_elig: float = 0.96,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Law 1 (Milestone 2.5): Decision-Horizon & Salience-Filtered Eligibility Weighting.
+        Masks out all prefix steps (tau <= T_prefix) so context grammar is never penalized,
+        and weights continuation decisions by gamma_elig^(T - tau) * salience(x_tau).
+        """
+        bsz, seq_len = target_ids.shape
+        device = target_ids.device
+        if isinstance(prefix_lens, int):
+            p_list = [prefix_lens] * bsz
+        elif isinstance(prefix_lens, torch.Tensor):
+            p_list = [int(x) for x in prefix_lens.tolist()]
+        else:
+            p_list = [int(x) for x in prefix_lens]
+
+        horizon_w = torch.zeros(bsz, seq_len, dtype=torch.float32, device=device)
+        for b in range(bsz):
+            valid_pos = torch.nonzero(
+                (target_ids[b] != pad_id) & (target_ids[b] != 1) & (target_ids[b] != 2),
+                as_tuple=False,
+            ).squeeze(-1)
+            if valid_pos.numel() == 0:
+                continue
+            last_t = int(valid_pos[-1].item())
+            start_t = max(0, p_list[b] - 1)
+            valid_dec = valid_pos[valid_pos >= start_t]
+            if valid_dec.numel() == 0:
+                continue
+            dists = (last_t - valid_dec).clamp(min=0).float()
+            horizon_w[b, valid_dec] = float(gamma_elig) ** dists
+
+        inputs_flat = input_ids.reshape(bsz * seq_len)
+        targets_flat = target_ids.reshape(bsz * seq_len)
+        horizon_flat = horizon_w.reshape(bsz * seq_len)
+        dec_mask = horizon_flat > 0.0
+
+        target_sal = self.token_salience[targets_flat]
+        input_sal = self.token_salience[inputs_flat]
+        step_salience = (0.75 * target_sal + 0.25 * input_sal).clamp(0.70, 1.80)
+        elig_weights = horizon_flat * step_salience
+        return elig_weights, dec_mask
+
+    @torch.no_grad()
+    def _apply_three_factor_pass(
+        self,
+        seq_ids: torch.Tensor,
+        prefix_lens: torch.Tensor | list[int] | int,
+        sample_rewards: torch.Tensor,
+        token_filter_mask: torch.Tensor | None = None,
+        pad_id: int = 0,
+        gamma_elig: float = 0.96,
+        eta_melt: float = 0.82,
+        eta_lock: float = 0.25,
+        eta_align_w: float = 1.6,
+        eta_align_0: float = 0.55,
+        eta_head_w: float = 7.5,
+        eta_head_0: float = 0.78,
+    ) -> dict[str, float]:
+        """
+        Executes a single unified Reward-Modulated Three-Factor Spring Plasticity pass
+        (Laws 1, 2, 3 & 4 of Milestone 2.5) across Dynamic/Block-Sparse hidden layers
+        and Output Head without autograd or any critic network.
+        """
+        bsz = seq_ids.shape[0]
+        if seq_ids.shape[1] < 2:
+            return {"valid_decisions": 0, "ce_loss": 0.0}
+
+        input_ids = seq_ids[:, :-1]
+        target_ids = seq_ids[:, 1:]
+        seq_len = input_ids.shape[1]
+        n_total = bsz * seq_len
+
+        self._is_training_step = False
+        logits = self.forward(input_ids)
+        logits_flat = logits.reshape(n_total, self.vocab_size)
+        targets_flat = target_ids.reshape(n_total)
+
+        elig_weights, dec_mask = self._build_decision_horizon_weights(
+            input_ids=input_ids,
+            target_ids=target_ids,
+            prefix_lens=prefix_lens,
+            pad_id=pad_id,
+            gamma_elig=gamma_elig,
+        )
+        if token_filter_mask is not None:
+            filter_flat = token_filter_mask.reshape(n_total).float()
+            eff_elig_weights = elig_weights * filter_flat
+            eff_dec_mask = dec_mask & (filter_flat > 0.0)
+        else:
+            eff_elig_weights = elig_weights
+            eff_dec_mask = dec_mask
+
+        n_dec = max(int(eff_dec_mask.sum().item()), 1)
+        if int(eff_dec_mask.sum().item()) == 0:
+            return {"valid_decisions": 0, "ce_loss": 0.0}
+
+        r_per_tok = sample_rewards.unsqueeze(1).expand(bsz, seq_len).reshape(n_total)
+        pos_gate = (r_per_tok > 0.0).float()
+        neg_gate = (r_per_tok < 0.0).float()
+
+        probs = F.softmax(logits_flat, dim=-1)
+        y_onehot = F.one_hot(targets_flat, num_classes=self.vocab_size).float()
+
+        # Token-level selection residual for R > 0 vs R < 0
+        pos_scale = (r_per_tok.clamp(min=0.0) * eff_elig_weights * pos_gate).unsqueeze(-1)
+        err_pos = (y_onehot - probs) * pos_scale
+
+        p_chosen = (probs * y_onehot).sum(dim=-1, keepdim=True)
+        p_other = probs * (1.0 - y_onehot)
+        p_alt = p_other / p_other.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        neg_scale = ((-r_per_tok).clamp(min=0.0) * eff_elig_weights * neg_gate).unsqueeze(-1)
+        err_neg = (p_alt - y_onehot) * p_chosen * neg_scale
+
+        err_total = err_pos + err_neg
+
+        has_neg = bool(((neg_gate > 0.0) & eff_dec_mask).any().item())
+        has_pos = bool(((pos_gate > 0.0) & eff_dec_mask).any().item())
+        mean_r_neg = (
+            float((-r_per_tok[(neg_gate > 0.0) & eff_dec_mask]).abs().mean().item()) if has_neg else 0.0
+        )
+        mean_r_pos = (
+            float(r_per_tok[(pos_gate > 0.0) & eff_dec_mask].mean().item()) if has_pos else 0.0
+        )
+
+        # Decision-horizon CE & chosen probability telemetry
+        dec_logits = logits_flat[eff_dec_mask]
+        dec_targets = targets_flat[eff_dec_mask]
+        ce_loss = float(F.cross_entropy(dec_logits, dec_targets).item())
+        mean_chosen_prob = float(p_chosen[eff_dec_mask].mean().item())
+
+        # Shared hidden-layer Three-Factor Plasticity loop (Block-Sparse & Element-Wise)
+        use_block_path = self.enable_block_sparse and (not self.continual_mode)
+        depth_dfa_scale = (
+            ((4.0 / float(max(self.num_layers, 4))) ** 0.25)
+            if (use_block_path and self.use_depth_scaled_highway and self.num_layers > 4)
+            else 1.0
+        )
+
+        k_hid_rej_before: list[float] = []
+        k_hid_rej_after: list[float] = []
+        k_hid_pref_before: list[float] = []
+        k_hid_pref_after: list[float] = []
+
+        for l_idx, layer in enumerate(self.spring_layers):
+            d_act = layer.d_active
+            a_prev = layer._last_a_prev
+            if a_prev is None:
+                continue
+            in_dim = a_prev.shape[1]
+            z_act = layer._last_z[:, :d_act]
+            raw_mask = layer._last_mask
+            if use_block_path:
+                cell_mask = raw_mask.repeat_interleave(self.block_size, dim=1)
+                n_blocks = max(1, d_act // self.block_size)
+                k_eff = (
+                    min(self.hierarchical_top_k_blocks[l_idx], n_blocks) * self.block_size
+                    if self.enable_hierarchical_compositional
+                    else (layer.top_k or d_act)
+                )
+            else:
+                cell_mask = raw_mask[:, :d_act]
+                k_eff = layer.top_k or d_act
+
+            g_prime = layer._activate_derivative(z_act)
+            active_cell = g_prime * cell_mask  # [N, d_act]
+            B_l_act = self.dfa_router.get_matrix(l_idx)[:d_act, :]
+
+            wins_per_cell = cell_mask.sum(dim=0).clamp(min=1.0).unsqueeze(1)
+            avg_dec_per_seq = float(n_dec) / float(max(bsz, 1))
+            denom = (0.35 * avg_dec_per_seq) + (0.65 * wins_per_cell)
+
+            w_act = layer.w[:d_act, :in_dim]
+            w0_act = layer.w0[:d_act, :in_dim]
+            k_act = layer.k[:d_act, :in_dim]
+
+            # 1. Negative Pass (R < 0): Selective Stiffness Melting on rejected synapses
+            elig_neg_l = None
+            if has_neg:
+                proj_neg = F.linear(err_neg, B_l_act) * depth_dfa_scale
+                delta_neg = proj_neg * active_cell
+                elig_neg_l = torch.matmul(delta_neg.t(), a_prev) / denom
+                norm_e_neg = self._normalize_active_eligibility(elig_neg_l)
+                melt_mask = norm_e_neg > 0.05
+                if melt_mask.any():
+                    k_hid_rej_before.append(float(k_act[melt_mask].mean().item()))
+                melt_frac = (eta_melt * mean_r_neg * norm_e_neg).clamp(0.0, 0.92)
+                k_act.mul_(1.0 - melt_mask.float() * melt_frac)
+                if melt_mask.any():
+                    k_hid_rej_after.append(float(k_act[melt_mask].mean().item()))
+
+            # 2. Combined Elastic Push & Anchor Deposition into W_0 (shielded by surviving k)
+            # Normalize by mean squared activation norm so step scale is invariant to d_act / d_last.
+            mean_a2_hid = max(float(a_prev.pow(2).sum(dim=-1).mean().item()), 1.0)
+            proj_tot = F.linear(err_total, B_l_act) * depth_dfa_scale
+            delta_tot = proj_tot * active_cell
+            elig_tot_l = torch.matmul(delta_tot.t(), a_prev) / denom
+            plastic_gate_hid = (1.0 - k_act).clamp(min=0.05).pow(2.5)
+            stretch = w_act - w0_act
+            delta_w = ((eta_align_w / mean_a2_hid) * plastic_gate_hid * elig_tot_l) - (layer.gamma * k_act * stretch)
+            w_act.add_(delta_w)
+            stretch_new = w_act - w0_act
+            w0_act.add_(eta_align_0 * (1.0 - k_act) * stretch_new)
+
+            # 3. Positive Pass (R > 0): Reward Locking on aligned synapses
+            if has_pos:
+                proj_pos = F.linear(err_pos, B_l_act) * depth_dfa_scale
+                delta_pos = proj_pos * active_cell
+                elig_pos_l = torch.matmul(delta_pos.t(), a_prev) / denom
+                norm_e_pos = self._normalize_active_eligibility(elig_pos_l)
+                lock_mask = norm_e_pos > 0.05
+                if lock_mask.any():
+                    k_hid_pref_before.append(float(k_act[lock_mask].mean().item()))
+                stiff_ceil = (
+                    self.layer_stiff_ceilings[l_idx]
+                    if self.enable_hierarchical_compositional
+                    else 0.85
+                )
+                delta_k = eta_lock * mean_r_pos * norm_e_pos * (1.0 - k_act)
+                k_act.add_(delta_k).clamp_(0.0, stiff_ceil)
+                if lock_mask.any():
+                    k_hid_pref_after.append(float(k_act[lock_mask].mean().item()))
+
+        # Output Head Three-Factor Plasticity (Melt rejected vocab links -> Consolidate & Lock preferred)
+        d_last = self._final_layer_dim()
+        a_head_raw = self.output_head._last_a_prev
+        a_head = a_head_raw[:, :d_last] if a_head_raw.shape[1] != d_last else a_head_raw
+        w_h = self.output_head.w[:, :d_last]
+        w0_h = self.output_head.w0[:, :d_last]
+        k_h = self.output_head.k[:, :d_last]
+
+        # Batch-size-invariant per-token occurrence normalization for output_head rows
+        avg_dec_per_seq = float(n_dec) / float(max(bsz, 1))
+        target_hits_v = torch.zeros(self.vocab_size, dtype=torch.float32, device=seq_ids.device)
+        target_hits_v.scatter_add_(
+            0,
+            dec_targets,
+            torch.ones(dec_targets.numel(), dtype=torch.float32, device=seq_ids.device),
+        )
+        denom_h = (0.20 * avg_dec_per_seq) + (0.80 * target_hits_v.clamp(min=1.0).unsqueeze(1))
+
+        # Track untouched vocab rows (zero negative & zero positive token presence)
+        dec_vocab_active = torch.zeros(self.vocab_size, dtype=torch.bool, device=seq_ids.device)
+        dec_vocab_active[dec_targets] = True
+        untouched_vocab = ~dec_vocab_active
+        untouched_k_before = float(k_h[untouched_vocab].mean().item()) if untouched_vocab.any() else 0.0
+
+        k_head_rej_before = 0.0
+        k_head_rej_after = 0.0
+        k_head_pref_before = 0.0
+        k_head_pref_after = 0.0
+
+        if has_neg:
+            # Melt ONLY synapses connected to actually executed rejected actions (zero spillover to general vocab)
+            elig_head_neg = torch.matmul((y_onehot * neg_scale * p_chosen.clamp(min=0.10)).t(), a_head) / denom_h
+            norm_eh_neg = self._normalize_active_eligibility(elig_head_neg)
+            melt_h_mask = norm_eh_neg > 0.05
+            if melt_h_mask.any():
+                k_head_rej_before = float(k_h[melt_h_mask].mean().item())
+            melt_h = (eta_melt * mean_r_neg * norm_eh_neg).clamp(0.0, 0.92)
+            k_h.mul_(1.0 - melt_h_mask.float() * melt_h)
+            if melt_h_mask.any():
+                k_head_rej_after = float(k_h[melt_h_mask].mean().item())
+
+        mean_a2_head = max(float(a_head.pow(2).sum(dim=-1).mean().item()), 1.0)
+        elig_head_tot = torch.matmul(err_total.t(), a_head) / denom_h
+        plastic_gate_head = (1.0 - k_h).clamp(min=0.04).pow(2.0)
+        stretch_h = w_h - w0_h
+        w_h.add_(((eta_head_w / mean_a2_head) * plastic_gate_head * elig_head_tot) - (self.output_head.gamma * k_h * stretch_h))
+        stretch_h_new = w_h - w0_h
+        w0_h.add_(eta_head_0 * (1.0 - k_h) * stretch_h_new)
+
+        if has_pos:
+            # Lock ONLY synapses connected to actually executed preferred actions (never lock rejected/general rows)
+            elig_head_pos = torch.matmul((y_onehot * pos_scale).t(), a_head) / denom_h
+            norm_eh_pos = self._normalize_active_eligibility(elig_head_pos)
+            lock_h_mask = norm_eh_pos > 0.05
+            if lock_h_mask.any():
+                k_head_pref_before = float(k_h[lock_h_mask].mean().item())
+            k_h.add_(eta_lock * mean_r_pos * norm_eh_pos * (1.0 - k_h)).clamp_(0.0, 0.92)
+            if lock_h_mask.any():
+                k_head_pref_after = float(k_h[lock_h_mask].mean().item())
+
+            if self.use_highway_anchored_dfa:
+                self._sync_highway_anchored_dfa(init_only=False)
+
+        untouched_k_after = float(k_h[untouched_vocab].mean().item()) if untouched_vocab.any() else 0.0
+
+        return {
+            "valid_decisions": n_dec,
+            "ce_loss": ce_loss,
+            "mean_chosen_prob": mean_chosen_prob,
+            "k_head_rej_before": k_head_rej_before,
+            "k_head_rej_melted": k_head_rej_after,
+            "k_head_pref_before": k_head_pref_before,
+            "k_head_pref_locked": k_head_pref_after,
+            "k_hid_rej_before": sum(k_hid_rej_before) / max(len(k_hid_rej_before), 1),
+            "k_hid_rej_melted": sum(k_hid_rej_after) / max(len(k_hid_rej_after), 1),
+            "k_hid_pref_before": sum(k_hid_pref_before) / max(len(k_hid_pref_before), 1),
+            "k_hid_pref_locked": sum(k_hid_pref_after) / max(len(k_hid_pref_after), 1),
+            "k_untouched_head_before": untouched_k_before,
+            "k_untouched_head_after": untouched_k_after,
+            "layer_normed_rms": list(self._last_layer_normed_rms),
+        }
+
+    @torch.no_grad()
+    def align_with_reward_modulation(
+        self,
+        seq_ids: torch.Tensor | None = None,
+        prefix_lens: torch.Tensor | list[int] | int = 1,
+        rewards: torch.Tensor | list[float] | float = 0.0,
+        preferred_seqs: torch.Tensor | None = None,
+        rejected_seqs: torch.Tensor | None = None,
+        pad_id: int = 0,
+        gamma_elig: float = 0.96,
+        eta_melt: float = 0.82,
+        eta_lock: float = 0.25,
+        eta_align_w: float = 1.6,
+        eta_align_0: float = 0.55,
+        eta_head_w: float = 7.5,
+        eta_head_0: float = 0.78,
+        use_reward_baseline: bool = True,
+        mask_shared_tokens_in_pairs: bool = True,
+    ) -> dict[str, float]:
+        """
+        Milestone 2.5 Post-Training Behavioral Alignment (Critic-Free, Zero-Autograd):
+        Accepts either:
+          (a) Contrastive behavioral preference pairs (`preferred_seqs` with R=+1 vs
+              `rejected_seqs` with R=-1 for the same context prefixes), or
+          (b) Individual rollout sequences (`seq_ids` with scalar rewards `rewards` in [-1, +1]
+              centered against the balanced EMA `reward_baseline`).
+        All aligned behavior consolidates directly into equilibrium anchors `W_0`.
+        """
+        if self.frozen:
+            raise RuntimeError("Model is already frozen; run alignment before production_freeze().")
+
+        if preferred_seqs is not None and rejected_seqs is not None:
+            bsz = preferred_seqs.shape[0]
+            if isinstance(prefix_lens, int):
+                p_list = [prefix_lens] * bsz
+            elif isinstance(prefix_lens, torch.Tensor):
+                p_list = [int(x) for x in prefix_lens.tolist()]
+            else:
+                p_list = [int(x) for x in prefix_lens]
+
+            rej_filter = None
+            if mask_shared_tokens_in_pairs:
+                t_rej = rejected_seqs.shape[1] - 1
+                rej_filter = torch.ones(bsz, t_rej, dtype=torch.float32, device=rejected_seqs.device)
+                rej_targets = rejected_seqs[:, 1:]
+                for b in range(bsz):
+                    pref_cont = set(
+                        int(t)
+                        for t in preferred_seqs[b, p_list[b]:].tolist()
+                        if t not in (pad_id, 1, 2)
+                    )
+                    start_t = max(0, p_list[b] - 1)
+                    for t in range(start_t, t_rej):
+                        tid = int(rej_targets[b, t].item())
+                        if tid == pad_id:
+                            continue
+                        if tid in pref_cont:
+                            rej_filter[b, t] = 0.0
+
+            neg_rewards = torch.full((bsz,), -1.0, dtype=torch.float32, device=rejected_seqs.device)
+            rej_stats = self._apply_three_factor_pass(
+                seq_ids=rejected_seqs,
+                prefix_lens=p_list,
+                sample_rewards=neg_rewards,
+                token_filter_mask=rej_filter,
+                pad_id=pad_id,
+                gamma_elig=gamma_elig,
+                eta_melt=eta_melt,
+                eta_lock=eta_lock,
+                eta_align_w=eta_align_w,
+                eta_align_0=eta_align_0,
+                eta_head_w=eta_head_w,
+                eta_head_0=eta_head_0,
+            )
+
+            pos_rewards = torch.full((bsz,), 1.0, dtype=torch.float32, device=preferred_seqs.device)
+            pref_stats = self._apply_three_factor_pass(
+                seq_ids=preferred_seqs,
+                prefix_lens=p_list,
+                sample_rewards=pos_rewards,
+                token_filter_mask=None,
+                pad_id=pad_id,
+                gamma_elig=gamma_elig,
+                eta_melt=eta_melt,
+                eta_lock=eta_lock,
+                eta_align_w=eta_align_w,
+                eta_align_0=eta_align_0,
+                eta_head_w=eta_head_w,
+                eta_head_0=eta_head_0,
+            )
+
+            stats = {
+                "mode": "contrastive_pair",
+                "valid_decisions": rej_stats["valid_decisions"] + pref_stats["valid_decisions"],
+                "pref_ce_loss": pref_stats["ce_loss"],
+                "mean_pref_prob": pref_stats["mean_chosen_prob"],
+                "mean_rej_prob": rej_stats["mean_chosen_prob"],
+                "k_head_rej_before": rej_stats["k_head_rej_before"],
+                "k_head_rej_melted": rej_stats["k_head_rej_melted"],
+                "k_head_pref_before": pref_stats["k_head_pref_before"],
+                "k_head_pref_locked": pref_stats["k_head_pref_locked"],
+                "k_hid_rej_before": rej_stats["k_hid_rej_before"],
+                "k_hid_rej_melted": rej_stats["k_hid_rej_melted"],
+                "k_hid_pref_before": pref_stats["k_hid_pref_before"],
+                "k_hid_pref_locked": pref_stats["k_hid_pref_locked"],
+                "k_untouched_head_before": rej_stats["k_untouched_head_before"],
+                "k_untouched_head_after": pref_stats["k_untouched_head_after"],
+                "layer_normed_rms": pref_stats["layer_normed_rms"],
+            }
+            self.alignment_logs.append(stats)
+            return stats
+
+        if seq_ids is None:
+            raise ValueError("Provide either `seq_ids` + `rewards` or (`preferred_seqs`, `rejected_seqs`).")
+
+        bsz = seq_ids.shape[0]
+        if isinstance(rewards, (int, float)):
+            r_tensor = torch.full((bsz,), float(rewards), dtype=torch.float32, device=seq_ids.device)
+        elif isinstance(rewards, torch.Tensor):
+            r_tensor = rewards.to(dtype=torch.float32, device=seq_ids.device)
+        else:
+            r_tensor = torch.tensor(rewards, dtype=torch.float32, device=seq_ids.device)
+
+        if use_reward_baseline:
+            r_adv = (r_tensor - self.reward_baseline).clamp(-1.5, 1.5)
+            batch_mean_r = float(r_tensor.mean().item())
+            self.reward_baseline = max(-0.30, min(0.30, 0.90 * self.reward_baseline + 0.10 * batch_mean_r))
+        else:
+            r_adv = r_tensor.clamp(-1.5, 1.5)
+
+        stats = self._apply_three_factor_pass(
+            seq_ids=seq_ids,
+            prefix_lens=prefix_lens,
+            sample_rewards=r_adv,
+            token_filter_mask=None,
+            pad_id=pad_id,
+            gamma_elig=gamma_elig,
+            eta_melt=eta_melt,
+            eta_lock=eta_lock,
+            eta_align_w=eta_align_w,
+            eta_align_0=eta_align_0,
+            eta_head_w=eta_head_w,
+            eta_head_0=eta_head_0,
+        )
+        stats["mode"] = "scalar_reward"
+        self.alignment_logs.append(stats)
+        return stats
 
     @torch.no_grad()
     def production_freeze(self, prune_dormant: bool = True) -> dict:

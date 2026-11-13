@@ -1,4 +1,4 @@
-# سجل الإصلاحات الهندسية والترقيات الفيزيائية للإصدار الثاني (SS-ENN v2.0 — Milestones 2.1, 2.2, 2.3 & 2.4)
+# سجل الإصلاحات الهندسية والترقيات الفيزيائية للإصدار الثاني (SS-ENN v2.0 — Milestones 2.1–2.5 | Complete)
 **Engineering Log, Bottleneck Diagnostics, and Permanent v2.0 Core Physics Upgrades on the Million-Parameter CPU Engine**
 
 ---
@@ -365,20 +365,80 @@
 
 ---
 
-## 8. طريقة إعادة الإنتاج والتحقق (`Reproducibility`)
+## 8. الطور 2.5 (الأخير): اللدونة النابضية ثلاثية العوامل المُعدَّلة بالمكافأة والضبط السلوكي بعد التدريب (`Milestone 2.5: Reward-Modulated Three-Factor Spring Plasticity & RL-Free Alignment`)
+
+بإتمام **الطور 2.5** تُستكمل خارطة طريق الإصدار الثاني **SS-ENN v2.0** بنسبة **100% (5/5 أطوار)**. يتيح هذا الطور للنموذج المُدرَّب مسبقاً الخضوع لضبط وتوجيه سلوكي بعد التدريب (`Post-Training Behavioral Alignment`) بالاعتماد فقط على إشارة مكافأة قياسية $R \in [-1, +1]$ — **بدون شبكات ناقد (`No Critic/Value Network`)، وبدون خوارزميات `PPO / DPO`، وبدون أي انتشار عكسي (`Zero-Autograd`)**:
+
+### 8.1 القوانين الفيزيائية الأربعة للطور 2.5 (في [`models/model_scaled.py`](../models/model_scaled.py))
+1. **القانون الأول — أثر الأهلية المحكوم بأفق القرار والأهمية الدلالية (`Decision-Horizon & Salience-Filtered Eligibility Trace`):**
+   - يُجمَّد أثر البادئة المشتركة تماماً ($\tau \le T_{\text{prefix}} \Rightarrow e_\tau = 0$) لحماية النحو السياقي في [`_build_decision_horizon_weights()`](../models/model_scaled.py#L2213-L2260)، وتُستثنى الرموز التأسيسية (`<pad>`, `<bos>`, `<eos>`) من تضخيم الترجيح، بينما تتضاعف أهلية خطوات القرار اللاحقة بأفقٍ زمنيٍّ ومصفوفة أهمية مفردات مدربة:
+     $$e_{t} = \mathbb{1}[\tau > T_{\text{prefix}}] \cdot \gamma_{\text{elig}}^{T - \tau} \cdot \left(0.75\, s(y_\tau) + 0.25\, s(x_\tau)\right), \qquad \gamma_{\text{elig}} = 0.985$$
+2. **القانون الثاني — الإذابة الحرارية الانتقائية للصلابة عند العقاب ($R < 0$) وقفل المكافأة ($R > 0$):**
+   - **عند السلوك المرفوض ($R < 0$):** تذوب صلابة $k$ **فقط** في المشابك النشطة والكبسولات ورأس الإخراج المسؤولة فعلياً عن الفعل المرفوض المُنَفَّذ (`y_onehot * neg_scale * p_chosen`):
+     $$k_{ij}^{\text{head/hid}} \leftarrow k_{ij} \left(1 - \eta_{\text{melt}} \, |R| \, \text{norm}\!\left(|\mathcal{E}_{ij}^{(-)}|\right)\right)$$
+     مما يحرر تلك الروابط لإعادة تشكيلها دون المساس بالمعرفة العامة.
+   - **عند السلوك المفضّل ($R > 0$):** تتجه الأوزان السريعة $w$ ونقاط الارتكاز $W_0$ نحو المسار المفضّل عبر خطوة معيارية لا تتأثر بعرض الطبقة (`mean_a2 = mean(||a||^2)`):
+     $$\Delta w = \frac{\eta_w}{\|a\|_2^2} (1 - k)^2 \mathcal{E}_{\text{tot}} - \gamma k (w - w_0), \qquad \Delta w_0 = \eta_0 (1 - k)(w_{\text{new}} - w_0)$$
+     ثم ترتفع الصلابة (`k <- k + eta_lock * R * norm(E^+) * (1 - k)`) لقفل القرار المفضّل في `W_0`.
+   - ولأن قفل وإذابة رأس الإخراج محصوران بـ `y_onehot` الفعلية للقرار، تبقى صفوف المعرفة العامة غير الملموسة (`untouched_vocab`) بلا تداخل يُذكر.
+3. **القانون الثالث — واجهة التوجيه المتباين أو بالمكافأة الفردية مع ثبات الطاقة (`Contrastive & Scalar-Reward Baseline API`):**
+   - تدعم الدالة [`align_with_reward_modulation()`](../models/model_scaled.py#L2520-L2670) كلاً من **الأزواج التفضيلية المتباينة (`preferred_seqs`, `rejected_seqs`)** و**المسارات المفردة ذات المكافأة القياسية (`seq_ids`, `rewards` مع خط الأساس المتوسط `self.reward_baseline`)** عبر [`_apply_three_factor_pass()`](../models/model_scaled.py#L2263-L2518)، مع استقرار طاقة الطبقات المطبّعة عند **`1.2000`**.
+4. **القانون الرابع — الترسيخ الكامل في الارتكاز `W_0` والتصدير بدون عبء (`Zero-Overhead W_0 Export`):**
+   - يُدمج التغيير السلوكي مباشرة في `W_0`، وعند `production_freeze()` تُتلف $(w, k)$ وأثر الأهلية كلياً فيبقى نفس الحجم **`6.54 MB`** تماماً (`0.00 MB` زيادة).
+
+### 8.2 نتائج الاختبار المعياري للطور 2.5 (`benchmarks/bench_v2_reward_alignment.py` — `Frozen W0 Only`)
+*(AST: `27` Python files scanned, `0 backward/grad` | Split: `General Train=255`, `General Val=45`, `Behavioral Scenarios=12` (5:1 pre-bias), `V=2,048` | Alignment Time: `3.674s`)*
+
+#### الجدول (1): المقارنة الشاملة قبل الضبط وبعده على `Frozen W0 Only`
+| المؤشر المقيّم (`Frozen W0 Only`) | قبل الضبط (`Unaligned W0`) | بعد الضبط (`Aligned v2.5 W0`) | التغيير (`Delta`) |
+| :--- | :---: | :---: | :---: |
+| **نسبة تفضيل السلوك المتوافق (`Aligned Preference%`)** | `0.00%` | **`100.00%`** | **`+100.00%`** |
+| **نسبة السلوك المرفوض (`Rejected Behavior%`)** | `91.67%` | **`0.00%`** | **`-91.67%`** |
+| **دقة متابعة المسار المفضل (`Preferred Eval Acc% / PPL`)** | `62.18%` (`PPL 9.93`) | **`88.83%`** (`PPL 2.20`) | **`+26.65%`** |
+| **دقة متابعة المسار المرفوض (`Rejected Eval Acc% / PPL`)** | `81.11%` (`PPL 3.54`) | `71.28%` (`PPL 4.18`) | `-9.82%` |
+| **الاحتفاظ بالمعرفة العامة — التدريب (`Gen Train Acc% / PPL`)** | `92.04%` (`PPL 1.67`) | **`91.58%`** (`PPL 1.48`) | `-0.46%` (`-0.19 PPL`) |
+| **الاحتفاظ بالمعرفة العامة — التحقق غير المرئي (`Gen Val Acc% / PPL`)** | `90.53%` (`PPL 1.74`) | **`91.29%`** (`PPL 1.51`) | **`+0.76%`** (`-0.23 PPL`) |
+| **بصمة الذاكرة المجمدة (`Frozen W0 Footprint`)** | `6.54 MB` (`[256]*4`) | **`6.54 MB`** (`[256]*4`) | **`0.00 MB`** (`Zero-Overhead`) |
+| **زمن الضبط السلوكي (`Alignment Wall-Clock Time`)** | `---` | **`3.674 s`** | `Zero-Autograd` |
+
+#### الجدول (2): الإذابة الحرارية الانتقائية للصلابة، قفل المكافأة، وثبات `Active RMSNorm`
+| الدائرة الفيزيائية / المؤشر (`Circuit Diagnostic`) | قبل الضبط | بعد الضبط | التحوّل النسبي |
+| :--- | :---: | :---: | :---: |
+| **صلابة مفردات السلوك المرفوض (`k_rej_head`)** | `0.1234` | **`0.0134`** | **`-89.1%`** *(إذابة حرارية)* |
+| **صلابة المشابك المخفية المرفوضة (`k_rej_hid`)** | `0.1959` | **`0.1568`** | **`-19.9%`** *(تحرير الدائرة)* |
+| **صلابة مفردات السلوك المفضل (`k_pref_head`)** | `0.0769` | **`0.5156`** | **`+570.5%`** *(قفل بالمكافأة)* |
+| **صلابة المشابك المخفية المفضلة (`k_pref_hid`)** | `0.1787` | **`0.3178`** | **`+77.9%`** *(ترسيخ سلوكي)* |
+| **صلابة مفردات المعرفة العامة غير الملموسة (`k_gen_head`)** | `0.1692` | **`0.1687`** | **`-0.3%`** *(عزل شبه تام)* |
+| **طاقة `Post-RMS` بعد التجميد (`L1..L4`)** | `---` | **`[1.2, 1.2, 1.2, 1.2]`** | `Target: 1.2000` |
+
+#### الجدول (3): تدقيق التوليد الحر الجانبي (`Side-by-Side Rollout Audit on Frozen W0`)
+*الحصيلة عبر جميع السيناريوهات الاثني عشر: **`100.00% (12/12)`** اتساق السلوك والكيان، **`0.00%`** تكرار متجاور، و**`0.00%`** حلقات عبارة:*
+- **`S01` (`brave puppy / wooden toy`):** `Broke the wheel and shouted angrily...` $\longrightarrow$ **`Repaired the wheel and shared kindly. then the brave puppy opened the small gate and played together.`**
+- **`S02` (`kind girl / bright sketch`):** `Tore the paper and yelled loudly...` $\longrightarrow$ **`Framed the paper and smiled gently. then the kind girl watered the roses...`**
+- **`S03` (`clever fox / fresh berries`):** `Snatched the basket...` $\longrightarrow$ **`Carried the basket and greeted warmly. then the clever fox delivered the fresh loaf...`**
+- **`S04` (`wise owl / heavy books`):** `Dropped the stack and scolded harshly...` $\longrightarrow$ **`Arranged the stack and taught patiently. then the wise owl welcomed the guests...`**
+- **`S05` (`curious boy / cool water`):** `Spilled the pitcher and...` $\longrightarrow$ **`Poured the pitcher and thanked politely. then the curious boy placed smooth pebbles beside the clean basin.`**
+- **`S06` (`young rabbit / sweet carrots`):** `Hoarded the bundle and refused selfishly...` $\longrightarrow$ **`Shared the bundle and cheered happily. then the young rabbit lifted the woven basket for his neighbor.`**
+
+---
+
+## 9. طريقة إعادة الإنتاج والتحقق (`Reproducibility`)
 ```bash
-# 1. تشغيل معيار الطور 2.4 للكبسولات الكتلية المتفرقة (B=16) والتوسع العميق لـ 12 طبقة
+# 1. تشغيل معيار الطور 2.5 للتوجيه بالمكافأة ثلاثية العوامل والضبط السلوكي بعد التدريب
+python benchmarks/bench_v2_reward_alignment.py
+
+# 2. تشغيل معيار الطور 2.4 للكبسولات الكتلية المتفرقة (B=16) والتوسع العميق لـ 12 طبقة
 python benchmarks/bench_v2_deep_block_sparse.py
 
-# 2. تشغيل معيار الطور 2.3 للتعميم التركيبي الصفري، الصلابة الهرمية، وتطبيع الطاقة الموضعي
+# 3. تشغيل معيار الطور 2.3 للتعميم التركيبي الصفري، الصلابة الهرمية، وتطبيع الطاقة الموضعي
 python benchmarks/bench_v2_compositional_gen.py
 
-# 3. تشغيل معيار الطور 2.2 للتعلم المستمر عبر 4 مراحل، طور النوم المزدوج، وإعادة تدوير الخلايا
+# 4. تشغيل معيار الطور 2.2 للتعلم المستمر عبر 4 مراحل، طور النوم المزدوج، وإعادة تدوير الخلايا
 python benchmarks/bench_v2_sleep_continual.py
 
-# 4. تشغيل معيار الطور 2.1 للمحرك المليوني والترقية الفيزيائية على المعالج المحلي
+# 5. تشغيل معيار الطور 2.1 للمحرك المليوني والترقية الفيزيائية على المعالج المحلي
 python benchmarks/bench_scale_english_cpu.py
 
-# 5. تشغيل حزمة الاختبارات الصارمة (8 اختبارات) وفحص AST عبر جميع ملفات المستودع (26 ملفاً برمجياً)
+# 6. تشغيل حزمة الاختبارات الصارمة (9 اختبارات) وفحص AST عبر جميع ملفات المستودع (27 ملفاً برمجياً)
 python tests/test_suite.py
 ```
