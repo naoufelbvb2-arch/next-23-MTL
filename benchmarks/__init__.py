@@ -6,6 +6,7 @@ from .bench_v2_compositional_gen import run_v2_compositional_gen_benchmark
 from .bench_v2_deep_block_sparse import run_v2_deep_block_sparse_benchmark
 from .bench_v2_reward_alignment import run_v2_reward_alignment_benchmark
 from .bench_v3_kernels_speed import run_v3_kernels_benchmark
+from .bench_v3_production_model import run_v3_production_benchmark
 
 __all__ = [
     "CORPUS_TIERS",
@@ -17,4 +18,5 @@ __all__ = [
     "run_v2_deep_block_sparse_benchmark",
     "run_v2_reward_alignment_benchmark",
     "run_v3_kernels_benchmark",
+    "run_v3_production_benchmark",
 ]

@@ -147,15 +147,27 @@ class MixedPrecisionCompensator:
     without stagnation, underflow-to-zero, or NaN.
     """
 
-    def __init__(self) -> None:
-        self._res_w: dict[int, torch.Tensor] = {}
-        self._res_w0: dict[int, torch.Tensor] = {}
-        self._res_k: dict[int, torch.Tensor] = {}
+    def __init__(self, mode: str = "full") -> None:
+        if mode not in ("full", "anchor_k", "off"):
+            raise ValueError(f"Unsupported MixedPrecisionCompensator mode: {mode!r}")
+        self.mode = mode
+        self._res_w: dict[int | str, torch.Tensor] = {}
+        self._res_w0: dict[int | str, torch.Tensor] = {}
+        self._res_k: dict[int | str, torch.Tensor] = {}
 
     @torch.no_grad()
     def get_residuals(
-        self, key_id: int, shape: tuple[int, int], device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, key_id: int | str, shape: tuple[int, int], device: torch.device
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        if self.mode == "off":
+            return None, None, None
+        if self.mode == "anchor_k":
+            self._res_w.pop(key_id, None)
+            rw0 = self._res_w0.get(key_id)
+            if rw0 is None or rw0.shape != shape or rw0.device != device:
+                self._res_w0[key_id] = torch.zeros(shape, device=device, dtype=torch.float32)
+                self._res_k[key_id] = torch.zeros(shape, device=device, dtype=torch.float32)
+            return None, self._res_w0[key_id], self._res_k[key_id]
         rw = self._res_w.get(key_id)
         if rw is None or rw.shape != shape or rw.device != device:
             self._res_w[key_id] = torch.zeros(shape, device=device, dtype=torch.float32)
@@ -179,7 +191,9 @@ def fused_spring_update_inplace(
     cubic_shield: bool = False,
     scratch: SpringScratchBuffer | None = None,
     compensator: MixedPrecisionCompensator | None = None,
-    comp_key: int | None = None,
+    comp_key: int | str | None = None,
+    comp_row_indices: torch.Tensor | None = None,
+    comp_full_rows: int | None = None,
 ) -> None:
     """
     Fused In-Place Three-Factor Spring Plasticity Kernel:
@@ -206,10 +220,22 @@ def fused_spring_update_inplace(
         rw = rw0 = rk = None
         if compensator is not None:
             ck = comp_key if comp_key is not None else id(w)
-            rw, rw0, rk = compensator.get_residuals(ck, (rows, cols), w.device)
-            wf.add_(rw)
-            w0f.add_(rw0)
-            kf.add_(rk).clamp_(0.0, 0.98 if cubic_shield else stiff_ceil)
+            full_rows = comp_full_rows if comp_full_rows is not None else rows
+            rw, rw0, rk = compensator.get_residuals(ck, (full_rows, cols), w.device)
+            if comp_row_indices is not None:
+                if rw is not None:
+                    wf.add_(rw[comp_row_indices])
+                if rw0 is not None:
+                    w0f.add_(rw0[comp_row_indices])
+                if rk is not None:
+                    kf.add_(rk[comp_row_indices]).clamp_(0.0, 0.98 if cubic_shield else stiff_ceil)
+            else:
+                if rw is not None:
+                    wf.add_(rw)
+                if rw0 is not None:
+                    w0f.add_(rw0)
+                if rk is not None:
+                    kf.add_(rk).clamp_(0.0, 0.98 if cubic_shield else stiff_ceil)
 
         _fused_fp32_core_inplace(
             wf, w0f, kf, drv_f, eta_w, eta_0, gamma, beta_k_eff,
@@ -222,10 +248,21 @@ def fused_spring_update_inplace(
         w.copy_(wf.to(w.dtype))
         w0.copy_(w0f.to(w0.dtype))
         k.copy_(kf.to(k.dtype))
-        if rw is not None:
-            rw.copy_(wf).sub_(w.float())
-            rw0.copy_(w0f).sub_(w0.float())
-            rk.copy_(kf).sub_(k.float())
+        if rw is not None or rw0 is not None or rk is not None:
+            if comp_row_indices is not None:
+                if rw is not None:
+                    rw.index_copy_(0, comp_row_indices, wf - w.float())
+                if rw0 is not None:
+                    rw0.index_copy_(0, comp_row_indices, w0f - w0.float())
+                if rk is not None:
+                    rk.index_copy_(0, comp_row_indices, kf - k.float())
+            else:
+                if rw is not None:
+                    rw.copy_(wf).sub_(w.float())
+                if rw0 is not None:
+                    rw0.copy_(w0f).sub_(w0.float())
+                if rk is not None:
+                    rk.copy_(kf).sub_(k.float())
         return
 
     buf_stretch, buf_gate = scratch.get_pair(rows, cols, w.device, w.dtype)
@@ -396,6 +433,7 @@ def batch_active_block_union_update(
     stiff_ceil: float,
     scratch: SpringScratchBuffer | None = None,
     compensator: MixedPrecisionCompensator | None = None,
+    comp_key: int | str | None = None,
 ) -> tuple[int, int]:
     """
     Active-Block Union Mini-Batch Kernel (Zero 5D Allocation):
@@ -412,6 +450,7 @@ def batch_active_block_union_update(
     n_tok = z_act.shape[0]
     n_blocks = max(1, d_act // block_size)
     scratch = scratch if scratch is not None else SpringScratchBuffer()
+    effective_comp_key = comp_key if comp_key is not None else id(layer)
 
     wins_per_block = block_mask.sum(dim=0)
     active_b_idx = torch.nonzero(wins_per_block > 0, as_tuple=False).squeeze(-1)
@@ -453,7 +492,7 @@ def batch_active_block_union_update(
             cubic_shield=False,
             scratch=scratch,
             compensator=compensator,
-            comp_key=id(layer),
+            comp_key=effective_comp_key,
         )
     else:
         # Sparse Active-Block Union path: compute matmul & spring updates ONLY on active rows
@@ -479,7 +518,10 @@ def batch_active_block_union_update(
             active_row_gate=None,
             cubic_shield=False,
             scratch=scratch,
-            compensator=None,
+            compensator=compensator,
+            comp_key=effective_comp_key,
+            comp_row_indices=active_rows,
+            comp_full_rows=d_act,
         )
         layer.w[:d_act, :d_eff].index_copy_(0, active_rows, w_sub)
         layer.w0[:d_act, :d_eff].index_copy_(0, active_rows, w0_sub)

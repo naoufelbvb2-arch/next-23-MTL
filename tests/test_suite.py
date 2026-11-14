@@ -25,6 +25,8 @@ from models import (
     DynamicSpringGenerativeNetwork,
     ContinuousSpringNetwork,
     ScaledSpringNetwork,
+    SSENNConfig,
+    SSENNProductionModel,
 )
 from train_eval import ARABIC_CORPUS, build_dataset, train_and_evaluate
 
@@ -397,6 +399,119 @@ class TestSpringMVPArchitecture(unittest.TestCase):
         self.assertGreaterEqual(bf16_kahan["cos_vs_fp32"], 0.90)
         self.assertGreater(bf16_kahan["cos_vs_fp32"], bf16_naive["cos_vs_fp32"] + 0.30)
         self.assertGreater(bf16_kahan["mean_delta_k"], 0.001)
+
+    def test_11_phase_3_2_manual_config_and_production_model(self):
+        """
+        Phase 3.2 Gate: Verify explicit manual SSENNConfig validation, zero-alloc
+        footprint estimation (Small -> 7B), unified SSENNProductionModel (Zero-[D,V]
+        DFA), O(1) parity, BF16 Kahan learning, sleep/alignment lifecycle, and 100%
+        bitwise mid-training checkpoint save/resume parity.
+        """
+        from benchmarks.bench_v3_production_model import run_v3_production_benchmark
+
+        # 1. Config validation error checks
+        with self.assertRaises(ValueError):
+            SSENNConfig(d_init=50, d_max=128, delta_d=16, block_size=16)
+        with self.assertRaises(ValueError):
+            SSENNConfig(d_init=64, d_max=128, delta_d=16, block_size=16, top_k_blocks=8)
+        with self.assertRaises(ValueError):
+            SSENNConfig(d_init=256, d_max=128, delta_d=16, block_size=16)
+        with self.assertRaises(ValueError):
+            SSENNConfig(dtype="int4")
+        with self.assertRaises(ValueError):
+            SSENNConfig(device="tpu_unknown")
+
+        cfg_fp32 = SSENNConfig(dtype="float32")
+        cfg_bf16 = SSENNConfig(dtype="bfloat16")
+        cfg_bf16_ak = SSENNConfig(dtype="bfloat16", kahan_mode="anchor_k")
+        cfg_bf16_off = SSENNConfig(dtype="bfloat16", kahan_mode="off")
+        self.assertFalse(cfg_fp32.uses_kahan_compensator)
+        self.assertEqual(cfg_fp32.effective_kahan_mode, "off")
+        self.assertTrue(cfg_bf16.uses_kahan_compensator)
+        self.assertEqual(cfg_bf16.effective_kahan_mode, "full")
+        self.assertTrue(cfg_bf16_ak.uses_kahan_compensator)
+        self.assertEqual(cfg_bf16_ak.effective_kahan_mode, "anchor_k")
+        self.assertFalse(cfg_bf16_off.uses_kahan_compensator)
+        self.assertAlmostEqual(
+            cfg_bf16_ak.estimate_memory_footprint()["kahan_savings_vs_full_pct"],
+            100.0 / 3.0,
+            places=2,
+        )
+
+        # 2. Pure forward side-effect check + sleep + reward alignment + dtype move + Zero-[D,V] DFA check
+        unit_cfg = SSENNConfig(
+            vocab_size=128, num_layers=3, d_init=32, d_max=64, delta_d=16,
+            block_size=16, top_k_blocks=1, max_seq_len=32, attn_top_k=4,
+            device="cpu", dtype="float32", seed=17,
+        )
+        m_unit = SSENNProductionModel(unit_cfg)
+        for name, buf in m_unit.named_buffers():
+            if buf is not None and buf.ndim == 2 and unit_cfg.vocab_size in buf.shape:
+                self.assertTrue(
+                    any(k in name for k in ("token_embedding", "head_w", "head_w0", "head_k")),
+                    f"Unexpected [D, V] buffer found: {name} {tuple(buf.shape)}",
+                )
+
+        x_seq = torch.randint(3, 120, (4, 12), dtype=torch.long)
+        _ = m_unit.train_minibatch(x_seq[:, :-1], x_seq[:, 1:], pad_id=0)
+        wins_before = m_unit.spring_layers[0].win_counts.clone()
+        _ = m_unit.forward(x_seq[:, :-1])
+        self.assertTrue(torch.equal(wins_before, m_unit.spring_layers[0].win_counts))
+
+        sleep_rec = m_unit.sleep_consolidate(phase_id=1)
+        self.assertGreater(sum(sleep_rec["locked_per_layer"]), 0)
+        align_rec = m_unit.align_with_reward_modulation(x_seq, prefix_lens=3, rewards=[1.0, -1.0, 1.0, -1.0], pad_id=0)
+        self.assertGreater(align_rec["valid_decisions"], 0)
+
+        m_unit.to_device_and_dtype("cpu", "bfloat16")
+        self.assertEqual(m_unit.token_embedding.dtype, torch.bfloat16)
+        self.assertEqual(m_unit.spring_layers[0].w.dtype, torch.bfloat16)
+        self.assertEqual(m_unit.token_salience.dtype, torch.float32)
+        self.assertEqual(m_unit.spring_layers[0].win_counts.dtype, torch.float32)
+
+        # 3. Full Phase 3.2 Benchmark Audit
+        res = run_v3_production_benchmark(epochs=16, batch_size=32, seq_len=36, verbose=False)
+        self.assertTrue(res["ast_zero_autograd"])
+        self.assertGreaterEqual(res["ast_verified_files"], 31)
+
+        t1 = res["table1"]
+        self.assertEqual(len(t1), 6)
+        params_seq = [r["footprint"]["max_train_params"] for r in t1]
+        self.assertEqual(params_seq, sorted(params_seq))
+        self.assertGreater(t1[-1]["footprint"]["max_train_params"], 5_000_000_000)
+        self.assertAlmostEqual(t1[-1]["footprint"]["kahan_savings_vs_full_pct"], 100.0 / 3.0, places=2)
+        for r in t1:
+            fp = r["footprint"]
+            self.assertGreaterEqual(fp["dfa_memory_savings_pct"], 75.0)
+            self.assertLess(fp["frozen_w0_mb"], fp["max_train_mb"])
+
+        t2 = res["table2"]
+        self.assertGreaterEqual(t2["frozen_train_acc"], 85.0)
+        self.assertGreaterEqual(t2["frozen_val_acc"], 92.5)
+        self.assertLess(t2["frozen_val_ppl"], 2.30)
+        self.assertGreaterEqual(t2["memory_saved_pct"], 45.0)
+        self.assertEqual(t2["reloaded_frozen_logit_diff"], 0.0)
+        self.assertEqual(t2["gen_parity_pct"], 100.0)
+        self.assertGreater(t2["gen_speedup"], 1.2)
+        self.assertGreaterEqual(t2["entity_consistency_pct"], 80.0)
+        self.assertEqual(t2["adjacent_dup_rate_pct"], 0.0)
+        self.assertEqual(t2["phrase_loop_rate_pct"], 0.0)
+        self.assertTrue(t2["bf16_finite"])
+        self.assertLess(t2["bf16_final_ce"], t2["bf16_ep1_ce"])
+        self.assertGreater(t2["bf16_kahan_mb"], 0.0)
+        self.assertGreater(t2["bf16_mean_k"], 0.0)
+        self.assertGreater(t2["bf16_ak_kahan_mb"], 0.0)
+        self.assertGreater(t2["bf16_ak_saved_pct"], 30.0)
+        self.assertEqual(t2["bf16_ak_res_w_count"], 0)
+        self.assertTrue(t2["bf16_ak_finite"])
+
+        t3 = res["table3"]
+        self.assertEqual(len(t3), 2)
+        for row in t3:
+            self.assertEqual(row["pre_freeze_weight_diff"], 0.0)
+            self.assertEqual(row["frozen_weight_diff"], 0.0)
+            self.assertEqual(row["logit_diff"], 0.0)
+            self.assertEqual(row["rollout_parity_pct"], 100.0)
 
 
 if __name__ == "__main__":
