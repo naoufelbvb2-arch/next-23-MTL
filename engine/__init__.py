@@ -5,6 +5,17 @@ from .sparse_attention import SparseCausalAttention
 from .dfa_router import DFARouter
 from .causal_context import CausalContext
 from .tokenizer import EnglishSubwordTokenizer
+from .kernels import (
+    TensorAllocationTracker,
+    SpringScratchBuffer,
+    MixedPrecisionCompensator,
+    fused_spring_update_inplace,
+    indexed_block_activate_highway,
+    indexed_block_matmul_slice,
+    batch_active_block_union_update,
+    FactorizedHighwayDFA,
+    SpringInferenceCache,
+)
 
 __all__ = [
     "SpringLayer",
@@ -13,4 +24,13 @@ __all__ = [
     "DFARouter",
     "CausalContext",
     "EnglishSubwordTokenizer",
+    "TensorAllocationTracker",
+    "SpringScratchBuffer",
+    "MixedPrecisionCompensator",
+    "fused_spring_update_inplace",
+    "indexed_block_activate_highway",
+    "indexed_block_matmul_slice",
+    "batch_active_block_union_update",
+    "FactorizedHighwayDFA",
+    "SpringInferenceCache",
 ]

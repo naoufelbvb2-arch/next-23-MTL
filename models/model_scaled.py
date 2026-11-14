@@ -50,6 +50,15 @@ from engine.sparse_attention import SparseCausalAttention
 from engine.dynamic_spring_layer import DynamicSpringLayer
 from engine.dfa_router import DFARouter
 from engine.spring_layer import SpringLayer
+from engine.kernels import (
+    SpringScratchBuffer,
+    MixedPrecisionCompensator,
+    fused_spring_update_inplace,
+    indexed_block_activate_highway,
+    batch_active_block_union_update,
+    FactorizedHighwayDFA,
+    SpringInferenceCache,
+)
 
 
 SCALE_PRESETS = {
@@ -202,6 +211,8 @@ class ScaledSpringNetwork(nn.Module):
         dfa_anchor_blend: float = 0.65,
         block_balance_strength: float = 0.68,
         use_role_bridge: bool | None = None,
+        use_fused_kernels: bool = False,
+        use_factorized_dfa: bool = False,
         seed: int = 42,
     ):
         super().__init__()
@@ -237,9 +248,14 @@ class ScaledSpringNetwork(nn.Module):
             if use_role_bridge is None
             else use_role_bridge
         )
+        self.use_fused_kernels = bool(use_fused_kernels)
+        self.use_factorized_dfa = bool(use_factorized_dfa)
+        self._kernel_scratch = SpringScratchBuffer()
+        self._mp_compensator = MixedPrecisionCompensator()
         self.frozen = False
         self.current_epoch = 1
         self._fast_d_eff: int | None = None
+        self._in_fast_generate: bool = False
 
         if self.enable_block_sparse:
             # Align dimensions strictly to integer multiples of capsule block_size
@@ -426,13 +442,25 @@ class ScaledSpringNetwork(nn.Module):
         self._last_ent_logits: torch.Tensor | None = None
         self._last_ent_slots: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
-        # 3. Law 4: Adaptive Hebbian Feedback Router B^(l) in R^{D_max x V}
-        self.dfa_router = DFARouter(
-            num_layers=self.num_layers,
-            d_model=self.d_max,
-            vocab_size=self.vocab_size,
-            seed=seed + 500,
-        )
+        # 3. Law 4 / Phase 3.1: Adaptive Hebbian Feedback Router OR Factorized Highway DFA
+        if self.use_factorized_dfa:
+            self.dfa_router = None
+            self.factorized_dfa = FactorizedHighwayDFA(
+                num_layers=self.num_layers,
+                d_max=self.d_max,
+                vocab_size=self.vocab_size,
+                eta_b=eta_b,
+                dfa_anchor_blend=self.dfa_anchor_blend,
+                seed=seed + 500,
+            )
+        else:
+            self.factorized_dfa = None
+            self.dfa_router = DFARouter(
+                num_layers=self.num_layers,
+                d_model=self.d_max,
+                vocab_size=self.vocab_size,
+                seed=seed + 500,
+            )
 
         # Output Linear Spring Head (D_max -> V)
         self.output_head = SpringLayer(
@@ -658,6 +686,14 @@ class ScaledSpringNetwork(nn.Module):
         return self.spring_layers[-1].d_active
 
     @torch.no_grad()
+    def enable_fused_kernels(self, enabled: bool = True) -> None:
+        """Toggles Phase 3.1 Fused In-Place Spring Kernels & Active-Block Execution."""
+        self.use_fused_kernels = bool(enabled)
+        if not self.use_fused_kernels:
+            self._kernel_scratch = SpringScratchBuffer()
+            self._mp_compensator = MixedPrecisionCompensator()
+
+    @torch.no_grad()
     def _sync_highway_anchored_dfa(self, init_only: bool = False) -> None:
         """
         Law 3 (Milestone 2.4): Highway-Anchored Deep Hebbian DFA.
@@ -665,7 +701,7 @@ class ScaledSpringNetwork(nn.Module):
         along active residual highway coordinates while blending layer-specific
         Hebbian specialization (1 - blend) and preserving row L2 normalization.
         """
-        if not self.use_highway_anchored_dfa or self.frozen:
+        if not self.use_highway_anchored_dfa or self.frozen or self.dfa_router is None:
             return
         target_norm = math.sqrt(self.vocab_size / float(self.d_max))
         d_eff = self._effective_context_dim()
@@ -717,7 +753,21 @@ class ScaledSpringNetwork(nn.Module):
         hidden_curr_active = sum(3 * (d * d_eff) for d in d_acts)
         hidden_frozen_w0 = sum(d * d_eff for d in d_acts)
 
-        dfa_params = self.num_layers * (d_max * v)
+        dfa_params = (
+            self.factorized_dfa.parameter_count()
+            if self.factorized_dfa is not None
+            else self.num_layers * (d_max * v)
+        )
+        dfa_init_active = (
+            self.num_layers * (d_init * d_init)
+            if self.factorized_dfa is not None
+            else self.num_layers * d_init * v
+        )
+        dfa_curr_active = (
+            sum(d * d_last for d in d_acts)
+            if self.factorized_dfa is not None
+            else sum(d * v for d in d_acts)
+        )
 
         head_max_train = 3 * (v * d_max)
         head_init_active = 3 * (v * d_init)
@@ -731,10 +781,10 @@ class ScaledSpringNetwork(nn.Module):
             emb_train_params + attn_train_params + hidden_max_train + dfa_params + head_max_train + role_train
         )
         total_init_active_params = (
-            emb_train_params + attn_train_params + hidden_init_active + (self.num_layers * d_init * v) + head_init_active + role_train
+            emb_train_params + attn_train_params + hidden_init_active + dfa_init_active + head_init_active + role_train
         )
         total_curr_active_params = (
-            emb_train_params + attn_train_params + hidden_curr_active + sum(d * v for d in d_acts) + head_curr_active + role_train
+            emb_train_params + attn_train_params + hidden_curr_active + dfa_curr_active + head_curr_active + role_train
         )
         total_frozen_prod_params = emb_frozen_params + attn_frozen_params + hidden_frozen_w0 + head_frozen_w0 + role_w0
 
@@ -1034,6 +1084,54 @@ class ScaledSpringNetwork(nn.Module):
         else:
             rank_score = block_energy
 
+        if (
+            self.use_fused_kernels
+            and self.frozen
+            and k_blk < n_blocks
+        ):
+            _, top_b_idx = torch.topk(rank_score, k=k_blk, dim=-1)
+            in_fast_gen = getattr(self, "_in_fast_generate", False)
+            if self._frozen_block_wins is not None and not in_fast_gen:
+                self._frozen_block_wins[l_idx][:n_blocks].scatter_add_(
+                    0,
+                    top_b_idx.reshape(-1),
+                    torch.ones(n_tok * k_blk, device=z_act.device, dtype=torch.float32),
+                )
+            res_scale = (self.alpha_res / math.sqrt(float(self.num_layers))) if self.use_depth_scaled_highway else 1.0
+            raw_out = indexed_block_activate_highway(
+                z_act=z_act,
+                a_prev_eff=a_prev_eff,
+                top_b_idx=top_b_idx,
+                block_size=b_size,
+                neg_slope=float(layer.negative_slope),
+                res_scale=res_scale,
+                use_highway=self.use_depth_scaled_highway,
+            )
+            need_stats = (not self._is_training_step) and (not in_fast_gen)
+            if self.use_depth_scaled_highway:
+                if d_sub == in_dim:
+                    out, raw_rms, normed_rms = self._apply_subspace_rmsnorm(
+                        raw_out, target_rms=1.20, return_stats=need_stats
+                    )
+                else:
+                    out_sub, raw_rms, normed_rms = self._apply_subspace_rmsnorm(
+                        raw_out[:, :d_sub], target_rms=1.20, return_stats=need_stats
+                    )
+                    out = raw_out
+                    out[:, :d_sub] = out_sub
+            else:
+                out = raw_out
+                raw_rms = (
+                    0.0
+                    if (self._is_training_step or in_fast_gen)
+                    else float(torch.sqrt(out[:, :d_sub].pow(2).mean(dim=-1, keepdim=True) + 1e-6).mean().item())
+                )
+                normed_rms = raw_rms
+
+            self._last_layer_raw_rms[l_idx] = raw_rms
+            self._last_layer_normed_rms[l_idx] = normed_rms
+            return out
+
         if k_blk < n_blocks:
             _, top_b_idx = torch.topk(rank_score, k=k_blk, dim=-1)  # [N, k_blk]
             idx_exp = top_b_idx.unsqueeze(-1).expand(-1, -1, b_size)
@@ -1126,6 +1224,29 @@ class ScaledSpringNetwork(nn.Module):
         Active-Slice Winner-Normalized Local Spring Update for Contiguous Block-Sparse Capsules.
         Updates strictly [:d_act, :d_eff] without touching dormant rows or columns.
         """
+        if self.use_fused_kernels:
+            d_act = layer.d_active
+            n_blocks = max(1, d_act // self.block_size)
+            if self.enable_hierarchical_compositional:
+                k_blk = min(self.hierarchical_top_k_blocks[l_idx], n_blocks)
+            else:
+                k_blk = max(1, min(n_blocks, int(round(self.top_k / float(self.block_size)))))
+            stiff_mult = self.layer_stiff_multipliers[l_idx] if self.enable_hierarchical_compositional else 1.0
+            stiff_ceil = self.layer_stiff_ceilings[l_idx] if self.enable_hierarchical_compositional else 0.85
+            batch_active_block_union_update(
+                layer=layer,
+                projected_error=projected_error,
+                n_valid=n_valid,
+                maturity_stiff_gain=maturity_stiff_gain,
+                block_size=self.block_size,
+                k_blk=k_blk,
+                stiff_mult=stiff_mult,
+                stiff_ceil=stiff_ceil,
+                scratch=self._kernel_scratch,
+                compensator=self._mp_compensator,
+            )
+            return
+
         d_act = layer.d_active
         a_prev_eff = layer._last_a_prev      # [N, d_eff]
         d_eff = a_prev_eff.shape[1]
@@ -1535,31 +1656,52 @@ class ScaledSpringNetwork(nn.Module):
             0, valid_targets, torch.ones_like(valid_targets, dtype=torch.float32)
         )
 
-        if self.continual_mode and self.use_cubic_shield:
-            inactive_vocab = ~self.phase_active_vocab_mask
-            train_logits = logits_flat.clone()
-            train_logits[:, inactive_vocab] = -1e4
-            probs = F.softmax(train_logits, dim=-1)
-        else:
+        if self.use_fused_kernels and not (self.continual_mode and self.use_cubic_shield):
             probs = F.softmax(logits_flat, dim=-1)
-        y_onehot = F.one_hot(targets_flat, num_classes=self.vocab_size).float()
+            valid_rows = targets_flat != pad_id
+            tgt_probs = probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
+            ce_loss = float((-torch.log(tgt_probs[valid_rows].clamp(min=1e-30))).mean().item())
+            preds_flat = probs.argmax(dim=-1)
+            correct = int(((preds_flat == targets_flat) & valid_rows).sum().item())
 
-        # Law 1: Weight error signal by target & input token salience s(v) in [0.70, 1.80]
-        target_sal = self.token_salience[targets_flat]
-        input_sal = self.token_salience[inputs_flat]
-        step_salience = (0.65 * target_sal + 0.35 * input_sal).clamp(0.70, 1.80)
+            target_sal = self.token_salience[targets_flat]
+            input_sal = self.token_salience[inputs_flat]
+            step_salience = (0.65 * target_sal + 0.35 * input_sal).clamp(0.70, 1.80)
 
-        raw_err = (y_onehot - probs) * valid_mask.unsqueeze(-1)
-        if self.continual_mode and self.use_cubic_shield:
-            raw_err[:, ~self.phase_active_vocab_mask] = 0.0
-        salient_err = raw_err * step_salience.unsqueeze(-1)
-        salient_err_hidden = salient_err
+            probs.neg_()
+            probs.scatter_add_(1, targets_flat.unsqueeze(1), valid_mask.unsqueeze(1))
+            if n_valid < float(n_total):
+                probs.mul_(valid_mask.unsqueeze(-1))
+            mse_loss = float((probs.norm().pow(2) * 0.5).item() / n_valid)
+            probs.mul_(step_salience.unsqueeze(-1))
+            salient_err_hidden = probs
+            e_scaled = None  # Scaled in-place right after hidden DFA updates
+        else:
+            if self.continual_mode and self.use_cubic_shield:
+                inactive_vocab = ~self.phase_active_vocab_mask
+                train_logits = logits_flat.clone()
+                train_logits[:, inactive_vocab] = -1e4
+                probs = F.softmax(train_logits, dim=-1)
+            else:
+                probs = F.softmax(logits_flat, dim=-1)
+            y_onehot = F.one_hot(targets_flat, num_classes=self.vocab_size).float()
 
-        # Metrics on valid tokens (evaluated on full unmasked logits)
-        ce_loss = float(F.cross_entropy(logits_flat, targets_flat, ignore_index=pad_id).item())
-        mse_loss = float((0.5 * (raw_err ** 2).sum()).item() / n_valid)
-        preds_flat = logits_flat.argmax(dim=-1)
-        correct = int(((preds_flat == targets_flat) & (targets_flat != pad_id)).sum().item())
+            # Law 1: Weight error signal by target & input token salience s(v) in [0.70, 1.80]
+            target_sal = self.token_salience[targets_flat]
+            input_sal = self.token_salience[inputs_flat]
+            step_salience = (0.65 * target_sal + 0.35 * input_sal).clamp(0.70, 1.80)
+
+            raw_err = (y_onehot - probs) * valid_mask.unsqueeze(-1)
+            if self.continual_mode and self.use_cubic_shield:
+                raw_err[:, ~self.phase_active_vocab_mask] = 0.0
+            salient_err = raw_err * step_salience.unsqueeze(-1)
+            salient_err_hidden = salient_err
+
+            # Metrics on valid tokens (evaluated on full unmasked logits)
+            ce_loss = float(F.cross_entropy(logits_flat, targets_flat, ignore_index=pad_id).item())
+            mse_loss = float((0.5 * (raw_err ** 2).sum()).item() / n_valid)
+            preds_flat = logits_flat.argmax(dim=-1)
+            correct = int(((preds_flat == targets_flat) & (targets_flat != pad_id)).sum().item())
 
         # Law 3: Maturity-Gated Stiffening schedule (gentle warmup in Epochs 1-2, then ramps up)
         if self.current_epoch <= 2:
@@ -1567,11 +1709,13 @@ class ScaledSpringNetwork(nn.Module):
         else:
             maturity_gain = min(280.0, 32.0 * float(self.current_epoch - 1))
 
-        # 2. Update Dual-Horizon Attention locally (shielded once armor-locked after Phase 1)
         scale_factor = float(n_total) / max(n_valid, 1.0)
-        e_scaled = salient_err * scale_factor
-        if not (self.use_cubic_shield and self.attn_armor_locked):
-            self.sparse_attention.local_spring_update(e_scaled)
+        use_inplace_err = self.use_fused_kernels and not (self.continual_mode and self.use_cubic_shield)
+        if not use_inplace_err:
+            e_scaled = salient_err * scale_factor
+            # 2. Update Dual-Horizon Attention locally (shielded once armor-locked after Phase 1)
+            if not (self.use_cubic_shield and self.attn_armor_locked):
+                self.sparse_attention.local_spring_update(e_scaled)
 
         # 3. Law 3 & Law 4: Update Hidden DynamicSpringLayers + Adaptive/Anchored Hebbian Feedback B^(l)
         use_block_path = self.enable_block_sparse and (not self.continual_mode)
@@ -1581,7 +1725,12 @@ class ScaledSpringNetwork(nn.Module):
             else 1.0
         )
         anchor_unit_full = None
-        if self.use_highway_anchored_dfa:
+        e_highway = None
+        d_last = self._final_layer_dim()
+        if self.factorized_dfa is not None:
+            head_w_active = self.output_head.w[:, :d_last]
+            e_highway = self.factorized_dfa.project_vocab_to_highway(salient_err_hidden, head_w_active)
+        elif self.use_highway_anchored_dfa:
             max_act_d = max(l.d_active for l in self.spring_layers)
             anchor_unit_full = F.normalize(
                 self.output_head.w[:, :max_act_d].t(),
@@ -1593,12 +1742,20 @@ class ScaledSpringNetwork(nn.Module):
 
         for l_idx, layer in enumerate(self.spring_layers):
             d_act = layer.d_active
-            B_l = self.dfa_router.get_matrix(l_idx)  # [D_max, V]
-            B_l_active = B_l[:d_act, :]              # [d_active, V]
+            if self.factorized_dfa is not None:
+                delta_l_active = self.factorized_dfa.broadcast_layer_error(
+                    layer_idx=l_idx,
+                    e_highway=e_highway,
+                    d_act=d_act,
+                    depth_scale=depth_dfa_scale,
+                )
+            else:
+                B_l = self.dfa_router.get_matrix(l_idx)  # [D_max, V]
+                B_l_active = B_l[:d_act, :]              # [d_active, V]
 
-            delta_l_active = F.linear(salient_err_hidden, B_l_active)  # [N, d_active]
-            if depth_dfa_scale != 1.0:
-                delta_l_active = delta_l_active * depth_dfa_scale
+                delta_l_active = F.linear(salient_err_hidden, B_l_active)  # [N, d_active]
+                if depth_dfa_scale != 1.0:
+                    delta_l_active = delta_l_active * depth_dfa_scale
 
             if use_block_path:
                 self._update_block_sparse_layer(
@@ -1632,8 +1789,18 @@ class ScaledSpringNetwork(nn.Module):
                     self.layer_w0_bedrock[l_idx][:d_act][locked_idx, : self._effective_context_dim()]
                 )
 
-            # Law 4 / Law 3 (v2.4): Row-Normalized Hebbian + Highway-Anchored Feedback Alignment on B^(l)
-            if self.use_highway_anchored_dfa and anchor_unit_full is not None and layer._last_a is not None:
+            # Law 4 / Law 3 (v2.4 / v3.1): Row-Normalized Hebbian + Highway-Anchored or Factorized DFA
+            if self.factorized_dfa is not None and layer._last_a is not None:
+                a_act = layer._last_a[:, :d_act]
+                unlocked_row_gate = (~self.armor_locked_masks[l_idx][:d_act]).float().unsqueeze(1)
+                self.factorized_dfa.adapt_layer(
+                    layer_idx=l_idx,
+                    a_act=a_act,
+                    e_highway=e_highway,
+                    n_valid=n_valid,
+                    unlocked_row_gate=unlocked_row_gate,
+                )
+            elif self.use_highway_anchored_dfa and anchor_unit_full is not None and layer._last_a is not None:
                 a_act = layer._last_a[:, :d_act]
                 hebb_corr = torch.matmul(a_act.t(), salient_err_hidden) / max(n_valid, 1.0)
                 unlocked_row_gate = (~self.armor_locked_masks[l_idx][:d_act]).float().unsqueeze(1)
@@ -1657,19 +1824,45 @@ class ScaledSpringNetwork(nn.Module):
                 B_updated = B_l_active + (self.eta_b * unlocked_row_gate) * hebb_corr
                 B_l[:d_act, :].copy_(F.normalize(B_updated, p=2, dim=-1) * target_row_norm)
 
+        if use_inplace_err:
+            if scale_factor != 1.0:
+                probs.mul_(scale_factor)
+            e_scaled = probs
+            if not (self.use_cubic_shield and self.attn_armor_locked):
+                self.sparse_attention.local_spring_update(e_scaled)
+
         # 4. Update Output Head locally (Active-Slice execution or Cubic Anchor Shielded)
         d_last = self._final_layer_dim()
         if use_block_path:
             a_head = self.output_head._last_a_prev
-            driving_head = torch.matmul(e_scaled.t(), a_head) / float(max(n_total, 1))
-            w_h = self.output_head.w[:, :d_last]
-            w0_h = self.output_head.w0[:, :d_last]
-            k_h = self.output_head.k[:, :d_last]
-            stretch_h = w_h - w0_h
-            w_h.add_((self.output_head.eta_w * driving_head) - (self.output_head.gamma * k_h * stretch_h))
-            stretch_h_new = w_h - w0_h
-            w0_h.add_(self.output_head.eta_0 * (1.0 - k_h) * stretch_h_new)
-            k_h.add_(self.output_head.beta_k * stretch_h_new.abs() * (1.0 - k_h)).clamp_(0.0, 1.0)
+            if self.use_fused_kernels:
+                driving_head = torch.matmul(e_scaled.t(), a_head).div_(float(max(n_total, 1)))
+                fused_spring_update_inplace(
+                    w=self.output_head.w[:, :d_last],
+                    w0=self.output_head.w0[:, :d_last],
+                    k=self.output_head.k[:, :d_last],
+                    driving_signal=driving_head,
+                    eta_w=self.output_head.eta_w,
+                    eta_0=self.output_head.eta_0,
+                    gamma=self.output_head.gamma,
+                    beta_k_eff=self.output_head.beta_k,
+                    stiff_ceil=1.0,
+                    active_row_gate=None,
+                    cubic_shield=False,
+                    scratch=self._kernel_scratch,
+                    compensator=self._mp_compensator,
+                    comp_key=id(self.output_head),
+                )
+            else:
+                driving_head = torch.matmul(e_scaled.t(), a_head) / float(max(n_total, 1))
+                w_h = self.output_head.w[:, :d_last]
+                w0_h = self.output_head.w0[:, :d_last]
+                k_h = self.output_head.k[:, :d_last]
+                stretch_h = w_h - w0_h
+                w_h.add_((self.output_head.eta_w * driving_head) - (self.output_head.gamma * k_h * stretch_h))
+                stretch_h_new = w_h - w0_h
+                w0_h.add_(self.output_head.eta_0 * (1.0 - k_h) * stretch_h_new)
+                k_h.add_(self.output_head.beta_k * stretch_h_new.abs() * (1.0 - k_h)).clamp_(0.0, 1.0)
         elif self.continual_mode and self.use_cubic_shield:
             if self.output_head._last_a_prev is not None and d_last < self.d_max:
                 self.output_head._last_a_prev[:, d_last:] = 0.0
@@ -1726,10 +1919,12 @@ class ScaledSpringNetwork(nn.Module):
             n_ent = float(ent_step_mask.sum().item())
             if n_ent > 0 and self._last_ent_logits is not None:
                 ent_probs = F.softmax(self._last_ent_logits, dim=-1)
-                ent_err = (y_onehot - ent_probs) * ent_step_mask.float().unsqueeze(-1)
-                ent_err = ent_err * (float(n_total) / max(n_ent, 1.0))
+                ent_mask_f = ent_step_mask.float().unsqueeze(-1)
+                ent_probs.neg_()
+                ent_probs.scatter_add_(1, targets_flat.unsqueeze(1), ent_mask_f)
+                ent_probs.mul_(ent_mask_f * (float(n_total) / max(n_ent, 1.0)))
                 emb_unit = F.normalize(self.sparse_attention.token_embedding, p=2, dim=-1, eps=1e-6)
-                proj_err = torch.matmul(ent_err, emb_unit) * ent_step_mask.float().unsqueeze(-1)
+                proj_err = torch.matmul(ent_probs, emb_unit) * ent_mask_f
                 self.entity_proj.local_spring_update(proj_err)
 
         return {
@@ -2360,6 +2555,13 @@ class ScaledSpringNetwork(nn.Module):
         k_hid_pref_before: list[float] = []
         k_hid_pref_after: list[float] = []
 
+        e_hwy_neg = e_hwy_tot = e_hwy_pos = None
+        if self.factorized_dfa is not None:
+            head_w_act_hwy = self.output_head.w[:, : self._final_layer_dim()]
+            e_hwy_neg = self.factorized_dfa.project_vocab_to_highway(err_neg, head_w_act_hwy) if has_neg else None
+            e_hwy_tot = self.factorized_dfa.project_vocab_to_highway(err_total, head_w_act_hwy)
+            e_hwy_pos = self.factorized_dfa.project_vocab_to_highway(err_pos, head_w_act_hwy) if has_pos else None
+
         for l_idx, layer in enumerate(self.spring_layers):
             d_act = layer.d_active
             a_prev = layer._last_a_prev
@@ -2382,7 +2584,7 @@ class ScaledSpringNetwork(nn.Module):
 
             g_prime = layer._activate_derivative(z_act)
             active_cell = g_prime * cell_mask  # [N, d_act]
-            B_l_act = self.dfa_router.get_matrix(l_idx)[:d_act, :]
+            B_l_act = None if self.factorized_dfa is not None else self.dfa_router.get_matrix(l_idx)[:d_act, :]
 
             wins_per_cell = cell_mask.sum(dim=0).clamp(min=1.0).unsqueeze(1)
             avg_dec_per_seq = float(n_dec) / float(max(bsz, 1))
@@ -2395,7 +2597,12 @@ class ScaledSpringNetwork(nn.Module):
             # 1. Negative Pass (R < 0): Selective Stiffness Melting on rejected synapses
             elig_neg_l = None
             if has_neg:
-                proj_neg = F.linear(err_neg, B_l_act) * depth_dfa_scale
+                if self.factorized_dfa is not None:
+                    proj_neg = self.factorized_dfa.broadcast_layer_error(
+                        l_idx, e_hwy_neg, d_act, depth_dfa_scale
+                    )
+                else:
+                    proj_neg = F.linear(err_neg, B_l_act) * depth_dfa_scale
                 delta_neg = proj_neg * active_cell
                 elig_neg_l = torch.matmul(delta_neg.t(), a_prev) / denom
                 norm_e_neg = self._normalize_active_eligibility(elig_neg_l)
@@ -2410,7 +2617,12 @@ class ScaledSpringNetwork(nn.Module):
             # 2. Combined Elastic Push & Anchor Deposition into W_0 (shielded by surviving k)
             # Normalize by mean squared activation norm so step scale is invariant to d_act / d_last.
             mean_a2_hid = max(float(a_prev.pow(2).sum(dim=-1).mean().item()), 1.0)
-            proj_tot = F.linear(err_total, B_l_act) * depth_dfa_scale
+            if self.factorized_dfa is not None:
+                proj_tot = self.factorized_dfa.broadcast_layer_error(
+                    l_idx, e_hwy_tot, d_act, depth_dfa_scale
+                )
+            else:
+                proj_tot = F.linear(err_total, B_l_act) * depth_dfa_scale
             delta_tot = proj_tot * active_cell
             elig_tot_l = torch.matmul(delta_tot.t(), a_prev) / denom
             plastic_gate_hid = (1.0 - k_act).clamp(min=0.05).pow(2.5)
@@ -2422,7 +2634,12 @@ class ScaledSpringNetwork(nn.Module):
 
             # 3. Positive Pass (R > 0): Reward Locking on aligned synapses
             if has_pos:
-                proj_pos = F.linear(err_pos, B_l_act) * depth_dfa_scale
+                if self.factorized_dfa is not None:
+                    proj_pos = self.factorized_dfa.broadcast_layer_error(
+                        l_idx, e_hwy_pos, d_act, depth_dfa_scale
+                    )
+                else:
+                    proj_pos = F.linear(err_pos, B_l_act) * depth_dfa_scale
                 delta_pos = proj_pos * active_cell
                 elig_pos_l = torch.matmul(delta_pos.t(), a_prev) / denom
                 norm_e_pos = self._normalize_active_eligibility(elig_pos_l)
@@ -2742,8 +2959,11 @@ class ScaledSpringNetwork(nn.Module):
 
             layer_prune_stats.append(stats)
 
-        for l_idx in range(self.num_layers):
-            setattr(self.dfa_router, f"B_{l_idx}", None)
+        if self.factorized_dfa is not None:
+            self.factorized_dfa.freeze()
+        elif self.dfa_router is not None:
+            for l_idx in range(self.num_layers):
+                setattr(self.dfa_router, f"B_{l_idx}", None)
 
         if prune_dormant and self.enable_block_sparse and (not self.continual_mode):
             self._fast_d_eff = d_eff
@@ -2775,70 +2995,354 @@ class ScaledSpringNetwork(nn.Module):
         }
 
     @torch.no_grad()
+    def init_inference_cache(self, batch_size: int = 1) -> SpringInferenceCache:
+        """
+        Allocates a constant-time O(1) Stateful Inference Cache holding rolling K/V/Salience
+        attention state, Salience-Gated EMA Capacitor, Exponential ALiBi accumulator,
+        lag-1/2 embeddings, Role-Bridge Entity Slots, and O(1) N-gram Refractory Gate tables.
+        """
+        use_active_slice = (
+            self.enable_block_sparse or (self._fast_d_eff is not None)
+        ) and (not self.continual_mode)
+        context_dim = self._effective_context_dim() if use_active_slice else self.d_max
+        cache = SpringInferenceCache(
+            batch_size=batch_size,
+            max_seq_len=self.max_seq_len,
+            d_max=self.d_max,
+            context_dim=context_dim,
+            device=self.sparse_attention.token_embedding.device,
+            dtype=self.sparse_attention.token_embedding.dtype,
+        )
+        if self.frozen and self.enable_hierarchical_compositional and self.use_role_bridge:
+            cache._emb_unit = F.normalize(
+                self.sparse_attention.token_embedding, p=2, dim=-1, eps=1e-6
+            )
+        else:
+            cache._emb_unit = None
+        return cache
+
+    @torch.no_grad()
+    def forward_step_cached(
+        self,
+        token_id: int,
+        cache: SpringInferenceCache,
+        compute_logits: bool = True,
+    ) -> torch.Tensor | None:
+        """
+        Executes a single causal token step using `SpringInferenceCache` in O(1) state updates
+        with mathematical parity to full-prefix recomputation (`self.forward(window)`).
+        When `compute_logits=False` (prompt prefix warmup), skips Q projection, softmax,
+        hidden layers, and output head while faithfully advancing all causal states.
+        """
+        t = cache.step
+        if t >= self.max_seq_len:
+            raise IndexError(
+                f"SpringInferenceCache step {t} exceeds max_seq_len {self.max_seq_len}."
+            )
+
+        tok_emb = self.sparse_attention.token_embedding[token_id].unsqueeze(0)  # [1, D_max]
+        pos_t = self.sparse_attention.pos_embedding[t].unsqueeze(0)              # [1, D_max]
+        x_t = tok_emb + pos_t                                                    # [1, D_max]
+
+        cache.k_cache[:, t, :].copy_(self.sparse_attention.k_proj(x_t))
+        cache.v_cache[:, t, :].copy_(self.sparse_attention.v_proj(x_t))
+        sal_val = self.sparse_attention.token_salience[token_id]
+        cache.sal_cache[:, t].fill_(sal_val)
+
+        # Salience-gated EMA Capacitor update
+        alpha_t = float(self.capacitor_alpha[token_id].item())
+        cache.c_state.mul_(1.0 - alpha_t).add_(tok_emb, alpha=alpha_t)
+
+        # Exponential O(1) ALiBi accumulator (matches _build_vectorized_context bit-for-bit)
+        use_sliding = self.enable_hierarchical_compositional and self.use_role_bridge and (not self.continual_mode)
+        use_active_slice = (self.enable_block_sparse or (self._fast_d_eff is not None)) and (not self.continual_mode)
+        d_eff = self._effective_context_dim()
+        out_dim = d_eff if use_active_slice else self.d_max
+
+        x_pos_t = tok_emb[:, :out_dim] + self.alibi_pos_encoding[t, :out_dim].unsqueeze(0)
+        alibi_ctx = None
+        if use_sliding:
+            cache.alibi_u.mul_(0.60).add_(x_pos_t)
+            cache.alibi_denom_base = cache.alibi_denom_base * 0.60 + 1.0
+            if compute_logits:
+                alibi_ctx = cache.alibi_u / max(cache.alibi_denom_base, 1e-6)
+        else:
+            cache.alibi_u.mul_(0.68).add_(x_pos_t)
+            cache.alibi_denom_base = cache.alibi_denom_base * 0.68 + 1.0
+            if t == 0:
+                cache.x_pos_0.copy_(x_pos_t)
+            elif t == 1:
+                cache.x_pos_1.copy_(x_pos_t)
+            if compute_logits:
+                if t == 0:
+                    alibi_num = cache.alibi_u + 0.30 * cache.x_pos_0
+                    denom = cache.alibi_denom_base + 0.30
+                else:
+                    alibi_num = cache.alibi_u + 0.30 * cache.x_pos_0 + 0.20 * cache.x_pos_1
+                    denom = cache.alibi_denom_base + 0.50
+                alibi_ctx = alibi_num / max(denom, 1e-6)
+
+        # Causal Role-Bridge Entity Slot tracking (updates even during compute_logits=False prefill)
+        ent_logits_t = None
+        ent_gate_t = False
+        tok_unit = None
+        use_role = self.enable_hierarchical_compositional and self.use_role_bridge and (not self.continual_mode)
+        if use_role:
+            tok_unit = F.normalize(tok_emb, p=2, dim=-1, eps=1e-6)
+            ent_t = bool(self.is_entity_vocab[token_id].item())
+            cur_l = int(cache.cur_len[0].item())
+            if not ent_t:
+                if cur_l > 0:
+                    valid_commit = (cur_l >= 2) if self.has_multiword_entities else True
+                    if valid_commit:
+                        cache.comp_start_emb.copy_(cache.cur_start_emb)
+                        cache.comp_end_emb.copy_(cache.cur_end_emb)
+                        cache.comp_start_id.copy_(cache.cur_start_id)
+                        cache.comp_end_id.copy_(cache.cur_end_id)
+                        cache.comp_ready.fill_(True)
+                cache.cur_len.zero_()
+            else:
+                if cur_l == 0:
+                    cache.cur_start_emb.copy_(tok_emb)
+                    cache.cur_end_emb.copy_(tok_emb)
+                    cache.cur_start_id.fill_(token_id)
+                    cache.cur_end_id.fill_(token_id)
+                else:
+                    cache.cur_end_emb.copy_(tok_emb)
+                    cache.cur_end_id.fill_(token_id)
+                cache.cur_len.add_(1)
+
+            if compute_logits:
+                bias_col = torch.ones(1, 1, device=tok_emb.device, dtype=tok_emb.dtype)
+                win_feat = torch.cat(
+                    [cache.lag3_unit, cache.lag2_unit, cache.lag1_unit, tok_unit, bias_col],
+                    dim=-1,
+                )
+                role_logits = self.role_bridge_head(win_feat)
+                role_probs = F.softmax(role_logits, dim=-1)
+                p_ent_start = role_probs[:, 1]
+                p_ent_end = role_probs[:, 2]
+                p_ent_sum = p_ent_start + p_ent_end
+                has_comp_flag = bool(cache.comp_ready[0].item())
+                if has_comp_flag and float(p_ent_sum[0].item()) > 0.60:
+                    ent_gate_t = True
+                    ent_mix = (
+                        p_ent_start.unsqueeze(-1) * cache.comp_start_emb
+                        + p_ent_end.unsqueeze(-1) * cache.comp_end_emb
+                    ) / p_ent_sum.clamp(min=1e-6).unsqueeze(-1)
+                    ent_vec = F.normalize(self.entity_proj(ent_mix), p=2, dim=-1, eps=1e-6)
+                    emb_unit = (
+                        cache._emb_unit
+                        if getattr(cache, "_emb_unit", None) is not None
+                        else F.normalize(self.sparse_attention.token_embedding, p=2, dim=-1, eps=1e-6)
+                    )
+                    ent_logits_t = 22.0 * F.linear(ent_vec, emb_unit)[0]
+
+        logits_out = None
+        if compute_logits:
+            k_len = t + 1
+            q_t = self.sparse_attention.q_proj(x_t)  # [1, D_max]
+            k_prefix = cache.k_cache[:, :k_len, :]
+            v_prefix = cache.v_cache[:, :k_len, :]
+            sal_prefix = cache.sal_cache[:, :k_len]
+
+            scale = 1.0 / math.sqrt(self.d_max)
+            scores = torch.bmm(q_t.unsqueeze(1), k_prefix.transpose(1, 2)).squeeze(1) * scale
+            scores = scores + 1.35 * (sal_prefix - 1.0)
+
+            attn_top_k = self.sparse_attention.attn_top_k
+            if attn_top_k is not None and attn_top_k < k_len:
+                salient_rank = 4.0 * sal_prefix + 0.15 * scores
+                k_anchor = min(2, k_len)
+                k_local = min(max(1, attn_top_k - k_anchor), k_len)
+                sparse_scores = torch.full_like(scores, float("-inf"))
+                _, anchor_idx = torch.topk(salient_rank, k=k_anchor, dim=-1)
+                sparse_scores.scatter_(-1, anchor_idx, scores.gather(-1, anchor_idx))
+                _, local_idx = torch.topk(scores, k=k_local, dim=-1)
+                sparse_scores.scatter_(-1, local_idx, scores.gather(-1, local_idx))
+                scores = sparse_scores
+
+            attn_weights = F.softmax(scores, dim=-1)
+            attended = torch.bmm(attn_weights.unsqueeze(1), v_prefix).squeeze(1) + x_t
+
+            cap_gain = 0.45 if use_sliding else 1.65
+            attn_slice = attended[:, :out_dim] if attended.shape[1] > out_dim else attended
+            cap_ctx = F.linear(cache.c_state, self.cap_proj[:out_dim, :])
+            ctx_t = attn_slice + alibi_ctx + cap_gain * cap_ctx
+            if t >= 1:
+                ctx_t = ctx_t + F.linear(cache.prev_emb_1, self.lag1_proj[:out_dim, :])
+            if t >= 2:
+                ctx_t = ctx_t + F.linear(cache.prev_emb_2, self.lag2_proj[:out_dim, :])
+
+            use_block_path = self.enable_block_sparse and (not self.continual_mode)
+            if (not use_block_path) and (self._fast_d_eff is None) and d_eff < self.d_max:
+                ctx_t = ctx_t.clone()
+                ctx_t[:, d_eff:] = 0.0
+
+            if use_block_path:
+                a = ctx_t
+                if self.use_depth_scaled_highway:
+                    a, _, _ = self._apply_subspace_rmsnorm(a, target_rms=1.20, return_stats=False)
+                for l_idx, layer in enumerate(self.spring_layers):
+                    a = self._forward_block_sparse_layer(layer, a, l_idx=l_idx)
+            else:
+                a = ctx_t
+                for l_idx, layer in enumerate(self.spring_layers):
+                    a = self._forward_dynamic_layer(layer, a, l_idx=l_idx)
+
+            if self.frozen:
+                in_dim = self.output_head.w0.shape[1]
+                scene_logits = F.linear(
+                    a[:, :in_dim] if a.shape[1] != in_dim else a,
+                    self.output_head.w0,
+                )
+            elif use_block_path:
+                d_last = self._final_layer_dim()
+                a_head = a[:, :d_last] if a.shape[1] != d_last else a
+                scene_logits = F.linear(a_head, self.output_head.w[:, :d_last])
+            else:
+                d_last = self._final_layer_dim()
+                a_masked = a.clone()
+                if d_last < self.d_max:
+                    a_masked[:, d_last:] = 0.0
+                scene_logits = self.output_head(a_masked)
+
+            if use_role and ent_gate_t and ent_logits_t is not None:
+                logits_out = 0.15 * scene_logits[0] + ent_logits_t
+            else:
+                logits_out = scene_logits[0].clone()
+
+        # Advance causal lags, N-gram tables, and step index strictly in causal order
+        cache.prev_emb_2.copy_(cache.prev_emb_1)
+        cache.prev_emb_1.copy_(tok_emb)
+        if use_role and tok_unit is not None:
+            cache.lag3_unit.copy_(cache.lag2_unit)
+            cache.lag2_unit.copy_(cache.lag1_unit)
+            cache.lag1_unit.copy_(tok_unit)
+        cache.record_token_ngrams(token_id)
+        cache.step += 1
+        return logits_out
+
+    def _apply_refractory_gate_logits(
+        self,
+        logits: torch.Tensor,
+        seq: list[int],
+        cache: SpringInferenceCache | None = None,
+    ) -> torch.Tensor:
+        if len(seq) < 1:
+            return logits
+        prev1 = seq[-1]
+        if 0 <= prev1 < self.vocab_size:
+            logits[prev1] = float("-inf")
+
+        if len(seq) >= 3:
+            prev2 = seq[-2]
+            prev3 = seq[-3]
+            if cache is not None:
+                bigram_counts = cache.bigram_next.get(prev1, {})
+                trigram_counts = cache.trigram_next.get((prev2, prev1), {})
+                fourgram_counts = cache.fourgram_next.get((prev3, prev2, prev1), {})
+            else:
+                bigram_counts: dict[int, int] = {}
+                trigram_counts: dict[int, int] = {}
+                fourgram_counts: dict[int, int] = {}
+                for i in range(len(seq) - 1):
+                    if seq[i] == prev1:
+                        nxt = seq[i + 1]
+                        bigram_counts[nxt] = bigram_counts.get(nxt, 0) + 1
+                for i in range(len(seq) - 2):
+                    if seq[i] == prev2 and seq[i + 1] == prev1:
+                        nxt = seq[i + 2]
+                        trigram_counts[nxt] = trigram_counts.get(nxt, 0) + 1
+                for i in range(len(seq) - 3):
+                    if seq[i] == prev3 and seq[i + 1] == prev2 and seq[i + 2] == prev1:
+                        nxt = seq[i + 3]
+                        fourgram_counts[nxt] = fourgram_counts.get(nxt, 0) + 1
+
+            for cand_id, b_cnt in bigram_counts.items():
+                if not (0 <= cand_id < self.vocab_size):
+                    continue
+                sal = float(self.token_salience[cand_id].item())
+                t_cnt = trigram_counts.get(cand_id, 0)
+                fg_cnt = fourgram_counts.get(cand_id, 0)
+
+                if fg_cnt >= 1:
+                    logits[cand_id] -= 15.0 * float(fg_cnt)
+                if sal >= 0.95 and (t_cnt >= 2 or b_cnt >= 2):
+                    logits[cand_id] -= 12.0 * float(max(t_cnt, b_cnt))
+        return logits
+
+    @torch.no_grad()
     def generate(
         self,
         prompt_ids: list[int],
         max_new_tokens: int = 28,
         eos_id: int | None = None,
         enable_refractory_gate: bool = True,
+        use_fast_cache: bool = False,
     ) -> list[int]:
         """
-        Autoregressive rollout equipped with the Milestone 2.2 Two-Tier Transition Refractory Gate:
-          - Tier 1 (Immediate Adjacent Token Gate t-1 -> t): Prevents any token from repeating
-            itself on consecutive steps (x_t != x_{t-1}), eliminating adjacent stutters ('the the')
-            while allowing natural recurrence at t+2, t+3, ...
-          - Tier 2 (Contextual Bigram/Trigram/4-Gram Transition Adaptation): Prevents phrase
-            loops at the tail of long rollouts (e.g. repeating a 3rd entity mention or repeating
-            an already-emitted 3-gram/4-gram action phrase) while preserving Sentence-2 entity
-            recurrence after '. then' / '. afterward'.
+        Autoregressive rollout equipped with the Milestone 2.2 Two-Tier Transition Refractory Gate
+        and Phase 3.1 O(1) Stateful Inference Cache (`use_fast_cache=True`).
         """
         seq = list(prompt_ids)
+        if not seq:
+            return seq
+
+        if use_fast_cache and not (self.frozen and self.continual_mode and self.phase_resonance_profiles):
+            prev_fast_gen = getattr(self, "_in_fast_generate", False)
+            self._in_fast_generate = True
+            try:
+                cache = self.init_inference_cache(batch_size=1)
+                init_window = seq[-self.max_seq_len:]
+                # Keep O(1) N-gram refractory state synchronized over any clipped prefix before window
+                prefix_cut = len(seq) - len(init_window)
+                for tid in seq[:prefix_cut]:
+                    cache.record_token_ngrams(tid)
+
+                # Fast prefill over prompt_ids[:-1] (skips Q/softmax/hidden/head), compute logits on last prompt token
+                logits = None
+                for idx, tid in enumerate(init_window):
+                    is_last = idx == (len(init_window) - 1)
+                    logits = self.forward_step_cached(tid, cache, compute_logits=is_last)
+
+                for _ in range(max_new_tokens):
+                    if logits is None:
+                        break
+                    if enable_refractory_gate:
+                        self._apply_refractory_gate_logits(logits, seq, cache=cache)
+                    next_id = int(torch.argmax(logits).item())
+                    seq.append(next_id)
+                    if eos_id is not None and next_id == eos_id:
+                        break
+
+                    if cache.step >= self.max_seq_len:
+                        # Sliding window shifted past max_seq_len: resync rolling positional window
+                        saved_hist = cache.seq_history
+                        saved_bi = cache.bigram_next
+                        saved_tri = cache.trigram_next
+                        saved_four = cache.fourgram_next
+                        cache = self.init_inference_cache(batch_size=1)
+                        win = seq[-self.max_seq_len:]
+                        for w_idx, w_tid in enumerate(win):
+                            is_last = w_idx == (len(win) - 1)
+                            logits = self.forward_step_cached(w_tid, cache, compute_logits=is_last)
+                        cache.seq_history = saved_hist
+                        cache.bigram_next = saved_bi
+                        cache.trigram_next = saved_tri
+                        cache.fourgram_next = saved_four
+                        cache.record_token_ngrams(next_id)
+                    else:
+                        logits = self.forward_step_cached(next_id, cache, compute_logits=True)
+                return seq
+            finally:
+                self._in_fast_generate = prev_fast_gen
+
         for _ in range(max_new_tokens):
             window = seq[-self.max_seq_len:]
             logits = self.forward(window).clone()
-
-            if enable_refractory_gate and len(seq) >= 1:
-                prev1 = seq[-1]
-                # Tier 1: Immediate Adjacent Token Refractory Gate (x_t != x_{t-1})
-                if 0 <= prev1 < self.vocab_size:
-                    logits[prev1] = float("-inf")
-
-                # Tier 2: Contextual N-gram Transition Adaptation (preventing tail phrase loops)
-                if len(seq) >= 3:
-                    prev2 = seq[-2]
-                    prev3 = seq[-3]
-                    bigram_counts: dict[int, int] = {}
-                    trigram_counts: dict[int, int] = {}
-                    fourgram_counts: dict[int, int] = {}
-
-                    for i in range(len(seq) - 1):
-                        if seq[i] == prev1:
-                            nxt = seq[i + 1]
-                            bigram_counts[nxt] = bigram_counts.get(nxt, 0) + 1
-                    for i in range(len(seq) - 2):
-                        if seq[i] == prev2 and seq[i + 1] == prev1:
-                            nxt = seq[i + 2]
-                            trigram_counts[nxt] = trigram_counts.get(nxt, 0) + 1
-                    for i in range(len(seq) - 3):
-                        if seq[i] == prev3 and seq[i + 1] == prev2 and seq[i + 2] == prev1:
-                            nxt = seq[i + 3]
-                            fourgram_counts[nxt] = fourgram_counts.get(nxt, 0) + 1
-
-                    for cand_id, b_cnt in bigram_counts.items():
-                        if not (0 <= cand_id < self.vocab_size):
-                            continue
-                        sal = float(self.token_salience[cand_id].item())
-                        t_cnt = trigram_counts.get(cand_id, 0)
-                        fg_cnt = fourgram_counts.get(cand_id, 0)
-
-                        # Block any exact 4-gram phrase loop (e.g. 'the brave puppy chased' repeating)
-                        if fg_cnt >= 1:
-                            logits[cand_id] -= 15.0 * float(fg_cnt)
-
-                        # Block any content trigram or content bigram (sal >= 0.95) from repeating a 3rd time
-                        if sal >= 0.95 and (t_cnt >= 2 or b_cnt >= 2):
-                            logits[cand_id] -= 12.0 * float(max(t_cnt, b_cnt))
-
+            if enable_refractory_gate:
+                self._apply_refractory_gate_logits(logits, seq, cache=None)
             next_id = int(torch.argmax(logits).item())
             seq.append(next_id)
             if eos_id is not None and next_id == eos_id:

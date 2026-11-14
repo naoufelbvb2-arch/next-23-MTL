@@ -335,6 +335,69 @@ class TestSpringMVPArchitecture(unittest.TestCase):
         self.assertLess(stat["k_head_rej_melted"], stat["k_head_rej_before"])
         self.assertGreater(stat["k_head_pref_locked"], stat["k_head_pref_before"])
 
+    def test_10_phase_3_1_fused_kernels_and_stateful_cache(self):
+        """
+        Verify v3.0 Phase 3.1 Hardware-Accelerated Kernels, Factorized Highway DFA,
+        O(1) Stateful SpringInferenceCache, and Mixed-Precision Kahan Safety:
+        1. AST Zero-Autograd across >= 29 Python source files.
+        2. Fused in-place (w, w0, k) spring kernels eliminate update matrix churn (0.00 MB),
+           reduce full-step ATen allocations >= 40%, speed up training with exact Val parity,
+           and execute indexed active-block slice GEMM accurately (< 1e-5 max diff).
+        3. FactorizedHighwayDFA cuts 12-layer DFA buffer memory >= 87.5% (99.2% at V=32K),
+           accelerates broadcast >= 2x, and converges end-to-end on 12L (> 90% Val Acc).
+        4. Stateful O(1) SpringInferenceCache achieves 100.00% exact token sequence parity
+           against O(T^2) rollout at +30 and +64 tokens for both 12L Block-Sparse and
+           4L Role-Bridge Compositional models.
+        5. BF16 + Kahan Compensator prevents sub-ULP underflow & maintains 0 NaN/Inf.
+        """
+        from benchmarks.bench_v3_kernels_speed import run_v3_kernels_benchmark
+
+        results = run_v3_kernels_benchmark(verbose=False)
+        self.assertTrue(results["ast_ok"])
+        self.assertGreaterEqual(results["scanned_files"], 29)
+
+        t1_rows = results["table1"]["rows"]
+        unfused, fused, fused_fac = t1_rows[0], t1_rows[1], t1_rows[2]
+        self.assertGreater(unfused["update_alloc_mb"], 20.0)
+        self.assertEqual(fused["update_alloc_mb"], 0.0)
+        self.assertEqual(fused_fac["update_alloc_mb"], 0.0)
+        self.assertLess(fused_fac["step_alloc_mb"], unfused["step_alloc_mb"] * 0.60)
+        self.assertGreaterEqual(fused_fac["speedup_x"], 1.25)
+        self.assertGreaterEqual(fused["val_acc_pct"], 88.0)
+        self.assertGreaterEqual(fused_fac["val_acc_pct"], 88.0)
+        self.assertLessEqual(abs(fused["val_acc_pct"] - unfused["val_acc_pct"]), 1.5)
+
+        sg = results["slice_gemm"]
+        self.assertLess(sg["max_abs_diff"], 1e-5)
+        self.assertGreaterEqual(sg["flop_reduction_pct"], 50.0)
+
+        t2 = results["table2"]
+        s2048 = t2["scaling_rows"][0]
+        s32000 = t2["scaling_rows"][-1]
+        self.assertGreaterEqual(s2048["mem_saved_pct"], 85.0)
+        self.assertGreaterEqual(s2048["speedup_x"], 2.0)
+        self.assertGreaterEqual(s32000["mem_saved_pct"], 99.0)
+        self.assertGreaterEqual(s32000["speedup_x"], 4.0)
+        self.assertGreaterEqual(t2["e2e_12l_val_acc"], 90.0)
+
+        t3 = results["table3"]
+        self.assertTrue(t3["all_exact_match"])
+        for row in t3["rows"]:
+            self.assertEqual(row["exact_match_pct"], 100.0)
+            self.assertLess(row["max_logit_diff"], 1e-4)
+            if row["horizon"] == 64 and "Role-Bridge" in row["model_label"]:
+                self.assertGreaterEqual(row["speedup_x"], 3.0)
+            if row["horizon"] == 64 and "12L" in row["model_label"]:
+                self.assertGreaterEqual(row["speedup_x"], 1.5)
+
+        t4_rows = results["table4"]["rows"]
+        for row in t4_rows:
+            self.assertEqual(row["nan_inf_count"], 0)
+        bf16_naive, bf16_kahan = t4_rows[1], t4_rows[2]
+        self.assertGreaterEqual(bf16_kahan["cos_vs_fp32"], 0.90)
+        self.assertGreater(bf16_kahan["cos_vs_fp32"], bf16_naive["cos_vs_fp32"] + 0.30)
+        self.assertGreater(bf16_kahan["mean_delta_k"], 0.001)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

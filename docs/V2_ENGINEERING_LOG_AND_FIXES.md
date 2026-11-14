@@ -422,23 +422,82 @@
 
 ---
 
-## 9. طريقة إعادة الإنتاج والتحقق (`Reproducibility`)
+## 9. المرحلة 3.1 (`v3.0 Phase 3.1`): نوى التسريع العتادي، الكبسولات المقطوعة، `FactorizedHighwayDFA`، وذاكرة الاستدلال $O(1)$
+
+مع اكتمال `SS-ENN v2.0` بالكامل (`v2.0.0`)، افتُتح خط **`v3.0`** بالمرحلة **3.1** لتحقيق أقصى كفاءة عتادية وبرمجية عبر وحدة مستقلة [`engine/kernels.py`](../engine/kernels.py) مع الالتزام الصارم بقاعدة `Zero-Autograd` عبر **29 ملفاً برمجياً** وبتطابق `100.00%` مع المسارات السابقة:
+
+### 9.1 القوانين والآليات الهندسية الأربع للطور 3.1 (في [`engine/kernels.py`](../engine/kernels.py) و [`models/model_scaled.py`](../models/model_scaled.py))
+1. **نواة التحديث الموضعي المدمجة + معوض `Kahan` للدقة المختلطة (`fused_spring_update_inplace` & `MixedPrecisionCompensator`):**
+   - تُنفَّذ قوانين النابض الثلاثة موضعياً في الذاكرة عبر مخازن عمل مُعاد تدويرها (`SpringScratchBuffer`) وتحديث خطأ `softmax` موضعياً داخل `train_minibatch()`، مما يُلغي تخصيصات تحديث الأوزان بالكامل (**`39.00 MB -> 0.00 MB`**) ويخفض تخصيصات الخطوة الكاملة بـ ATen (`TensorAllocationTracker` عبر `TorchDispatchMode`) من **`226.70 MB`** إلى **`125.45 MB` (`Fused In-Place`)** و**`97.70 MB` (`Fused + Factorized`)**.
+   - عند العمل بـ `bfloat16`/`float16`، يُخزَّن خطأ التدوير المتبقي $r_t$ بدقة `FP32` ويُحقن قبل الخطوة التالية لتفادي التلاشي `sub-ULP`:
+     $$\tilde{w}_t = \text{fp32}(w_t) + r_{w,t}, \qquad w_{t+1} = \text{bf16}(\tilde{w}_t^{\text{new}}), \qquad r_{w,t+1} = \tilde{w}_t^{\text{new}} - \text{fp32}(w_{t+1})$$
+2. **التنفيذ الكتلي المقطوع للفضاء النشط (`indexed_block_activate_highway`, `indexed_block_matmul_slice`, `batch_active_block_union_update`):**
+   - الانتقاء والجمع الموضعي عبر `.index_select()` و `.index_add_()` للكتل الفائزة فقط (`U / N_blocks` كتل نشطة) وتفادي تخصيص أقنعة ثلاثية/خماسية الأبعاد، مع مطابقة الكثيف حتى **`1.43e-06`** وتخطي `62.5% FLOPs` (`Dense=0.201ms -> Sparse=0.174ms`).
+3. **التوجيه الراجع المفكك بالممر السريع (`FactorizedHighwayDFA`):**
+   - بدلاً من تخزين مصفوفة $[D_{\max} \times V]$ لكل طبقة ($O(L \cdot D \cdot V)$)، يُسقط خطأ المفردات **مرة واحدة** نحو فضاء الممر السريع ثم يُمرر عبر محولات محلية مدمجة $M^{(l)} \in \mathbb{R}^{D_{\max} \times D_{\max}}$ ($O(L \cdot D^2)$):
+     $$\mathbf{e}_{\text{hwy}} = \text{row\_norm}(W_{\text{head}}^{\top})\,\mathbf{e}_t \in \mathbb{R}^{N \times D_{\text{last}}}, \qquad \delta^{(l)} = s_L \left(M^{(l)}_{[:d_{\text{act}}, :d_{\text{last}}]}\, \mathbf{e}_{\text{hwy}}\right)$$
+     مما يثبّت ذاكرة DFA عبر 12 طبقة عند **`3.00 MB`** فقط حتى عند $V = 32,000$ (توفير **`99.20%`** وتسريع **`8.09x`**).
+4. **ذاكرة الاستدلال الحالة الثابتة $O(1)$ (`SpringInferenceCache` & `forward_step_cached()`):**
+   - الحفاظ على الحالة السببية المتزايدة خطوة بخطوة: مخازن `(K, V, Salience)`، ومكثف الـ EMA $c_t$، ومركّم ALiBi الأسي الدقيق (للمسارين القياسي `0.68` مع أوزان البداية `0.30/0.20` والمنزلق `0.60`)، ومؤخرات `lag1/2` و`Role-Bridge Entity Slots`، وجداول الـ N-gram ($2/3/4$-grams) لبوابة الجموح، مع تسريع قراءة البادئة الأولية (`compute_logits=False` لـ `prompt_ids[:-1]`).
+
+### 9.2 الجداول التجريبية الأربعة للمرحلة 3.1 (`benchmarks/bench_v3_kernels_speed.py` — `Frozen W0 Only`)
+*(AST: `29` Python files scanned, `0 backward/grad` | Split: TinyStories `Train=355 (12,780 tok)` / `Val=39 (1,404 tok)` | `V=2,048`)*
+
+#### الجدول (1): مقارنة سرعة التدريب والتخصيصات الفعليّة (`Unfused v2.4` vs. `Fused In-Place v3.1` — `4L Block-Sparse`)
+| Configuration | Throughput (`tok/s`) | Speedup | Step Alloc (ATen) | Update Alloc (ATen) | Train Acc | Val Acc | Val PPL |
+| :--- | ---: | :---: | ---: | ---: | :---: | :---: | :---: |
+| **`Unfused v2.4 (Baseline)`** | `12,181.9` | `1.00x` | `226.70 MB` | `39.00 MB` | `91.68%` | `90.46%` | `1.84` |
+| **`Fused In-Place v3.1`** | `13,451.2` | `1.10x` | `125.45 MB` | **`0.00 MB`** | `91.53%` | `90.31%` | `1.84` |
+| **`Fused + Factorized v3.1`** | **`19,450.7`** | **`1.60x`** | **`97.70 MB`** | **`0.00 MB`** | `91.65%` | **`90.88%`** | `1.86` |
+
+- *تحقق `indexed_block_matmul_slice` (`U=6/16 blocks`, تخطي `62.5% FLOPs`):* `Dense = 0.201ms` vs **`Sparse = 0.174ms`** | `MaxDiff = 1.43e-06`.
+
+#### الجدول (2): مقارنة ذاكرة وسرعة `FactorizedHighwayDFA [D, D]` مقابل `DFARouter [D, V]` (`L=12, D=256, N=512`)
+| Vocab ($V$) | Std `[D, V]` MB | Factorized MB | Mem Saved | Std (`ms`) | Factorized (`ms`) | Broadcast Speedup |
+| ---: | ---: | ---: | :---: | ---: | ---: | :---: |
+| `2,048` | `24.00 MB` | `3.00 MB` | **`87.50%`** | `38.53` | `8.98` | **`4.29x`** |
+| `4,096` | `48.00 MB` | `3.00 MB` | **`93.75%`** | `72.49` | `11.44` | **`6.34x`** |
+| `32,000` | `375.00 MB` | `3.00 MB` | **`99.20%`** | `577.18` | `71.30` | **`8.09x`** |
+
+- *تدريب 12 طبقة متكامل بـ `FactorizedHighwayDFA` (`Frozen W0`):* `Train Acc = 92.50%` | **`Val Acc = 92.38%`** | **`Val PPL = 1.67`** | `Speed = 10,474.4 tok/s`.
+
+#### الجدول (3): استدلال $O(1)$ (`SpringInferenceCache`) مقابل إعادة الحساب $O(T^2)$ (`Frozen W0 Only`)
+| Model Architecture | Horizon | $O(T^2)$ `tok/s` | $O(1)$ `tok/s` | Speedup | Exact Token Match | Max Logit Diff |
+| :--- | :---: | ---: | ---: | :---: | :---: | :---: |
+| **`12L Block-Sparse v3.1`** | `+30` | `123.5` | `284.8` | **`2.31x`** | **`100.00%`** | `4.77e-06` |
+| **`12L Block-Sparse v3.1`** | `+64` | `116.3` | `293.8` | **`2.53x`** | **`100.00%`** | `4.77e-06` |
+| **`4L Role-Bridge Compositional`** | `+30` | `101.2` | `398.1` | **`3.93x`** | **`100.00%`** | `5.72e-06` |
+| **`4L Role-Bridge Compositional`** | `+64` | `61.9` | `452.5` | **`7.31x`** | **`100.00%`** | `5.72e-06` |
+
+#### الجدول (4): تدقيق أمان الدقة المختلطة (`50` خطوة `sub-ULP` متتالية: `FP32` vs. `BF16`)
+| Precision Mode | NaN / Inf | $\|\Delta W_0\|_2$ | FP32 Retention | Mean $\Delta k$ | Cos vs FP32 |
+| :--- | :---: | ---: | ---: | ---: | ---: |
+| **`FP32 Reference`** | `0` | `0.274610` | `100.00%` | `0.001972` | `1.000000` |
+| **`BF16 Naive (No Comp)`** | `0` | `0.083876` | `30.54%` | `0.000000` *(توقف)* | `0.353738` |
+| **`BF16 + Kahan Comp (v3.1)`** | **`0`** | `0.286580` | **`104.36%`** | **`0.001960`** | **`0.935948`** |
+
+---
+
+## 10. طريقة إعادة الإنتاج والتحقق (`Reproducibility`)
 ```bash
-# 1. تشغيل معيار الطور 2.5 للتوجيه بالمكافأة ثلاثية العوامل والضبط السلوكي بعد التدريب
+# 1. تشغيل معيار المرحلة 3.1 لنوى التسريع العتادي و DFA المفكك وذاكرة الاستدلال O(1)
+python benchmarks/bench_v3_kernels_speed.py
+
+# 2. تشغيل معيار الطور 2.5 للتوجيه بالمكافأة ثلاثية العوامل والضبط السلوكي بعد التدريب
 python benchmarks/bench_v2_reward_alignment.py
 
-# 2. تشغيل معيار الطور 2.4 للكبسولات الكتلية المتفرقة (B=16) والتوسع العميق لـ 12 طبقة
+# 3. تشغيل معيار الطور 2.4 للكبسولات الكتلية المتفرقة (B=16) والتوسع العميق لـ 12 طبقة
 python benchmarks/bench_v2_deep_block_sparse.py
 
-# 3. تشغيل معيار الطور 2.3 للتعميم التركيبي الصفري، الصلابة الهرمية، وتطبيع الطاقة الموضعي
+# 4. تشغيل معيار الطور 2.3 للتعميم التركيبي الصفري، الصلابة الهرمية، وتطبيع الطاقة الموضعي
 python benchmarks/bench_v2_compositional_gen.py
 
-# 4. تشغيل معيار الطور 2.2 للتعلم المستمر عبر 4 مراحل، طور النوم المزدوج، وإعادة تدوير الخلايا
+# 5. تشغيل معيار الطور 2.2 للتعلم المستمر عبر 4 مراحل، طور النوم المزدوج، وإعادة تدوير الخلايا
 python benchmarks/bench_v2_sleep_continual.py
 
-# 5. تشغيل معيار الطور 2.1 للمحرك المليوني والترقية الفيزيائية على المعالج المحلي
+# 6. تشغيل معيار الطور 2.1 للمحرك المليوني والترقية الفيزيائية على المعالج المحلي
 python benchmarks/bench_scale_english_cpu.py
 
-# 6. تشغيل حزمة الاختبارات الصارمة (9 اختبارات) وفحص AST عبر جميع ملفات المستودع (27 ملفاً برمجياً)
+# 7. تشغيل حزمة الاختبارات الصارمة (10 اختبارات) وفحص AST عبر جميع ملفات المستودع (29 ملفاً برمجياً)
 python tests/test_suite.py
 ```

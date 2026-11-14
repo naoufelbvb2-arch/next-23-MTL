@@ -1,9 +1,10 @@
-# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0 & v2.0 Complete 5/5)
+# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0, v2.0 & v3.0 Phase 3.1)
 **الشبكات العصبية المرنة ذاتية التشكيل — إطار تعلم موضعي خالٍ من الانتشار العكسي للتوليد المتسلسل والتعلم المستمر**
 
-*A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Dual-Horizon Sparse Causal Attention, Dynamic Neurogenesis, Dual-Stage Sleep Consolidation, and Three-Factor Reward Alignment*
+*A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Dual-Horizon Sparse Causal Attention, Hardware-Accelerated Kernels, Factorized Highway DFA, and O(1) Stateful Inference Cache*
 
-[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(27%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
+[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(29%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
+[![v3.0 Phase 3.1 Kernels & O(1) Cache](https://img.shields.io/badge/Phase%203.1-0.00%20MB%20Upd%20%7C%2099.2%25%20DFA%20Saved%20%7C%207.31x%20O(1)-orange)](./benchmarks/bench_v3_kernels_speed.py)
 [![Milestone 2.5 Reward Alignment](https://img.shields.io/badge/Milestone%202.5-100%25%20Aligned%20%7C%200%25%20Rejected%20%7C%20Zero--RL-brightgreen)](./benchmarks/bench_v2_reward_alignment.py)
 [![Milestone 2.4 12-Layer Block-Sparse](https://img.shields.io/badge/Milestone%202.4-12L%2093.59%25%20%7C%201.34x%20Eval%20Speedup-purple)](./benchmarks/bench_v2_deep_block_sparse.py)
 [![Milestone 2.3 Zero-Shot Recombination](https://img.shields.io/badge/Milestone%202.3-90.27%25%20Hybrid%20%7C%20100%25%20Binding-blue)](./benchmarks/bench_v2_compositional_gen.py)
@@ -55,9 +56,9 @@
 
 ---
 
-## الحصيلة المعملية للتجارب الإحدى عشرة | Empirical Benchmark Suite (v1.0 & v2.0 Complete 5/5)
+## الحصيلة المعملية للتجارب الاثنتي عشرة | Empirical Benchmark Suite (v1.0, v2.0 & v3.0 Phase 3.1)
 
-تخضع جميع ملفات المستودع (27 ملفاً برمجياً) لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
+تخضع جميع ملفات المستودع (29 ملفاً برمجياً) لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
 
 | # | الاختبار المعملي (`Benchmark`) | السكريبت التنفيذي | التحدي وحجم البيانات | الأبعاد النشطة النهائية ($D_{\text{active}}$) | توفير السعة / الذاكرة | الدقة بعد التجميد ($W_0$ فقط) | النتيجة الفيزيائية البارزة |
 | :-: | :--- | :--- | :--- | :--- | :---: | :---: | :--- |
@@ -72,6 +73,7 @@
 | **9** | **الصلابة الهرمية، تطبيع الطاقة الموضعي، والتعميم التركيبي الصفري (`v2.0 Milestone 2.3`)** | [`benchmarks/bench_v2_compositional_gen.py`](./benchmarks/bench_v2_compositional_gen.py) | تدريب قطري (`64` قصة) + تقييم صفري (`W_0`) على `24` توليفة هجينة غير مرئية `(L_j, S_i, A_k)` | طيف Top-K هرمي `[24, 24, 20, 16]` وصلابة متدرجة `k_bar = [0.0799..0.1676]` | تثبيت الطاقة الموضعي `RMS = 1.2000` عبر `L1..L4` (مقابل تضخم `1.7607` المسطح) | **`90.27%` Hybrid Full (`PPL 1.870`)**، **`97.01%` Hybrid Cont**، **`100.00%` (`48/48`)** Subject Binding (`0.00%` Reversion) | **`100.00%` (`6/6`)** توليد حر (`+30` رمزاً) بـ `0.00%` تكرار متجاور وحلقات عبارة |
 | **10** | **الكبسولات الكتلية المتفرقة والتوسع العميق لـ 12 طبقة (`v2.0 Milestone 2.4`)** | [`benchmarks/bench_v2_deep_block_sparse.py`](./benchmarks/bench_v2_deep_block_sparse.py) | `394` قصة إنجليزية (`V=2,048`) بعمق `4L` و `12L` (`B=16`) ومقارنة `Element-wise` و `Deep Naive` | كبسولات كتلية متجاورة `12x16 = 192` (`L1..L12`: `2/12` ثم `1/12` لكل طبقة) | تسريع **`1.23x`** تدريب (`10,920 tok/s`) و **`1.34x`** استدلال (`41,862 tok/s`) لـ `4L` (`5.42 MB`) | **`93.73%` (`4L`, `PPL 1.45`)** و **`93.59%` (`12L Val`, `PPL 1.48`)** مقابل `92.88%` الساذج | نسبة تباين `L12/L1` **`1.0000 / 0.9901`**، إنتروبيا كتلية **`0.9864 / 0.9133`**، صلابة $\bar{k}=0.1733$، وثبات كيانات **`100% (5/5)`** (`0.00%` تكرار/حلقات) |
 | **11** | **اللدونة ثلاثية العوامل والضبط بالمكافأة (`v2.0 Milestone 2.5`)** | [`benchmarks/bench_v2_reward_alignment.py`](./benchmarks/bench_v2_reward_alignment.py) | `12` معضلة سلوكية منحازة `5:1` + `300` قصة عامة (`Train=255`, `Val=45`, `V=2,048`) | أبعاد موحدة `[256]*4` بصلابة انتقائية وعزل عام | **`0.00 MB`** زيادة عند التجميد (`6.54 MB`) في **`3.674s`** (`Zero-RL`) | السلوك المواءم **`0.00% -> 100.00%`**، المرفوض **`91.67% -> 0.00%`**، المعرفة العامة **`91.29% Val`** (`PPL 1.51`) | إذابة `k_rej` (**`-89.1%`**) وقفل `k_pref` (**`+570.5%`**) مع عزل عام (`-0.3%`)، `RMS = 1.2000`، وكيانات **`100% (12/12)`** |
+| **12** | **النوى المدمجة، DFA المفكك، وذاكرة $O(1)$ (`v3.0 Phase 3.1`)** | [`benchmarks/bench_v3_kernels_speed.py`](./benchmarks/bench_v3_kernels_speed.py) | `394` قصة إنجليزية (`V=2,048 -> 32,000`) عبر `4L/12L` مع أمان `BF16` (`Kahan`) | `[256]*4` و `[256]*12` مع الكتل النشطة $U/N$ و `FactorizedHighwayDFA` | **`0.00 MB`** تخصيص تحديث (`97.70 MB` خطوة مقابل `226.70 MB`) و **`99.20%`** توفير DFA (`32K`) | **`90.88%` (`4L`)** و **`92.38%` (`12L Fac`, `PPL 1.67`)**؛ وتطابق **`100.00%`** لذاكرة $O(1)$ | تسريع تدريب **`1.60x`** (`19,450 tok/s`)، بث DFA **`8.09x`**، توليد $O(1)$ حتى **`7.31x`** (`100%` تطابق)، و`BF16 Kahan Cos=0.936` (`0 NaN`) |
 
 ---
 
@@ -86,6 +88,7 @@ next-23-MTL/
 │   ├── sparse_attention.py           # Zero-autograd Sparse Causal Self-Attention (Top-K = 3..5)
 │   ├── dfa_router.py                 # Fixed & Adaptive Direct Feedback Alignment (B^(l) matrices)
 │   ├── causal_context.py             # Autoregressive causal context processor
+│   ├── kernels.py                    # v3.0 Phase 3.1 fused kernels, FactorizedDFA, Kahan BF16 & O(1) Cache
 │   └── tokenizer.py                  # Hybrid English Word + BPE Subword Tokenizer (V=2048..4096)
 ├── models/                           # حزمة النماذج المعزولة (v1.0 & v2.0 Scaled)
 │   ├── __init__.py
@@ -107,10 +110,11 @@ next-23-MTL/
 │   ├── bench_v2_sleep_continual.py   # v2.0 Milestone 2.2: 4-phase sleep consolidation, recycling & refractory gate
 │   ├── bench_v2_compositional_gen.py # v2.0 Milestone 2.3: Hierarchical stiffness, Active RMSNorm & zero-shot recombination
 │   ├── bench_v2_deep_block_sparse.py # v2.0 Milestone 2.4: Block-sparse capsules (B=16) & 12-layer deep highway scaling
-│   └── bench_v2_reward_alignment.py  # v2.0 Milestone 2.5: Reward-modulated three-factor plasticity & RL-free alignment
+│   ├── bench_v2_reward_alignment.py  # v2.0 Milestone 2.5: Reward-modulated three-factor plasticity & RL-free alignment
+│   └── bench_v3_kernels_speed.py     # v3.0 Phase 3.1: Fused in-place kernels, Factorized DFA, O(1) cache & BF16 audit
 ├── tests/                            # حزمة التحقق الصارم وفحص AST
 │   ├── __init__.py
-│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (27 files, 9 tests)
+│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (29 files, 10 tests)
 ├── docs/                             # الأوراق البحثية وسجل الإصلاحات وخارطة الطريق
 │   ├── RESEARCH_PAPER_SS_ENN.md      # Full technical paper, equations, empirical tables & reproducibility
 │   ├── V2_ENGINEERING_LOG_AND_FIXES.md # Detailed v2.0 Milestones 2.1–2.5 physics upgrades & audit
@@ -139,7 +143,7 @@ python tests/test_suite.py
 python train_eval.py
 ```
 
-### 3. تشغيل الاختبارات المعملية الإحدى عشرة (Run All v1.0 & v2.0 Benchmarks)
+### 3. تشغيل الاختبارات المعملية الاثنتي عشرة (Run All v1.0, v2.0 & v3.1 Benchmarks)
 ```bash
 # 1. Capacity & Saturation Benchmark (12 -> 25 -> 50 sentences)
 python benchmarks/bench_capacity.py
@@ -170,6 +174,9 @@ python benchmarks/bench_v2_deep_block_sparse.py
 
 # 10. Reward-Modulated Three-Factor Spring Plasticity & RL-Free Post-Training Alignment (Milestone 2.5)
 python benchmarks/bench_v2_reward_alignment.py
+
+# 11. Hardware-Accelerated Fused Kernels, Factorized DFA & O(1) Inference Cache (v3.0 Phase 3.1)
+python benchmarks/bench_v3_kernels_speed.py
 ```
 
 ---
