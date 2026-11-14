@@ -41,6 +41,7 @@ def verify_all_repo_files_zero_autograd() -> tuple[bool, int]:
     scan_dirs = [
         PROJECT_ROOT / "engine",
         PROJECT_ROOT / "models",
+        PROJECT_ROOT / "trainer",
         PROJECT_ROOT / "benchmarks",
     ]
     files = [PROJECT_ROOT / "train_eval.py"]

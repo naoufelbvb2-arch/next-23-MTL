@@ -272,39 +272,43 @@ $$\delta_j^{(l)} = \left( B^{(l)} \mathbf{e} \right)_j \odot g'\left(z_j^{(l)}\r
 
 ---
 
+### 5.9 المنظومة الإنتاجية والتدريب السحابي المقاوم للأعطال (`v3.0 Phases 3.1–3.4`)
+
+انتقلت معمارية **SS-ENN** في الإصدار الثالث **`v3.0`** إلى منظومة إنتاجية موحدة صالحة للتشغيل على المعالج المحلي ومسرّعات السحابة (`Colab GPU / TPU`) مع الحفاظ التام على قاعدة **`Zero-Autograd`** عبر جميع ملفات المستودع (**`38` ملفاً برمجياً مفحوصاً بـ `AST`**):
+1. **النوى المدمجة و`FactorizedHighwayDFA` وذاكرة الاستدلال $O(1)$ (`v3.0 Phase 3.1` — [`engine/kernels.py`](../engine/kernels.py)):** إلغاء تخصيصات تحديث الأوزان (`39.00 -> 0.00 MB`) وخفض التخصيص الكلي للخطوة إلى `97.70 MB` بتسريع **`1.60x`** (`19,450.7 tok/s`)، وتثبيت ذاكرة التوجيه الراجع `DFA` عبر 12 طبقة عند **`3.00 MB`** فقط (`99.20%` توفير عند $V=32,000$ وبث أسرع **`8.09x`**)، مع ذاكرة استدلال $O(1)$ أسرع حتى **`7.31x`** بتطابق **`100.00%`**، ومعوض `Kahan FP32` لسلامة `BF16` (`Cos=0.9359`, `0 NaN/Inf`).
+2. **الإعدادات اليدوية الصريحة والترسيب المرن النهائي (`v3.0 Phase 3.2` — [`models/config_v3.py`](../models/config_v3.py) و[`models/model_v3_production.py`](../models/model_v3_production.py)):** مقدّر بصمة بدون تخصيص يمتد من `15.09M` (`0.069 GB`) إلى `7.11B` مع وضع `kahan_mode="anchor_k"` الذي يخفض بصمة `Kahan` بنسبة **`33.3%`** (`19.71 -> 13.14 GB`)، وترسيب مرن نهائي (`Final Elastic Settlement`) يحافظ على مطابقة `Frozen W0` لدقة ما قبل التجميد (**`92.62%`**, **`Val PPL=1.82`**, تقليص حيّز **`55.3%`**)، ومطابقة استئناف **`0.00e+00`** عبر `FP32` و`BF16`.
+3. **التدريب المقاوم للانقطاع والتدفق الذاكري (`v3.0 Phase 3.3` — [`trainer/`](../trainer/)):** شرائح ثنائية `uint16`/`uint32` تُقرأ عبر `numpy.memmap` باستهلاك **`1.93 KB`** بيانات وصفية وتدفق حتى **`32.23M tok/s`**، مع مطابقة **`0.00e+00`** عند الإجهاض المفاجئ في منتصف الحقبة عبر `FP32` و`BF16 (anchor_k)`، وتعافٍ ذاتي من إتلاف `checkpoint_latest.pt` بالارتداد إلى `checkpoint_backup.pt` (`Val Acc 92.62%`)، وحارس `SIGTERM` الفعلي وتصدير `best_frozen_w0.pt`.
+4. **واجهة الإطلاق الموحدة ودليل الإنتاج (`v3.0 Phase 3.4` — [`trainer/cli.py`](../trainer/cli.py) و[`docs/V3_PRODUCTION_TRAINING_GUIDE.md`](./V3_PRODUCTION_TRAINING_GUIDE.md)):** أربعة أوامر فرعية (`estimate`, `prepare-data`, `train`, `generate`) مختبرة بالكامل من البداية للنهاية (`13/13` اختبارات في `tests/test_suite.py`).
+
+---
+
 ## 6. دليل قابلية إعادة الإنتاج والتشغيل (Reproducibility Guide)
 
 ```bash
 # 1. تثبيت المتطلبات الأساسية
 pip install -r requirements.txt
 
-# 2. تشغيل حزمة التحقق الصارم (9 اختبارات) وفحص AST الشامل (27 ملفاً برمجياً)
+# 2. تشغيل حزمة التحقق الصارم (13 اختباراً) وفحص AST الشامل (38 ملفاً برمجياً)
 python tests/test_suite.py
 
-# 3. تشغيل تجربة النواة الأساسية (MVP)
+# 3. تشغيل تجربة النواة الأساسية (MVP) والواجهة الإنتاجية الموحدة (v3.0 CLI)
 python train_eval.py
+python -m trainer.cli estimate --vocab-size 32000 --num-layers 32 --d-init 3072 --d-max 6656 --delta-d 512 --dtype bfloat16 --kahan-mode anchor_k
 
-# 4. تشغيل حزمة الـ Benchmarks الخمسة للإصدار الأول (v1.0)
+# 4. تشغيل حزمة الـ Benchmarks للإصدارات v1.0 و v2.0 و v3.0
 python benchmarks/bench_capacity.py
 python benchmarks/bench_continual.py
 python benchmarks/bench_sparse_attention.py
 python benchmarks/bench_neurogenesis.py
 python benchmarks/bench_continuous_stream.py
-
-# 5. تشغيل تجربة المحرك المليوني وترقية الفيزياء الأساسية (v2.0 Milestone 2.1 on CPU)
 python benchmarks/bench_scale_english_cpu.py
-
-# 6. تشغيل تجربة التعلم المستمر متعدد المراحل، طور النوم المزدوج، وإعادة التدوير (v2.0 Milestone 2.2)
 python benchmarks/bench_v2_sleep_continual.py
-
-# 7. تشغيل تجربة التعميم التركيبي الصفري، الصلابة الهرمية، وتطبيع الطاقة الموضعي (v2.0 Milestone 2.3)
 python benchmarks/bench_v2_compositional_gen.py
-
-# 8. تشغيل تجربة الكبسولات الكتلية المتفرقة (B=16) والتوسع العميق لـ 12 طبقة (v2.0 Milestone 2.4)
 python benchmarks/bench_v2_deep_block_sparse.py
-
-# 9. تشغيل تجربة اللدونة ثلاثية العوامل والضبط السلوكي بالمكافأة (v2.0 Milestone 2.5)
 python benchmarks/bench_v2_reward_alignment.py
+python benchmarks/bench_v3_kernels_speed.py
+python benchmarks/bench_v3_production_model.py
+python benchmarks/bench_v3_trainer_fault_tolerance.py
 ```
 
 ---

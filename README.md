@@ -1,9 +1,11 @@
-# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0, v2.0 & v3.0 Phases 3.1–3.2)
+# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0, v2.0 & v3.0.0)
 **الشبكات العصبية المرنة ذاتية التشكيل — إطار تعلم موضعي خالٍ من الانتشار العكسي للتوليد المتسلسل والتعلم المستمر**
 
-*A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Dual-Horizon Sparse Causal Attention, Hardware-Accelerated Kernels, Factorized Highway DFA, and O(1) Stateful Inference Cache*
+*A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Dual-Horizon Sparse Causal Attention, Hardware-Accelerated Kernels, Fault-Tolerant Cloud Training, and O(1) Stateful Inference*
 
-[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(32%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
+[![Release v3.0.0](https://img.shields.io/badge/Release-v3.0.0%20Production-brightgreen)](./docs/V3_PRODUCTION_TRAINING_GUIDE.md)
+[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(38%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
+[![v3.0 Phase 3.3 Fault-Tolerant](https://img.shields.io/badge/Phase%203.3-0.00e%2B00%20Kill%2FSIGTERM%20%7C%2032.2M%20tok%2Fs-blueviolet)](./benchmarks/bench_v3_trainer_fault_tolerance.py)
 [![v3.0 Phase 3.2 Production Model](https://img.shields.io/badge/Phase%203.2-92.62%25%20Frozen%20W0%20%7C%200.00e%2B00%20Resume-blue)](./benchmarks/bench_v3_production_model.py)
 [![v3.0 Phase 3.1 Kernels & O(1) Cache](https://img.shields.io/badge/Phase%203.1-0.00%20MB%20Upd%20%7C%2099.2%25%20DFA%20Saved%20%7C%207.31x%20O(1)-orange)](./benchmarks/bench_v3_kernels_speed.py)
 [![Milestone 2.5 Reward Alignment](https://img.shields.io/badge/Milestone%202.5-100%25%20Aligned%20%7C%200%25%20Rejected%20%7C%20Zero--RL-brightgreen)](./benchmarks/bench_v2_reward_alignment.py)
@@ -57,9 +59,9 @@
 
 ---
 
-## الحصيلة المعملية للتجارب الثلاث عشرة | Empirical Benchmark Suite (v1.0, v2.0 & v3.0 Phases 3.1–3.2)
+## الحصيلة المعملية للتجارب الأربع عشرة | Empirical Benchmark Suite (v1.0, v2.0 & v3.0.0)
 
-تخضع جميع ملفات المستودع (32 ملفاً برمجياً) لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
+تخضع جميع ملفات المستودع (38 ملفاً برمجياً) لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
 
 | # | الاختبار المعملي (`Benchmark`) | السكريبت التنفيذي | التحدي وحجم البيانات | الأبعاد النشطة النهائية ($D_{\text{active}}$) | توفير السعة / الذاكرة | الدقة بعد التجميد ($W_0$ فقط) | النتيجة الفيزيائية البارزة |
 | :-: | :--- | :--- | :--- | :--- | :---: | :---: | :--- |
@@ -76,6 +78,7 @@
 | **11** | **اللدونة ثلاثية العوامل والضبط بالمكافأة (`v2.0 Milestone 2.5`)** | [`benchmarks/bench_v2_reward_alignment.py`](./benchmarks/bench_v2_reward_alignment.py) | `12` معضلة سلوكية منحازة `5:1` + `300` قصة عامة (`Train=255`, `Val=45`, `V=2,048`) | أبعاد موحدة `[256]*4` بصلابة انتقائية وعزل عام | **`0.00 MB`** زيادة عند التجميد (`6.54 MB`) في **`3.674s`** (`Zero-RL`) | السلوك المواءم **`0.00% -> 100.00%`**، المرفوض **`91.67% -> 0.00%`**، المعرفة العامة **`91.29% Val`** (`PPL 1.51`) | إذابة `k_rej` (**`-89.1%`**) وقفل `k_pref` (**`+570.5%`**) مع عزل عام (`-0.3%`)، `RMS = 1.2000`، وكيانات **`100% (12/12)`** |
 | **12** | **النوى المدمجة، DFA المفكك، وذاكرة $O(1)$ (`v3.0 Phase 3.1`)** | [`benchmarks/bench_v3_kernels_speed.py`](./benchmarks/bench_v3_kernels_speed.py) | `394` قصة إنجليزية (`V=2,048 -> 32,000`) عبر `4L/12L` مع أمان `BF16` (`Kahan`) | `[256]*4` و `[256]*12` مع الكتل النشطة $U/N$ و `FactorizedHighwayDFA` | **`0.00 MB`** تخصيص تحديث (`97.70 MB` خطوة مقابل `226.70 MB`) و **`99.20%`** توفير DFA (`32K`) | **`90.88%` (`4L`)** و **`92.38%` (`12L Fac`, `PPL 1.67`)**؛ وتطابق **`100.00%`** لذاكرة $O(1)$ | تسريع تدريب **`1.60x`** (`19,450 tok/s`)، بث DFA **`8.09x`**، توليد $O(1)$ حتى **`7.31x`** (`100%` تطابق)، و`BF16 Kahan Cos=0.936` (`0 NaN`) |
 | **13** | **الإعدادات اليدوية والنموذج الإنتاجي الموحد (`v3.0 Phase 3.2`)** | [`benchmarks/bench_v3_production_model.py`](./benchmarks/bench_v3_production_model.py) | تقدير بصمة `1.66M -> 7.11B` + تدريب وتجميد وضغط + استئناف `FP32/BF16` | نمو من `d_init=64 -> [128]*6` ومؤشرات `anchor_k` على مقياس `7B` | توفير **`55.3%`** (`6.44 -> 2.87 MB`) و**`33.3%`** بوضع `anchor_k` (`19.71 -> 13.14 GB`) | **`92.62%`** (`Frozen W0` دون أي هبوط عن `92.62%`، `Val PPL=1.82`) | مطابقة استئناف **`0.00e+00`** (`FP32` و `BF16`)، استدلال $O(1)$ **`2.64x`** (`100%` تطابق)، و`100%` اتساق كيانات |
+| **14** | **التدريب السحابي المقاوم للانقطاع و`MMap` (`v3.0 Phase 3.3`)** | [`benchmarks/bench_v3_trainer_fault_tolerance.py`](./benchmarks/bench_v3_trainer_fault_tolerance.py) | تدفق `2.11M` رمز + قتل منتصف الحقبة + إتلاف (`truncate/bitflip`) + `SIGTERM` | `SSENNConfig` + `AtomicCheckpointVault` (`SHA-256`) + `MMapTokenDataset` | ذاكرة وصفية **`1.93 KB`** (`O(1)`) ومؤقت تدفق **`0.28 MB`** لملف `4.03 MB` | **`90.62%`** (قتل مفاجئ) و **`92.62%`** (تعافي `backup`، `PPL 1.87`) و **`90.54%`** (`best_frozen_w0.pt`) | تدفق **`32.23M tok/s`**، مطابقة **`0.00e+00`** عبر `FP32/BF16`، وتعافٍ ذاتي **`100%`** |
 
 ---
 
@@ -101,6 +104,12 @@ next-23-MTL/
 │   ├── model_scaled.py               # ScaledSpringNetwork (1.5M-5M Vectorized + Milestones 2.1–2.5)
 │   ├── config_v3.py                  # v3.0 Phase 3.2 explicit manual SSENNConfig & zero-alloc estimator
 │   └── model_v3_production.py        # v3.0 Phase 3.2 unified SSENNProductionModel (FP32/BF16, compact freeze)
+├── trainer/                          # حزمة التدريب السحابي المقاوم للأعطال وواجهة سطر الأوامر (v3.0 Phases 3.3–3.4)
+│   ├── __init__.py
+│   ├── mmap_dataset.py               # BinaryShardBuilder, MMapTokenDataset (O(1) RAM) & ResumableBatchStreamer
+│   ├── checkpoint_vault.py           # AtomicCheckpointVault (SHA-256 + backup fallback) & SIGTERM watchdog
+│   ├── colab_orchestrator.py         # ElasticCloudTrainer (mid-epoch resume, non-destructive best_frozen_w0.pt)
+│   └── cli.py                        # Unified CLI: python -m trainer.cli {estimate,prepare-data,train,generate}
 ├── benchmarks/                       # حزمة التجارب المعملية والبيانات
 │   ├── __init__.py
 │   ├── corpus_data.py                # Tiered Arabic corpora (12, 25, 50, 100 sentences & 8 paragraphs)
@@ -116,13 +125,15 @@ next-23-MTL/
 │   ├── bench_v2_deep_block_sparse.py # v2.0 Milestone 2.4: Block-sparse capsules (B=16) & 12-layer deep highway scaling
 │   ├── bench_v2_reward_alignment.py  # v2.0 Milestone 2.5: Reward-modulated three-factor plasticity & RL-free alignment
 │   ├── bench_v3_kernels_speed.py     # v3.0 Phase 3.1: Fused in-place kernels, Factorized DFA, O(1) cache & BF16 audit
-│   └── bench_v3_production_model.py  # v3.0 Phase 3.2: Manual config estimator, compact freeze & checkpoint resume parity
+│   ├── bench_v3_production_model.py  # v3.0 Phase 3.2: Manual config estimator, compact freeze & checkpoint resume parity
+│   └── bench_v3_trainer_fault_tolerance.py # v3.0 Phase 3.3: MMap O(1), Kill/Corrupt/SIGTERM recovery parity
 ├── tests/                            # حزمة التحقق الصارم وفحص AST
 │   ├── __init__.py
-│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (32 files, 11 tests)
-├── docs/                             # الأوراق البحثية وسجل الإصلاحات وخارطة الطريق
+│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (38 files, 13 tests)
+├── docs/                             # الأوراق البحثية وسجل الإصلاحات وأدلة الإنتاج
+│   ├── V3_PRODUCTION_TRAINING_GUIDE.md # v3.0.0 Bilingual Production Manual (Google Colab, 5TB Drive, 15M-7B+ Scaling)
 │   ├── RESEARCH_PAPER_SS_ENN.md      # Full technical paper, equations, empirical tables & reproducibility
-│   ├── V2_ENGINEERING_LOG_AND_FIXES.md # Detailed v2.0 Milestones 2.1–2.5 physics upgrades & audit
+│   ├── V2_ENGINEERING_LOG_AND_FIXES.md # Detailed v2.0 & v3.0 Phases 3.1–3.4 engineering upgrades & audit
 │   ├── LIMITATIONS_AND_V2_ROADMAP.md # Critical scaling analysis & SS-ENN v2.0 execution roadmap
 │   └── SPEC_SPRING_MVP.md            # Core mathematical & architectural specification
 ├── .gitignore
@@ -148,7 +159,22 @@ python tests/test_suite.py
 python train_eval.py
 ```
 
-### 3. تشغيل الاختبارات المعملية الثلاث عشرة (Run All v1.0, v2.0 & v3.1–3.2 Benchmarks)
+### 3. واجهة الإطلاق الإنتاجية الموحدة (`v3.0 Unified CLI`) — سطر واحد للتقدير، التجهيز، التدريب، والتوليد
+```bash
+# 1) فحص الذاكرة والتوصية بالعتاد قبل حجز الـ GPU (مثال 7B مع anchor_k)
+python -m trainer.cli estimate --vocab-size 32000 --num-layers 32 --d-init 3072 --d-max 6656 --delta-d 512 --dtype bfloat16 --kahan-mode anchor_k
+
+# 2) تجهيز البيانات الثنائية (uint16 / SHA-256)
+python -m trainer.cli prepare-data --builtin-tinystories --out-dir ./shards_data --vocab-size 2048 --seq-len 36
+
+# 3) التدريب المقاوم للانقطاع والاستئناف التلقائي (--auto-resume)
+python -m trainer.cli train --data-dir ./shards_data --vault-dir ./ssenn_vault --epochs 14 --ckpt-every-steps 20 --auto-resume
+
+# 4) التوليد السريع بذاكرة O(1) من النموذج المجمّد best_frozen_w0.pt
+python -m trainer.cli generate --vault-dir ./ssenn_vault --prompt "Once upon a time" --max-new-tokens 40
+```
+
+### 4. تشغيل الاختبارات المعملية الأربع عشرة (`Run All v1.0, v2.0 & v3.0 Benchmarks`)
 ```bash
 # 1. Capacity & Saturation Benchmark (12 -> 25 -> 50 sentences)
 python benchmarks/bench_capacity.py
@@ -185,15 +211,19 @@ python benchmarks/bench_v3_kernels_speed.py
 
 # 12. Explicit Manual Config, Unified Production Model & Bitwise Resume Parity (v3.0 Phase 3.2)
 python benchmarks/bench_v3_production_model.py
+
+# 13. Fault-Tolerant Cloud Trainer, Atomic Vault, Corrupt Backup Recovery & MMap Streamer (v3.0 Phase 3.3)
+python benchmarks/bench_v3_trainer_fault_tolerance.py
 ```
 
 ---
 
-## التوثيق العلمي وخارطة الطريق | Research Documentation & v2.0 Roadmap
+## التوثيق العلمي وأدلة الإنتاج | Research Documentation & Production Manual
 
-- **[الورقة البحثية المتكاملة (`docs/RESEARCH_PAPER_SS_ENN.md`)](./docs/RESEARCH_PAPER_SS_ENN.md):** الاشتقاق النظري لقوانين النابض الثلاثة، معادلات التوجيه المباشر (`DFA`)، التجارب الإحدى عشرة الكاملة، وتحليل ظاهرة التشكيل الذاتي وترشيح الضوضاء عبر نقطة الارتكاز (`Anchor Denoising Effect`).
-- **[سجل الإصلاحات والترقيات الفيزيائية للإصدار الثاني (`docs/V2_ENGINEERING_LOG_AND_FIXES.md`)](./docs/V2_ENGINEERING_LOG_AND_FIXES.md):** التوثيق الرياضي والبرمجي الكامل لأطوار **`v2.0 Milestones 2.1–2.5`** (معالجة انجراف الكيانات، تفتت الصلابة الدفعية، طور النوم المزدوج، إعادة تدوير الخلايا، الدرع التكعيبي، بوابة الجموح الانتقالية، الطيف الهرمي للصلابة، تطبيع الطاقة الموضعي، التعميم التركيبي الصفري، الكبسولات الكتلية المتفرقة `B=16`، التوسع العميق لـ 12 طبقة، واللدونة ثلاثية العوامل بالمكافأة).
-- **[وثيقة الحدود المعمارية وخارطة طريق الإصدار الثاني (`docs/LIMITATIONS_AND_V2_ROADMAP.md`)](./docs/LIMITATIONS_AND_V2_ROADMAP.md):** مراجعة نقدية شاملة للسبع عقبات القياسية نحو نماذج `1B` ومصفوفة التقدم التنفيذية لأطوار `v2.0`.
+- **[الدليل الهندسي الشامل للتدريب الإنتاجي على Google Colab & Drive (`docs/V3_PRODUCTION_TRAINING_GUIDE.md`)](./docs/V3_PRODUCTION_TRAINING_GUIDE.md):** الدليل الكامل للإصدار الثالث **`v3.0.0`** شاملاً ربط `5TB Google Drive`، تحضير شظايا `mmap`، جدول الأبعاد اليدوية من `15M` إلى `7B+` (`full` vs `anchor_k`)، المراقبة عبر `training_telemetry.jsonl`، والتوليد بذاكرة $O(1)$.
+- **[الورقة البحثية المتكاملة (`docs/RESEARCH_PAPER_SS_ENN.md`)](./docs/RESEARCH_PAPER_SS_ENN.md):** الاشتقاق النظري لقوانين النابض الثلاثة، معادلات التوجيه المباشر (`DFA`)، التجارب الكاملة للإصدارات `v1.0–v3.0`، وظاهرة التشكيل الذاتي وترشيح الضوضاء عبر نقطة الارتكاز (`Anchor Denoising Effect`).
+- **[سجل الإصلاحات والترقيات الفيزيائية وسجلات الإنتاج (`docs/V2_ENGINEERING_LOG_AND_FIXES.md`)](./docs/V2_ENGINEERING_LOG_AND_FIXES.md):** التوثيق الرياضي والبرمجي التفصيلي لمراحل **`v2.0 (2.1–2.5)`** و**`v3.0 (3.1–3.4)`** وكافة الجداول المعملية.
+- **[وثيقة الحدود المعمارية وخارطة طريق الإصدار الثاني (`docs/LIMITATIONS_AND_V2_ROADMAP.md`)](./docs/LIMITATIONS_AND_V2_ROADMAP.md):** مراجعة نقدية شاملة للسبع عقبات القياسية نحو نماذج `1B` ومصفوفة التقدم التنفيذية.
 - **[مواصفات النواة الأساسية (`docs/SPEC_SPRING_MVP.md`)](./docs/SPEC_SPRING_MVP.md):** وثيقة المواصفات الأولية والقيود الصارمة للنظام.
 
 ---

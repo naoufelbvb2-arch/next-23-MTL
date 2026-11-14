@@ -521,29 +521,81 @@
 
 ---
 
-## 11. طريقة إعادة الإنتاج والتحقق (`Reproducibility`)
+## 11. المرحلة 3.3 (`v3.0 Phase 3.3`): إطار التدريب السحابي المقاوم للانقطاع وتدفق الخرائط الذاكرية (`trainer/`)
+
+تمتد المعمارية الإنتاجية عبر حزمة **`trainer/`** المستقلة لإدارة تدريب الشرائح الضخمة والتعافي الذاتي من انقطاع الجلسات السحابية (`Colab / Spot VMs`) عبر [`trainer/mmap_dataset.py`](../trainer/mmap_dataset.py) و[`trainer/checkpoint_vault.py`](../trainer/checkpoint_vault.py) و[`trainer/colab_orchestrator.py`](../trainer/colab_orchestrator.py) مع التحقق الكامل عبر [`benchmarks/bench_v3_trainer_fault_tolerance.py`](../benchmarks/bench_v3_trainer_fault_tolerance.py) (**`37` ملفاً برمجياً** حتى المرحلة 3.3 بـ `0 backward/grad`):
+
+### 11.1 الركائز الهندسية للمرحلة 3.3
+1. **الشرائح الثنائية والخرائط الذاكرية $O(1)$ (`BinaryShardBuilder`, `MMapTokenDataset`, `ResumableBatchStreamer`):**
+   - تغليف متجهي لشرائح `uint16`/`uint32` مع ملف وصفي `.meta.json` وبصمة `SHA-256`، ثم رسم خرائط قراءة فقط عبر `numpy.memmap(mode="r")` مع خيط جلب مسبق محدود Queue (`prefetch_batches`) ومؤشر حتمي (`epoch`, `batch_cursor`, `epoch_rng_seed`)، وإغلاق صريح للمقابض لتجنب أقفال Windows.
+2. **خزنة الحفظ الذري ثنائي الجيل وصائد المقاطعة (`AtomicCheckpointVault`, `PreemptionSignalHandler`):**
+   - حفظ مرحلي ذري: `.tmp` $\to$ `flush()` + `os.fsync()` $\to$ تدوير النسخة السابقة إلى `checkpoint_backup.pt` $\to$ `os.replace()` إلى `checkpoint_latest.pt` داخل غلاف ممهور ببصمة `SHA-256`، مع ارتداد ذاتي تلقائي عند أي قطع أو عطب في البتات (`truncate` / `bitflip`)، وتثبيت حارس إشارات `SIGINT`/`SIGTERM`.
+3. **المنسق السحابي (`ElasticCloudTrainer`):**
+   - استئناف حتمي من منتصف الحقبة يحفظ مجمعات خسارة الحقبة الجارية (`epoch_accum`) كي تتطابق قرارات `end_epoch` وتوليد الخلايا حرفياً مع التشغيل المتصل (`0.00e+00`)، مع استنساخ وتجميد غير مدمر لأفضل نموذج إلى `best_frozen_w0.pt` وسجل بث `training_telemetry.jsonl`.
+
+### 11.2 الجداول التجريبية الأربعة للمرحلة 3.3 ([`benchmarks/bench_v3_trainer_fault_tolerance.py`](../benchmarks/bench_v3_trainer_fault_tolerance.py))
+*(AST Zero-Autograd Verification: `PASS` — `37 Python files verified`)*
+
+#### الجدول (1): كفاءة `MMapTokenDataset (numpy.memmap)` ومُتدفّق `ResumableBatchStreamer`
+| Shard Workload | Tokens | Disk MB | Meta RAM | Stream Peak | Stream `tok/s` | Cursor Parity |
+| :--- | ---: | ---: | ---: | ---: | ---: | :---: |
+| `TinyStories Shard (uint16)` | `10,508` | `0.02` | `1.94 KB` | `0.03 MB` | `1,399,167.9` | **`100.00%`** |
+| `Scale 2.1M-Tok Shard (uint16)` | `2,113,536` | `4.03` | **`1.93 KB`** | `0.28 MB` | **`32,227,138.0`** | **`100.00%`** |
+
+#### الجدول (2): مطابقة البتّ بين التشغيل المتصل والإجهاض المفاجئ في منتصف الحقبة (`auto_resume=True`)
+| Precision | Kill -> Recv | Epoch / Cursor | Pre-Freeze Diff | Frozen `W0` Diff | Val Acc (PPL) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **`float32 (off)`** | `Step 58 -> 55` | `Ep7 / b=1` | **`0.00e+00`** | **`0.00e+00`** | `90.62% (1.99)` |
+| **`bfloat16 (anchor_k)`** | `Step 14 -> 10` | `Ep2 / b=1` | **`0.00e+00`** | **`0.00e+00`** | `28.30% (53.38)` |
+
+#### الجدول (3): التعافي الذاتي عند إتلاف `checkpoint_latest.pt` والارتداد إلى `checkpoint_backup.pt`
+| Injected Fault Mode | Detected | Fallback Source | Recv -> End | Val Acc | Val PPL | Finite |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`truncate`** | `True` | **`backup`** | `20 -> 126` | `92.62%` | `1.87` | **`True`** |
+| **`bitflip`** | `True` | **`backup`** | `20 -> 126` | `92.62%` | `1.87` | **`True`** |
+
+#### الجدول (4): حارس المقاطعة `SIGTERM`، وتصدير `best_frozen_w0.pt`، وسجل `training_telemetry.jsonl`
+- **مقاطعة `SIGTERM` الفعلية (`os_native=True`):** `status='preempted' @ Step 22` | `emergency_saves=1` | استئناف سلس `source='latest' @ Step 22 -> Step 126`.
+- **تصدير أفضل نموذج مضغوط (`best_frozen_w0.pt`):** `exists=True` | الحجم **`4372.2 KB`** | `frozen=True` | **`Val Acc 90.54% (PPL 2.06)`**.
+- **بث القياسات (`training_telemetry.jsonl`):** `records=30` | الأحداث: `['best_frozen_w0_exported', 'checkpoint_resumed', 'emergency_preemption_save', 'epoch_end']`.
+
+---
+
+## 12. المرحلة 3.4 والأخيرة (`v3.0 Phase 3.4`): واجهة الإطلاق الموحدة (`trainer/cli.py`) ودليل الإنتاج السحابي (`v3.0.0`)
+
+اكتمل الإصدار الثالث بتوحيد خط الإنتاج عبر سطر الأوامر [`trainer/cli.py`](../trainer/cli.py) مع إضافة واجهة التدوين والتحميل (`save`/`load`) في [`engine/tokenizer.py`](../engine/tokenizer.py) وإصدار الدليل الشامل [`docs/V3_PRODUCTION_TRAINING_GUIDE.md`](./V3_PRODUCTION_TRAINING_GUIDE.md):
+- **`python -m trainer.cli estimate`**: مقدّر بصمة ذاكرة وتوصية عتاد من `15M` (`0.069 GB`) إلى `7.11B` (`32.957 GB full` / `26.387 GB anchor_k`) بدون تخصيص مصفوفات.
+- **`python -m trainer.cli prepare-data`**: بناء `tokenizer.json` وشظايا التدريب والتحقق الثنائية (`uint16`/`uint32` مع `SHA-256`).
+- **`python -m trainer.cli train`**: تشغيل أو استئناف `ElasticCloudTrainer` تلقائياً عبر `--auto-resume` على CPU أو Colab GPU/TPU.
+- **`python -m trainer.cli generate`**: الاستدلال الفوري من `best_frozen_w0.pt` عبر ذاكرة $O(1)$ (`SpringInferenceCache`).
+- **التحقق الشامل:** اجتياز الاختبار **`test_13_phase_3_4_unified_cli_workflow_end_to_end`** ضمن حزمة **`13/13`** في [`tests/test_suite.py`](../tests/test_suite.py) وفحص **AST عبر `38` ملفاً برمجياً**.
+
+---
+
+## 13. طريقة إعادة الإنتاج والتحقق (`Reproducibility`)
 ```bash
-# 1. تشغيل معيار المرحلة 3.2 للنموذج الإنتاجي الموحد والإعدادات اليدوية ومطابقة الاستئناف
+# 1. سير العمل الإنتاجي الموحد عبر سطر الأوامر (CLI — v3.0 Phase 3.4)
+python -m trainer.cli estimate --vocab-size 32000 --num-layers 32 --d-init 3072 --d-max 6656 --delta-d 512 --dtype bfloat16 --kahan-mode anchor_k
+python -m trainer.cli prepare-data --builtin-tinystories --out-dir ./shards_tmp --vocab-size 2048 --seq-len 36
+python -m trainer.cli train --data-dir ./shards_tmp --vault-dir ./vault_tmp --epochs 14 --auto-resume
+python -m trainer.cli generate --vault-dir ./vault_tmp --prompt "Once upon a time" --max-new-tokens 30
+
+# 2. تشغيل معيار المرحلة 3.3 لخزنة الحفظ الذرية و X-MMap والتعافي الذاتي من الأعطال
+python benchmarks/bench_v3_trainer_fault_tolerance.py
+
+# 3. تشغيل معيار المرحلة 3.2 للنموذج الإنتاجي الموحد والإعدادات اليدوية ومطابقة الاستئناف
 python benchmarks/bench_v3_production_model.py
 
-# 2. تشغيل معيار المرحلة 3.1 لنوى التسريع العتادي و DFA المفكك وذاكرة الاستدلال O(1)
+# 4. تشغيل معيار المرحلة 3.1 لنوى التسريع العتادي و DFA المفكك وذاكرة الاستدلال O(1)
 python benchmarks/bench_v3_kernels_speed.py
 
-# 3. تشغيل معيار الطور 2.5 للتوجيه بالمكافأة ثلاثية العوامل والضبط السلوكي بعد التدريب
+# 5. تشغيل معايير v2.0 (المراحل 2.1 إلى 2.5)
+python benchmarks/bench_scale_english_cpu.py
+python benchmarks/bench_v2_sleep_continual.py
+python benchmarks/bench_v2_compositional_gen.py
+python benchmarks/bench_v2_deep_block_sparse.py
 python benchmarks/bench_v2_reward_alignment.py
 
-# 4. تشغيل معيار الطور 2.4 للكبسولات الكتلية المتفرقة (B=16) والتوسع العميق لـ 12 طبقة
-python benchmarks/bench_v2_deep_block_sparse.py
-
-# 5. تشغيل معيار الطور 2.3 للتعميم التركيبي الصفري، الصلابة الهرمية، وتطبيع الطاقة الموضعي
-python benchmarks/bench_v2_compositional_gen.py
-
-# 6. تشغيل معيار الطور 2.2 للتعلم المستمر عبر 4 مراحل، طور النوم المزدوج، وإعادة تدوير الخلايا
-python benchmarks/bench_v2_sleep_continual.py
-
-# 7. تشغيل معيار الطور 2.1 للمحرك المليوني والترقية الفيزيائية على المعالج المحلي
-python benchmarks/bench_scale_english_cpu.py
-
-# 8. تشغيل حزمة الاختبارات الصارمة (11 اختباراً) وفحص AST عبر جميع ملفات المستودع (32 ملفاً برمجياً)
+# 6. تشغيل حزمة الاختبارات الصارمة (13 اختباراً) وفحص AST عبر جميع ملفات المستودع (38 ملفاً برمجياً)
 python tests/test_suite.py
 ```

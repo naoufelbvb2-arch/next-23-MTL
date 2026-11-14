@@ -40,13 +40,14 @@ class TestSpringMVPArchitecture(unittest.TestCase):
         scan_dirs = [
             PROJECT_ROOT / "engine",
             PROJECT_ROOT / "models",
+            PROJECT_ROOT / "trainer",
             PROJECT_ROOT / "benchmarks",
         ]
         source_files = [PROJECT_ROOT / "train_eval.py"]
         for d in scan_dirs:
             source_files.extend(sorted(d.glob("*.py")))
 
-        self.assertGreaterEqual(len(source_files), 15, "Expected at least 15 Python files scanned")
+        self.assertGreaterEqual(len(source_files), 36, "Expected at least 36 Python files scanned")
 
         for file_path in source_files:
             content = file_path.read_text(encoding="utf-8")
@@ -512,6 +513,211 @@ class TestSpringMVPArchitecture(unittest.TestCase):
             self.assertEqual(row["frozen_weight_diff"], 0.0)
             self.assertEqual(row["logit_diff"], 0.0)
             self.assertEqual(row["rollout_parity_pct"], 100.0)
+
+    def test_12_phase_3_3_atomic_vault_mmap_and_fault_tolerant_resume(self):
+        """
+        Phase 3.3 Gate: Verify O(1) RAM MMapTokenDataset & ResumableBatchStreamer
+        cursor parity, 0.00e+00 mid-epoch sudden kill resume parity across FP32
+        & BF16 (anchor_k), self-healing backup fallback on truncated/bit-flipped
+        checkpoints, real SIGTERM preemption save, and compacted best_frozen_w0.pt
+        export alongside Zero-Autograd AST verification across >= 36 files.
+        """
+        from benchmarks.bench_v3_trainer_fault_tolerance import (
+            run_v3_trainer_fault_tolerance_benchmark,
+        )
+
+        res = run_v3_trainer_fault_tolerance_benchmark(verbose=False)
+        self.assertTrue(res["ast_zero_autograd_ok"])
+        self.assertGreaterEqual(res["ast_files_verified"], 36)
+
+        t1 = res["table1"]
+        self.assertEqual(len(t1), 2)
+        for row in t1:
+            self.assertTrue(row["sha256_ok"])
+            self.assertEqual(row["cursor_parity_pct"], 100.0)
+            self.assertLess(row["meta_ram_kb"], 16.0)
+            self.assertGreater(row["stream_tok_s"], 10_000.0)
+
+        t2 = res["table2"]
+        self.assertEqual(len(t2), 2)
+        for row in t2:
+            self.assertEqual(row["pre_freeze_diff"], 0.0)
+            self.assertEqual(row["frozen_w0_diff"], 0.0)
+            self.assertEqual(row["val_parity_pct"], 100.0)
+        self.assertGreaterEqual(t2[0]["val_acc_pct"], 85.0)
+        self.assertGreater(t2[1]["val_acc_pct"], 15.0)
+
+        t3 = res["table3"]
+        self.assertEqual(len(t3), 2)
+        for row in t3:
+            self.assertTrue(row["primary_corrupted"])
+            self.assertEqual(row["resume_source"], "backup")
+            self.assertEqual(row["recovered_step"], 20)
+            self.assertTrue(row["finite_ok"])
+            self.assertGreaterEqual(row["final_val_acc"], 85.0)
+
+        t4 = res["table4"]
+        self.assertEqual(t4["preempt_status"], "preempted")
+        self.assertEqual(t4["preempt_step"], 22)
+        self.assertEqual(t4["emergency_saves"], 1)
+        self.assertEqual(t4["post_resume_source"], "latest")
+        self.assertEqual(t4["post_resume_step"], 22)
+        self.assertTrue(t4["best_frozen_w0_exists"])
+        self.assertTrue(t4["best_frozen_is_frozen"])
+        self.assertTrue(t4["best_frozen_has_no_train_bufs"])
+        self.assertGreaterEqual(t4["best_frozen_val_acc"], 85.0)
+        self.assertIn("emergency_preemption_save", t4["telemetry_events"])
+        self.assertIn("checkpoint_resumed", t4["telemetry_events"])
+        self.assertIn("best_frozen_w0_exported", t4["telemetry_events"])
+        self.assertIn("epoch_end", t4["telemetry_events"])
+
+    def test_13_phase_3_4_unified_cli_workflow_end_to_end(self):
+        """
+        Phase 3.4 Gate: Exercise all 4 subcommands of `python -m trainer.cli`
+        (`estimate`, `prepare-data`, `train`, `generate`) end-to-end on clean
+        temporary storage alongside full AST Zero-Autograd verification across
+        >= 38 Python files.
+        """
+        import io
+        import json
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+        from trainer.cli import main as cli_main
+        from trainer.checkpoint_vault import AtomicCheckpointVault
+        from benchmarks.bench_scale_english_cpu import verify_all_repo_files_zero_autograd
+
+        ast_ok, n_files = verify_all_repo_files_zero_autograd()
+        self.assertTrue(ast_ok)
+        self.assertGreaterEqual(n_files, 38)
+
+        with tempfile.TemporaryDirectory(prefix="ssenn_cli_e2e_") as tmp_dir_str:
+            tmp_root = Path(tmp_dir_str)
+            data_dir = tmp_root / "shards"
+            vault_dir = tmp_root / "vault"
+
+            # 1. `estimate` (verify JSON analytical table + recommendation for 7B anchor_k)
+            buf_est = io.StringIO()
+            with redirect_stdout(buf_est):
+                rc = cli_main(
+                    [
+                        "estimate",
+                        "--vocab-size", "32000",
+                        "--num-layers", "32",
+                        "--d-init", "3072",
+                        "--d-max", "6656",
+                        "--delta-d", "512",
+                        "--block-size", "16",
+                        "--top-k-blocks", "32",
+                        "--max-seq-len", "2048",
+                        "--attn-top-k", "16",
+                        "--dtype", "bfloat16",
+                        "--kahan-mode", "anchor_k",
+                        "--json",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            est_data = json.loads(buf_est.getvalue())
+            self.assertEqual(est_data["kahan_mode"], "anchor_k")
+            self.assertAlmostEqual(est_data["kahan_savings_vs_full_pct"], 100.0 / 3.0, places=2)
+            self.assertGreater(est_data["max_train_params"], 7_000_000_000)
+            self.assertIn("A100", est_data["recommended_hardware"])
+
+            # 2. `prepare-data` (tokenize built-in TinyStories & build SHA-256 binary shards)
+            buf_prep = io.StringIO()
+            with redirect_stdout(buf_prep):
+                rc = cli_main(
+                    [
+                        "prepare-data",
+                        "--builtin-tinystories",
+                        "--out-dir", str(data_dir),
+                        "--vocab-size", "2048",
+                        "--seq-len", "36",
+                        "--target-min-tokens", "12000",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertTrue((data_dir / "tokenizer.json").exists())
+            self.assertTrue((data_dir / "train_shard.bin").exists())
+            self.assertTrue((data_dir / "train_shard.meta.json").exists())
+            self.assertTrue((data_dir / "val_shard.bin").exists())
+            self.assertTrue((data_dir / "val_shard.meta.json").exists())
+
+            # 3. `train` (run Phase 1 up to 3 epochs, then auto-resume to 12 epochs)
+            buf_tr1 = io.StringIO()
+            with redirect_stdout(buf_tr1):
+                rc = cli_main(
+                    [
+                        "train",
+                        "--data-dir", str(data_dir),
+                        "--vault-dir", str(vault_dir),
+                        "--num-layers", "6",
+                        "--d-init", "64",
+                        "--d-max", "128",
+                        "--delta-d", "16",
+                        "--block-size", "16",
+                        "--top-k-blocks", "2",
+                        "--max-seq-len", "64",
+                        "--attn-top-k", "8",
+                        "--dtype", "float32",
+                        "--kahan-mode", "off",
+                        "--epochs", "3",
+                        "--batch-size", "32",
+                        "--ckpt-every-steps", "5",
+                        "--quiet",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertIn("resumed=False", buf_tr1.getvalue())
+
+            buf_tr2 = io.StringIO()
+            with redirect_stdout(buf_tr2):
+                rc = cli_main(
+                    [
+                        "train",
+                        "--data-dir", str(data_dir),
+                        "--vault-dir", str(vault_dir),
+                        "--num-layers", "6",
+                        "--d-init", "64",
+                        "--d-max", "128",
+                        "--delta-d", "16",
+                        "--block-size", "16",
+                        "--top-k-blocks", "2",
+                        "--max-seq-len", "64",
+                        "--attn-top-k", "8",
+                        "--dtype", "float32",
+                        "--kahan-mode", "off",
+                        "--epochs", "12",
+                        "--batch-size", "32",
+                        "--ckpt-every-steps", "5",
+                        "--auto-resume",
+                        "--quiet",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            tr2_out = buf_tr2.getvalue()
+            self.assertIn("resumed=True", tr2_out)
+            self.assertTrue((vault_dir / "best_frozen_w0.pt").exists())
+            telemetry = AtomicCheckpointVault(vault_dir).read_telemetry()
+            self.assertGreater(len(telemetry), 0)
+
+            # 4. `generate` (O(1) stateful cache inference from compacted best_frozen_w0.pt)
+            buf_gen = io.StringIO()
+            with redirect_stdout(buf_gen):
+                rc = cli_main(
+                    [
+                        "generate",
+                        "--vault-dir", str(vault_dir),
+                        "--prompt", "Once upon a time",
+                        "--max-new-tokens", "20",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            gen_out = buf_gen.getvalue()
+            self.assertIn("O(1) Stateful Cache", gen_out)
+            self.assertIn("Frozen=True", gen_out)
+            self.assertIn("Once upon a time", gen_out)
+            self.assertIn("tok/s", gen_out)
 
 
 if __name__ == "__main__":

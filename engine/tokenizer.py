@@ -5,8 +5,10 @@ Supports special tokens (<pad>, <bos>, <eos>, <unk>), subword fallback for rare/
 morphological variants, and vectorized batch encoding/decoding.
 Strictly zero autograd / zero backward().
 """
+import json
 import re
 from collections import Counter
+from pathlib import Path
 
 
 class EnglishSubwordTokenizer:
@@ -236,3 +238,40 @@ class EnglishSubwordTokenizer:
                 for start in range(0, len(ids) - seq_len + 1, max(1, seq_len - 4)):
                     windows.append(ids[start : start + seq_len])
         return windows
+
+    def to_dict(self) -> dict:
+        """Serializes tokenizer configuration and vocabulary cleanly to JSON dict."""
+        ordered_vocab = [
+            self.id_to_token[idx] for idx in sorted(self.id_to_token.keys())
+        ]
+        return {
+            "format_version": "ssenn_tokenizer_1.0",
+            "max_vocab_size": int(self.max_vocab_size),
+            "vocab": ordered_vocab,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "EnglishSubwordTokenizer":
+        """Restores tokenizer deterministically from a serialized dictionary."""
+        tok = cls(max_vocab_size=int(data["max_vocab_size"]))
+        tok.token_to_id.clear()
+        tok.id_to_token.clear()
+        tok.word_cache.clear()
+        for idx, token in enumerate(data["vocab"]):
+            tok.token_to_id[token] = idx
+            tok.id_to_token[idx] = token
+        return tok
+
+    def save(self, path: str | Path) -> Path:
+        """Saves tokenizer vocabulary deterministically to `tokenizer.json`."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        return p
+
+    @classmethod
+    def load(cls, path: str | Path) -> "EnglishSubwordTokenizer":
+        """Loads tokenizer cleanly from a saved `tokenizer.json` file."""
+        p = Path(path)
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return cls.from_dict(data)
