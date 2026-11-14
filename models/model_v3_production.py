@@ -43,6 +43,7 @@ from engine.kernels import (
     batch_active_block_union_update,
     fused_spring_update_inplace,
     indexed_block_activate_highway,
+    normalize_token_sequences,
 )
 from .config_v3 import SSENNConfig, _VALID_DTYPES
 
@@ -572,27 +573,34 @@ class SSENNProductionModel(nn.Module):
     @torch.no_grad()
     def calibrate_salience_from_tokens(
         self,
-        token_sequences: list[list[int]],
+        token_sequences,
         pad_id: int = 0,
-        bos_id: int = 1,
-        eos_id: int = 2,
+        bos_id: int | None = 1,
+        eos_id: int | None = 2,
     ) -> dict[str, float]:
         """Law 1: Clipped Log-Salience s(v) in [0.70, 1.80] & EMA Capacitor alpha(v)."""
+        norm_seqs = normalize_token_sequences(token_sequences)
+        pad_tok = int(pad_id)
+        bos_tok = int(bos_id) if bos_id is not None else None
+        eos_tok = int(eos_id) if eos_id is not None else None
+        special_ids = {t for t in (pad_tok, bos_tok, eos_tok) if t is not None}
+
         counts = torch.zeros(self.vocab_size, dtype=torch.float32)
         doc_freq = torch.zeros(self.vocab_size, dtype=torch.float32)
         burst_freq = torch.zeros(self.vocab_size, dtype=torch.float32)
         unigram_cross_burst = torch.zeros(self.vocab_size, dtype=torch.float32)
         bigram_df: dict[tuple[int, int], float] = {}
         bigram_cross_burst: dict[tuple[int, int], float] = {}
-        n_docs = max(len(token_sequences), 1)
+        n_docs = max(len(norm_seqs), 1)
 
-        for seq in token_sequences:
+        for seq in norm_seqs:
             seq_counts: dict[int, int] = {}
             uni_pos: dict[int, list[int]] = {}
             bi_pos: dict[tuple[int, int], list[int]] = {}
             prev_tid = -1
-            for pos, tid in enumerate(seq):
-                if 0 <= tid < self.vocab_size and tid not in (pad_id, bos_id, eos_id):
+            for pos, raw_tok in enumerate(seq):
+                tid = int(raw_tok)
+                if 0 <= tid < self.vocab_size and tid not in special_ids:
                     counts[tid] += 1.0
                     seq_counts[tid] = seq_counts.get(tid, 0) + 1
                     uni_pos.setdefault(tid, []).append(pos)
@@ -640,9 +648,12 @@ class SSENNProductionModel(nn.Module):
         else:
             salience = torch.ones(self.vocab_size, dtype=torch.float32)
 
-        salience[pad_id] = 0.0
-        salience[bos_id] = 0.70
-        salience[eos_id] = 0.80
+        if 0 <= pad_tok < self.vocab_size:
+            salience[pad_tok] = 0.0
+        if bos_tok is not None and 0 <= bos_tok < self.vocab_size:
+            salience[bos_tok] = 0.70
+        if eos_tok is not None and 0 <= eos_tok < self.vocab_size:
+            salience[eos_tok] = 0.80
         self.token_salience.copy_(salience.to(self.model_device))
 
         phrase_mask = phrase_burst_score >= 0.45
@@ -655,8 +666,10 @@ class SSENNProductionModel(nn.Module):
 
         rel_sal = ((salience - 0.70) / 1.10).clamp(0.0, 1.0)
         alpha = torch.where(salience >= 1.45, 0.38 + 0.12 * rel_sal, 0.004 * (rel_sal ** 2))
-        alpha[pad_id] = 0.0
-        alpha[bos_id] = 0.0
+        if 0 <= pad_tok < self.vocab_size:
+            alpha[pad_tok] = 0.0
+        if bos_tok is not None and 0 <= bos_tok < self.vocab_size:
+            alpha[bos_tok] = 0.0
         self.capacitor_alpha.copy_(alpha.to(self.model_device))
 
         seen_sal = salience[active_vocab]

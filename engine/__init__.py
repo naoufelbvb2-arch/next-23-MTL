@@ -15,6 +15,7 @@ from .kernels import (
     batch_active_block_union_update,
     FactorizedHighwayDFA,
     SpringInferenceCache,
+    normalize_token_sequences,
 )
 
 __all__ = [
@@ -33,4 +34,5 @@ __all__ = [
     "batch_active_block_union_update",
     "FactorizedHighwayDFA",
     "SpringInferenceCache",
+    "normalize_token_sequences",
 ]

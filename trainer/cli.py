@@ -262,7 +262,18 @@ def cmd_train(args: argparse.Namespace) -> int:
             raise ValueError(
                 f"Configured vocab_size ({vocab_size}) != shard vocab_size ({train_ds.vocab_size})"
             )
-        max_seq_len = int(max(args.max_seq_len, train_ds.seq_len))
+        if val_ds.seq_len != train_ds.seq_len:
+            raise ValueError(
+                f"Train shard seq_len ({train_ds.seq_len}) != val shard seq_len ({val_ds.seq_len})"
+            )
+        effective_seq_len = int(train_ds.seq_len)
+        if int(args.max_seq_len) < effective_seq_len:
+            print(
+                f"[CLI Notice] Raising --max-seq-len from {args.max_seq_len} to "
+                f"{effective_seq_len} to match shard seq_len.",
+                flush=True,
+            )
+        max_seq_len = int(max(args.max_seq_len, effective_seq_len))
         pad_id = int(train_ds.pad_id)
         bos_id = tokenizer.bos_id if tokenizer is not None else 1
         eos_id = tokenizer.eos_id if tokenizer is not None else 2
@@ -292,6 +303,8 @@ def cmd_train(args: argparse.Namespace) -> int:
             idxs = list(range(start, min(start + v_bs, n_val)))
             val_batches.append(val_ds.get_batch(idxs))
 
+        if args.sleep_min_epoch < 0:
+            raise ValueError(f"--sleep-min-epoch must be >= 0, got {args.sleep_min_epoch}")
         trainer = ElasticCloudTrainer(
             config=cfg,
             vault_dir=vault_dir,
@@ -299,6 +312,7 @@ def cmd_train(args: argparse.Namespace) -> int:
             checkpoint_every_seconds=args.ckpt_every_seconds,
             keep_best_frozen=True,
             sleep_every_epochs=args.sleep_every_epochs,
+            sleep_min_epoch=args.sleep_min_epoch,
             verbose=not args.quiet,
         )
 
@@ -332,6 +346,10 @@ def cmd_train(args: argparse.Namespace) -> int:
     print(
         f"  Status          : {res['status']} | Final Step: {res['final_global_step']} | "
         f"Throughput: {res['tok_s']:,.1f} tok/s"
+    )
+    print(
+        f"  Sequence & Sleep: shard_seq_len={effective_seq_len} | max_seq_len={max_seq_len} | "
+        f"sleep_every={args.sleep_every_epochs} (min_ep={args.sleep_min_epoch})"
     )
     print(
         f"  Resume State    : resumed={res['resumed']} (source={res['resume_source']}, "
@@ -481,7 +499,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--val-shard", type=str, default="val_shard", help="Validation shard basename.")
     p_train.add_argument("--epochs", type=int, default=14, help="Total target training epochs.")
     p_train.add_argument("--batch-size", type=int, default=32, help="Minibatch size B.")
-    p_train.add_argument("--seq-len", type=int, default=None, help="Optional check against shard seq_len.")
+    p_train.add_argument(
+        "--seq-len",
+        type=int,
+        default=None,
+        help="Optional check against shard seq_len (auto-inferred from shard meta.json when omitted).",
+    )
     p_train.add_argument("--prefetch-batches", type=int, default=2, help="Background prefetch queue depth.")
     p_train.add_argument("--ckpt-every-steps", type=int, default=20, help="Periodic checkpoint interval in steps.")
     p_train.add_argument("--ckpt-every-seconds", type=float, default=0.0, help="Periodic checkpoint interval in seconds.")
@@ -489,7 +512,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--sleep-every-epochs",
         type=int,
         default=0,
-        help="Run dual-stage offline sleep consolidation every N epochs (0 disables).",
+        help="Run dual-stage offline sleep consolidation every N epochs (default: 0 disables).",
+    )
+    p_train.add_argument(
+        "--sleep-min-epoch",
+        type=int,
+        default=0,
+        help="Minimum epoch required before periodic sleep consolidation triggers (default: 0).",
     )
     p_train.add_argument(
         "--auto-resume",

@@ -583,8 +583,13 @@ class TestSpringMVPArchitecture(unittest.TestCase):
         import tempfile
         from contextlib import redirect_stdout
         from pathlib import Path
+        from engine.tokenizer import EnglishSubwordTokenizer
+        from models.config_v3 import SSENNConfig
+        from models.model_scaled import ScaledSpringNetwork
+        from models.model_v3_production import SSENNProductionModel
         from trainer.cli import main as cli_main
         from trainer.checkpoint_vault import AtomicCheckpointVault
+        from trainer.mmap_dataset import BinaryShardBuilder, MMapTokenDataset
         from benchmarks.bench_scale_english_cpu import verify_all_repo_files_zero_autograd
 
         ast_ok, n_files = verify_all_repo_files_zero_autograd()
@@ -718,6 +723,129 @@ class TestSpringMVPArchitecture(unittest.TestCase):
             self.assertIn("Frozen=True", gen_out)
             self.assertIn("Once upon a time", gen_out)
             self.assertIn("tok/s", gen_out)
+
+            # 5. Hotfix v3.0.1 Gate: Tensor vs List salience calibration parity & low hub vs high entity scores
+            tok_loaded = EnglishSubwordTokenizer.load(data_dir / "tokenizer.json")
+            with MMapTokenDataset(data_dir, shard_name="train_shard", verify_checksum=True) as ds_cal:
+                cal_n = min(len(ds_cal), 256)
+                x_cal, y_cal = ds_cal.get_batch(list(range(cal_n)))
+                tensor_seqs = torch.cat([x_cal, y_cal[:, -1:]], dim=1)
+                list_seqs = tensor_seqs.tolist()
+
+            cal_cfg = SSENNConfig(
+                vocab_size=tok_loaded.vocab_size,
+                num_layers=2,
+                d_init=32,
+                d_max=32,
+                delta_d=0,
+                block_size=16,
+                top_k_blocks=1,
+                max_seq_len=64,
+                attn_top_k=4,
+                dtype="float32",
+                kahan_mode="off",
+                seed=42,
+            )
+            m_list = SSENNProductionModel(cal_cfg)
+            m_tensor = SSENNProductionModel(cal_cfg)
+            m_list.calibrate_salience_from_tokens(
+                list_seqs, pad_id=tok_loaded.pad_id, bos_id=tok_loaded.bos_id, eos_id=tok_loaded.eos_id
+            )
+            m_tensor.calibrate_salience_from_tokens(
+                tensor_seqs, pad_id=tok_loaded.pad_id, bos_id=tok_loaded.bos_id, eos_id=tok_loaded.eos_id
+            )
+            self.assertEqual(float((m_list.token_salience - m_tensor.token_salience).abs().max().item()), 0.0)
+            self.assertEqual(float((m_list.capacitor_alpha - m_tensor.capacitor_alpha).abs().max().item()), 0.0)
+
+            s_list = ScaledSpringNetwork(
+                vocab_size=tok_loaded.vocab_size, num_layers=2, d_init=32, d_max=32,
+                delta_d=0, top_k=8, attn_top_k=4, max_seq_len=64, seed=42,
+            )
+            s_tensor = ScaledSpringNetwork(
+                vocab_size=tok_loaded.vocab_size, num_layers=2, d_init=32, d_max=32,
+                delta_d=0, top_k=8, attn_top_k=4, max_seq_len=64, seed=42,
+            )
+            s_list.calibrate_salience_from_tokens(
+                list_seqs, pad_id=tok_loaded.pad_id, bos_id=tok_loaded.bos_id, eos_id=tok_loaded.eos_id
+            )
+            s_tensor.calibrate_salience_from_tokens(
+                tensor_seqs, pad_id=tok_loaded.pad_id, bos_id=tok_loaded.bos_id, eos_id=tok_loaded.eos_id
+            )
+            self.assertEqual(float((s_list.token_salience - s_tensor.token_salience).abs().max().item()), 0.0)
+
+            the_id = tok_loaded.token_to_id["the"]
+            the_sal = float(m_tensor.token_salience[the_id].item())
+            self.assertLessEqual(the_sal, 0.75)
+            for entity_word in ("bird", "rabbit", "squirrel", "kitten"):
+                ent_id = tok_loaded.token_to_id[entity_word]
+                self.assertGreater(float(m_tensor.token_salience[ent_id].item()), 1.30)
+
+            # 6. Hotfix v3.0.1 Gate: BinaryShardBuilder long-paragraph strided chunking (> 3 * seq_len)
+            long_dir = tmp_root / "long_shards"
+            long_story = " ".join([
+                "Once upon a time in the green valley the little bird sang a sweet song.",
+                "Then the young rabbit hopped along the soft grass and found a fresh carrot.",
+                "Suddenly a gentle rain began to fall while the wise owl watched from oak.",
+                "Finally everyone returned home safely beside the quiet forest river."
+            ])
+            long_seq_len = 16
+            encoded_long = tok_loaded.encode(long_story, add_bos=True, add_eos=True)
+            self.assertGreater(len(encoded_long), 3 * long_seq_len)
+            long_meta = BinaryShardBuilder.build_from_stories(
+                stories=[long_story],
+                tokenizer=tok_loaded,
+                seq_len=long_seq_len,
+                output_dir=long_dir,
+                shard_name="long_chunk_shard",
+            )
+            self.assertGreaterEqual(int(long_meta["num_sequences"]), 4)
+            with MMapTokenDataset(long_dir, shard_name="long_chunk_shard", verify_checksum=True) as ds_long:
+                self.assertGreaterEqual(len(ds_long), 4)
+                x_last, y_last = ds_long[len(ds_long) - 1]
+                # Tail chunk preserves tokens from end of story (not discarded after first window)
+                self.assertIn(int(tok_loaded.eos_id), y_last.tolist())
+
+            # 7. Hotfix v3.0.1 Gate: CLI --seq-len conflict guard & automatic --max-seq-len raise notice
+            with self.assertRaises(ValueError):
+                cli_main([
+                    "train",
+                    "--data-dir", str(data_dir),
+                    "--vault-dir", str(tmp_root / "vault_mismatch"),
+                    "--seq-len", "99",
+                    "--quiet",
+                ])
+
+            buf_notice = io.StringIO()
+            with redirect_stdout(buf_notice):
+                rc = cli_main([
+                    "train",
+                    "--data-dir", str(data_dir),
+                    "--vault-dir", str(tmp_root / "vault_raise_seq"),
+                    "--num-layers", "2",
+                    "--d-init", "32",
+                    "--d-max", "32",
+                    "--delta-d", "0",
+                    "--block-size", "16",
+                    "--top-k-blocks", "1",
+                    "--max-seq-len", "16",
+                    "--attn-top-k", "4",
+                    "--dtype", "float32",
+                    "--kahan-mode", "off",
+                    "--epochs", "5",
+                    "--batch-size", "128",
+                    "--sleep-every-epochs", "2",
+                    "--sleep-min-epoch", "3",
+                    "--quiet",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertIn("Raising --max-seq-len from 16 to 36", buf_notice.getvalue())
+            self.assertIn("shard_seq_len=36 | max_seq_len=36", buf_notice.getvalue())
+            sleep_telemetry = [
+                rec
+                for rec in AtomicCheckpointVault(tmp_root / "vault_raise_seq").read_telemetry()
+                if rec.get("event") == "sleep_consolidation"
+            ]
+            self.assertEqual([rec["epoch"] for rec in sleep_telemetry], [4])
 
 
 if __name__ == "__main__":

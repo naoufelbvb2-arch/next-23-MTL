@@ -179,22 +179,34 @@ class BinaryShardBuilder:
         seq_len: int,
         output_dir: str | Path,
         shard_name: str = "train",
+        min_tail_tokens: int = 4,
     ) -> dict:
         """
         Tokenizes narrative stories identically to `build_minibatch_tensors`
-        (`add_bos=True`, `add_eos=True`, padded/trimmed to `seq_len + 1`) and
-        writes a binary shard + `.meta.json`.
+        (`add_bos=True`, `add_eos=True`), splits long paragraphs exceeding
+        `row_stride = seq_len + 1` into strided consecutive chunks (`stride = seq_len`
+        to preserve every token transition across windows, retaining tails with
+        `>= min_tail_tokens`), pads shorter sequences to `row_stride`, and writes
+        a binary shard + `.meta.json`.
         """
         sequences: list[list[int]] = []
         row_stride = int(seq_len) + 1
+        stride = max(int(seq_len), 1)
+        min_tail = max(1, int(min_tail_tokens))
         pad_id = int(tokenizer.pad_id)
         for story in stories:
             ids = tokenizer.encode(story, add_bos=True, add_eos=True)
-            if len(ids) < row_stride:
-                padded = ids + [pad_id] * (row_stride - len(ids))
+            if len(ids) <= row_stride:
+                row = ids if len(ids) == row_stride else (ids + [pad_id] * (row_stride - len(ids)))
+                sequences.append(row)
             else:
-                padded = ids[:row_stride]
-            sequences.append(padded)
+                for start in range(0, len(ids), stride):
+                    chunk = ids[start : start + row_stride]
+                    if start > 0 and len(chunk) < min_tail:
+                        break
+                    if len(chunk) < row_stride:
+                        chunk = chunk + [pad_id] * (row_stride - len(chunk))
+                    sequences.append(chunk)
         return cls.build_from_sequences(
             sequences=sequences,
             vocab_size=int(tokenizer.vocab_size),

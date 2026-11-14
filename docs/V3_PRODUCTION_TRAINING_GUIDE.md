@@ -1,5 +1,5 @@
-# دليل التدريب الإنتاجي الشامل على السحابة و Google Colab & Drive — SS-ENN v3.0
-**Comprehensive Production Training Manual for Google Colab, 5TB Google Drive Vaults & Local Acceleration (`v3.0`)**
+# دليل التدريب الإنتاجي الشامل على السحابة و Google Colab & Drive — SS-ENN v3.0.1
+**Comprehensive Production Training Manual for Google Colab, 5TB Google Drive Vaults & Local Acceleration (`v3.0.1`)**
 
 ---
 
@@ -73,6 +73,7 @@ if torch.cuda.is_available():
 
 يقوم الأمر الفرعي `prepare-data` بتدريب/تجهيز `EnglishSubwordTokenizer` (`tokenizer.json`) وتحويل المدونات النصية إلى شظايا ثنائية مضغوطة:
 - نوع البيانات تلقائياً **`uint16`** إذا كان `vocab_size <= 65536` (بايتان فقط لكل رمز، أي `2 GB` تخزن **`1 مليار رمز`** بالكامل)، أو **`uint32`** للمفردات الأكبر.
+- **تقطيع النصوص الطويلة دون هدر (`v3.0.1 Strided Chunking`):** عندما يتجاوز طول الفقرة أو القصة نافذة `row_stride = seq_len + 1`، يقسّم `BinaryShardBuilder.build_from_stories` التسلسل تلقائياً إلى نوافذ متتالية بخطوة `seq_len` (مع الاحتفاظ بأي ذيل أخير بطول `>= 4` رموز)، فلا تضيع بقية السطور الطويلة في `--input-file`.
 - يُحفظ لكل شظية ملف `.meta.json` يتضمن بصمة التحقق **`SHA-256`** للتأكد من سلامة النقل بين SSD و Google Drive.
 
 ### أ. تجهيز بياناتك النصية الخاصة (أو مدونة القصص المدمجة للاختبار السريع)
@@ -83,7 +84,7 @@ python -m trainer.cli prepare-data \
   --input-file /content/drive/MyDrive/datasets/english_corpus.txt \
   --out-dir /content/drive/MyDrive/SS_ENN_Shards/run_32k \
   --vocab-size 32000 \
-  --seq-len 512 \
+  --seq-len 128 \
   --train-ratio 0.95
 
 # 2) أو تجربة سريعة باستعمال مدونة TinyStories المدمجة في المستودع
@@ -137,13 +138,16 @@ python -m trainer.cli estimate \
   --dtype bfloat16 --kahan-mode anchor_k --device cuda
 
 # 3. إطلاق التدريب الإنتاجي المقاوم للانقطاع على Colab GPU مع خزنة Drive
+# ملاحظات v3.0.1:
+#  - يستنتج train طول السياق `--seq-len` تلقائياً من `.meta.json` عند إغفاله، ويرفع `--max-seq-len` تلقائياً مع تنبيه إذا كان أصغر من الشظية.
+#  - القيمة الافتراضية `--sleep-every-epochs 0` مناسبة للتدريب التأسيسي الموحد؛ وعند تفعيل النوم الدوري يُنصح بضبط `--sleep-min-epoch` لحماية الحقب المبكرة من القفل الميكانيكي المبكر.
 python -m trainer.cli train \
   --data-dir /content/local_shards \
   --vault-dir /content/drive/MyDrive/SS_ENN_Vault/exp_125m \
   --num-layers 12 --d-init 512 --d-max 1024 --delta-d 128 \
   --block-size 16 --top-k-blocks 8 --max-seq-len 1024 --attn-top-k 12 \
   --dtype bfloat16 --kahan-mode full --device cuda \
-  --epochs 20 --batch-size 32 --ckpt-every-steps 100 --sleep-every-epochs 5 \
+  --epochs 20 --batch-size 32 --ckpt-every-steps 100 --sleep-every-epochs 0 \
   --auto-resume
 ```
 

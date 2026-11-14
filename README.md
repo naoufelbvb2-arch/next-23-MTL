@@ -1,9 +1,9 @@
-# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0, v2.0 & v3.0.0)
+# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0, v2.0 & v3.0.1)
 **الشبكات العصبية المرنة ذاتية التشكيل — إطار تعلم موضعي خالٍ من الانتشار العكسي للتوليد المتسلسل والتعلم المستمر**
 
 *A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Dual-Horizon Sparse Causal Attention, Hardware-Accelerated Kernels, Fault-Tolerant Cloud Training, and O(1) Stateful Inference*
 
-[![Release v3.0.0](https://img.shields.io/badge/Release-v3.0.0%20Production-brightgreen)](./docs/V3_PRODUCTION_TRAINING_GUIDE.md)
+[![Release v3.0.1](https://img.shields.io/badge/Release-v3.0.1%20Production-brightgreen)](./docs/V3_PRODUCTION_TRAINING_GUIDE.md)
 [![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(38%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
 [![v3.0 Phase 3.3 Fault-Tolerant](https://img.shields.io/badge/Phase%203.3-0.00e%2B00%20Kill%2FSIGTERM%20%7C%2032.2M%20tok%2Fs-blueviolet)](./benchmarks/bench_v3_trainer_fault_tolerance.py)
 [![v3.0 Phase 3.2 Production Model](https://img.shields.io/badge/Phase%203.2-92.62%25%20Frozen%20W0%20%7C%200.00e%2B00%20Resume-blue)](./benchmarks/bench_v3_production_model.py)
@@ -159,16 +159,16 @@ python tests/test_suite.py
 python train_eval.py
 ```
 
-### 3. واجهة الإطلاق الإنتاجية الموحدة (`v3.0 Unified CLI`) — سطر واحد للتقدير، التجهيز، التدريب، والتوليد
+### 3. واجهة الإطلاق الإنتاجية الموحدة (`v3.0.1 Unified CLI`) — سطر واحد للتقدير، التجهيز، التدريب، والتوليد
 ```bash
 # 1) فحص الذاكرة والتوصية بالعتاد قبل حجز الـ GPU (مثال 7B مع anchor_k)
-python -m trainer.cli estimate --vocab-size 32000 --num-layers 32 --d-init 3072 --d-max 6656 --delta-d 512 --dtype bfloat16 --kahan-mode anchor_k
+python -m trainer.cli estimate --vocab-size 32000 --num-layers 32 --d-init 3072 --d-max 6656 --delta-d 512 --top-k-blocks 32 --max-seq-len 2048 --attn-top-k 16 --dtype bfloat16 --kahan-mode anchor_k
 
-# 2) تجهيز البيانات الثنائية (uint16 / SHA-256)
+# 2) تجهيز البيانات الثنائية (uint16 / SHA-256) مع تقطيع النصوص الطويلة دون هدر
 python -m trainer.cli prepare-data --builtin-tinystories --out-dir ./shards_data --vocab-size 2048 --seq-len 36
 
-# 3) التدريب المقاوم للانقطاع والاستئناف التلقائي (--auto-resume)
-python -m trainer.cli train --data-dir ./shards_data --vault-dir ./ssenn_vault --epochs 14 --ckpt-every-steps 20 --auto-resume
+# 3) التدريب المقاوم للانقطاع والاستئناف التلقائي (--seq-len يُستنتج من الشظية و --sleep-every-epochs 0 افتراضياً)
+python -m trainer.cli train --data-dir ./shards_data --vault-dir ./ssenn_vault --epochs 14 --ckpt-every-steps 20 --sleep-every-epochs 0 --auto-resume
 
 # 4) التوليد السريع بذاكرة O(1) من النموذج المجمّد best_frozen_w0.pt
 python -m trainer.cli generate --vault-dir ./ssenn_vault --prompt "Once upon a time" --max-new-tokens 40

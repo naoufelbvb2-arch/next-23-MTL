@@ -85,6 +85,7 @@ class ElasticCloudTrainer:
         keep_best_frozen: bool = True,
         sleep_between_epochs: bool = False,
         sleep_every_epochs: int = 0,
+        sleep_min_epoch: int = 0,
         verbose: bool = False,
     ) -> None:
         self.config = config
@@ -95,6 +96,7 @@ class ElasticCloudTrainer:
         self.keep_best_frozen = bool(keep_best_frozen)
         self.sleep_every_epochs = int(sleep_every_epochs) if sleep_every_epochs > 0 else (1 if sleep_between_epochs else 0)
         self.sleep_between_epochs = bool(self.sleep_every_epochs > 0)
+        self.sleep_min_epoch = max(0, int(sleep_min_epoch))
         self.verbose = bool(verbose)
 
         self.global_step: int = 0
@@ -129,7 +131,7 @@ class ElasticCloudTrainer:
         x_b, y_b = dataset.get_batch(list(range(n)))
         full_seqs = torch.cat([x_b, y_b[:, -1:]], dim=1)
         self.model.calibrate_salience_from_tokens(
-            full_seqs, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id
+            full_seqs.tolist(), pad_id=pad_id, bos_id=bos_id, eos_id=eos_id
         )
 
     @torch.no_grad()
@@ -472,7 +474,12 @@ class ElasticCloudTrainer:
                 if val_batches:
                     self._maybe_export_best_frozen(val_metrics, epoch=ep)
 
-                if self.sleep_every_epochs > 0 and (ep % self.sleep_every_epochs == 0) and ep < int(epochs):
+                if (
+                    self.sleep_every_epochs > 0
+                    and ep >= self.sleep_min_epoch
+                    and (ep % self.sleep_every_epochs == 0)
+                    and ep < int(epochs)
+                ):
                     sleep_info = self.model.sleep_consolidate(phase_id=self.sleep_phase_counter)
                     self.sleep_phase_counter += 1
                     self.vault.append_telemetry(

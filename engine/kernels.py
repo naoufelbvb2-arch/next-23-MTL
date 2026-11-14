@@ -739,3 +739,30 @@ class SpringInferenceCache:
             d3 = self.fourgram_next.setdefault(k3, {})
             d3[token_id] = d3.get(token_id, 0) + 1
         self.seq_history.append(int(token_id))
+
+
+def normalize_token_sequences(token_sequences) -> list[list[int]]:
+    """
+    Normalizes 1-D/2-D `torch.Tensor` batches or nested token sequences into
+    explicit `list[list[int]]`, preventing 0-D tensor identity-hashing bugs when
+    token IDs are used as dictionary keys.
+    """
+    if isinstance(token_sequences, torch.Tensor):
+        if token_sequences.numel() == 0:
+            return []
+        raw = token_sequences.detach().cpu().tolist()
+        if token_sequences.ndim == 1:
+            return [[int(tok) for tok in raw]]
+        return [[int(tok) for tok in row] for row in raw]
+
+    normalized: list[list[int]] = []
+    for seq in token_sequences:
+        if isinstance(seq, torch.Tensor):
+            raw_row = seq.detach().cpu().tolist()
+            if seq.ndim == 0:
+                normalized.append([int(raw_row)])
+            else:
+                normalized.append([int(tok) for tok in raw_row])
+        else:
+            normalized.append([int(tok) for tok in seq])
+    return normalized
