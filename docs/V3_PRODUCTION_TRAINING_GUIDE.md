@@ -31,40 +31,170 @@ flowchart LR
 
 ---
 
-## 2. إعداد بيئة Google Colab وربط مساحة Google Drive
+## 2. خلايا التشغيل الرسمية الخمس على Google Colab & Drive (`v3.1.0 Verified`)
 
 لتفادي ضياع التقدم عند انتهاء مهلة الجلسة المجانية أو فصل مثيل Colab (مثل T4 / L4 / A100)، يُنصح بفصل:
-1. **الشيفرة والبيانات المؤقتة السريعة:** على قرص الجلسة `/content/next-23-MTL` و`/content/shards` (سرعة I/O عالية).
-2. **خزنة الحفظ الدائمة (`Vault`) والنسخة الاحتياطية للشظايا:** داخل **Google Drive** (`/content/drive/MyDrive/SS_ENN_Vault`).
+1. **الشيفرة والبيانات المؤقتة السريعة:** على قرص الجلسة `/content/next-23-MTL` و`/content/local_shards` (سرعة I/O عالية).
+2. **خزنة الحفظ الدائمة (`Vault`) والنسخة الاحتياطية للشظايا:** داخل **Google Drive** (`/content/drive/MyDrive/SS_ENN_Vault` و `/content/drive/MyDrive/SS_ENN_Shards`).
 
-### الخلية الأولى الجاهزة للنسخ واللصق في Google Colab (`Setup Cell`)
+جميع الخلايا الخمس التالية مفحوصة برمجياً (`build_parser().parse_args` + تنفيذ فعلي نهاية-لنهاية) على الوسم **`v3.1.0`** لضمان انعدام أي تعارض في الأعلام أو `--seq-len` أو نوع الدقة (`BF16`/`FP16`/`FP32`).
+
+### الخلية (1): ربط Google Drive، استنساخ الوسم `v3.1.0`، وضبط الدقة تلقائياً
 
 ```python
-# === الخلية (1): ربط Google Drive، استنساخ المستودع، وفحص العتاد و BF16 ===
+# === الخلية (1): ربط Google Drive، استنساخ v3.1.0، وضبط الدقة تلقائياً (A100/L4 BF16 | T4 FP16) ===
 from google.colab import drive
 drive.mount("/content/drive")
 
-import os, torch
-VAULT_ROOT = "/content/drive/MyDrive/SS_ENN_Vault"
-SHARDS_BACKUP = "/content/drive/MyDrive/SS_ENN_Shards"
-os.makedirs(VAULT_ROOT, exist_ok=True)
-os.makedirs(SHARDS_BACKUP, exist_ok=True)
+import os
+import torch
 
+# 1. استنساخ المستودع عند الوسم المرجعي v3.1.0 وتثبيت المتطلبات
 !rm -rf /content/next-23-MTL
-!git clone https://github.com/naoufelbvb2-arch/next-23-MTL.git /content/next-23-MTL
+!git clone --depth 1 --branch v3.1.0 https://github.com/naoufelbvb2-arch/next-23-MTL.git /content/next-23-MTL
 %cd /content/next-23-MTL
 !pip install -q -r requirements.txt
 
-!nvidia-smi
-print("PyTorch:", torch.__version__)
-print("CUDA Available:", torch.cuda.is_available())
+# 2. الكشف التلقائي عن البطاقة الرسومية وأفضل دقة مدعومة مع تعويض Kahan FP32
 if torch.cuda.is_available():
-    print("GPU:", torch.cuda.get_device_name(0))
-    print("BF16 Native Support:", torch.cuda.is_bf16_supported())
+    DEVICE = "cuda"
+    GPU_NAME = torch.cuda.get_device_name(0)
+    if torch.cuda.is_bf16_supported():
+        DTYPE, KAHAN_MODE = "bfloat16", "full"      # A100 / L4 / H100 (استخدم anchor_k لمقياس 7B)
+    else:
+        DTYPE, KAHAN_MODE = "float16", "full"       # T4 16GB (معوّض Kahan يحمي تحديثات sub-ULP)
+else:
+    DEVICE, GPU_NAME = "cpu", "CPU-Only"
+    DTYPE, KAHAN_MODE = "float32", "off"
+
+# 3. مسارات العمل الموحدة (القرص المحلي السريع للشظايا + Drive الدائم للخزنة والنسخة الاحتياطية)
+VAULT_DIR = "/content/drive/MyDrive/SS_ENN_Vault/v3_1_0_run"
+DRIVE_SHARDS = "/content/drive/MyDrive/SS_ENN_Shards/v3_1_0_run"
+LOCAL_SHARDS = "/content/local_shards"
+os.makedirs(VAULT_DIR, exist_ok=True)
+os.makedirs(DRIVE_SHARDS, exist_ok=True)
+os.makedirs(LOCAL_SHARDS, exist_ok=True)
+
+# 4. الأبعاد اليدوية الموحدة (Edge-28.6M السريع المتوافق مع T4/L4/A100 — عدّلها لـ Base-125M أو 1.3B أو 7B عند الحاجة)
+os.environ.update({
+    "SSENN_DEVICE": DEVICE,
+    "SSENN_DTYPE": DTYPE,
+    "SSENN_KAHAN": KAHAN_MODE,
+    "SSENN_VAULT_DIR": VAULT_DIR,
+    "SSENN_DRIVE_SHARDS": DRIVE_SHARDS,
+    "SSENN_LOCAL_SHARDS": LOCAL_SHARDS,
+    "SSENN_VOCAB_SIZE": "8192",
+    "SSENN_SEQ_LEN": "128",
+    "SSENN_NUM_LAYERS": "8",
+    "SSENN_D_INIT": "256",
+    "SSENN_D_MAX": "512",
+    "SSENN_DELTA_D": "64",
+    "SSENN_BLOCK_SIZE": "16",
+    "SSENN_TOP_K_BLOCKS": "4",
+    "SSENN_ATTN_TOP_K": "12",
+})
+
+print(f"GPU: {GPU_NAME} | Device: {DEVICE} | Dtype: {DTYPE} | Kahan: {KAHAN_MODE}")
+!git describe --tags --always
+!nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
+```
+
+### الخلية (2): فحص بصمة الذاكرة والمعاملات (`estimate`)
+
+```bash
+# === الخلية (2): تقدير البصمة الذاكرية والمعاملات دون تخصيص ===
+!python -m trainer.cli estimate \
+  --vocab-size "$SSENN_VOCAB_SIZE" \
+  --num-layers "$SSENN_NUM_LAYERS" \
+  --d-init "$SSENN_D_INIT" \
+  --d-max "$SSENN_D_MAX" \
+  --delta-d "$SSENN_DELTA_D" \
+  --block-size "$SSENN_BLOCK_SIZE" \
+  --top-k-blocks "$SSENN_TOP_K_BLOCKS" \
+  --max-seq-len "$SSENN_SEQ_LEN" \
+  --attn-top-k "$SSENN_ATTN_TOP_K" \
+  --dtype "$SSENN_DTYPE" \
+  --kahan-mode "$SSENN_KAHAN" \
+  --device "$SSENN_DEVICE"
+```
+
+### الخلية (3): بناء الشظايا الثنائية عبر `MultilingualByteBPETokenizer` (`prepare-data`)
+
+```python
+# === الخلية (3): بناء train_shard.bin / val_shard.bin / tokenizer.json ونسخها احتياطياً لـ Drive ===
+# لتدريب ملفك النصي الخاص من Drive، اكتب مساره هنا (أو اتركه فارغاً للتجربة الفورية على TinyStories):
+DRIVE_INPUT_FILE = ""  # مثال: "/content/drive/MyDrive/datasets/arabic_english_corpus.txt"
+
+import os, subprocess, shutil
+
+cmd = [
+    "python", "-m", "trainer.cli", "prepare-data",
+    "--out-dir", os.environ["SSENN_LOCAL_SHARDS"],
+    "--tokenizer-type", "multilingual_bpe",
+    "--vocab-size", os.environ["SSENN_VOCAB_SIZE"],
+    "--seq-len", os.environ["SSENN_SEQ_LEN"],
+    "--seed", "42",
+]
+if DRIVE_INPUT_FILE.strip():
+    if not os.path.exists(DRIVE_INPUT_FILE):
+        raise FileNotFoundError(f"Drive corpus not found: {DRIVE_INPUT_FILE}")
+    cmd += ["--input-file", DRIVE_INPUT_FILE, "--train-ratio", "0.95"]
+else:
+    cmd += ["--builtin-tinystories", "--target-min-tokens", "40000"]
+
+subprocess.run(cmd, check=True)
+
+# نسخ الشظايا والمُرمِّز إلى Google Drive لنجاتها بعد فصل جلسة Colab
+shutil.copytree(os.environ["SSENN_LOCAL_SHARDS"], os.environ["SSENN_DRIVE_SHARDS"], dirs_exist_ok=True)
+print("Backed up shards to Drive:", os.environ["SSENN_DRIVE_SHARDS"])
+```
+
+### الخلية (4): إطلاق أو استئناف التدريب المحمي ذرياً (`train`)
+
+```python
+# === الخلية (4): التدريب المقاوم للانقطاع والاستئناف التلقائي (--auto-resume & --sleep-every-epochs 0) ===
+import os, shutil
+
+# استرجاع تلقائي للشظايا من Drive إلى قرص Colab المحلي عند فتح جلسة جديدة
+if not os.path.exists(os.path.join(os.environ["SSENN_LOCAL_SHARDS"], "train_shard.bin")):
+    shutil.copytree(os.environ["SSENN_DRIVE_SHARDS"], os.environ["SSENN_LOCAL_SHARDS"], dirs_exist_ok=True)
+
+# ملاحظة: إغفال --seq-len و --vocab-size يجعل cli يستنتجهما تلقائياً من .meta.json بمطابقة 100%
+!python -m trainer.cli train \
+  --data-dir "$SSENN_LOCAL_SHARDS" \
+  --vault-dir "$SSENN_VAULT_DIR" \
+  --num-layers "$SSENN_NUM_LAYERS" \
+  --d-init "$SSENN_D_INIT" \
+  --d-max "$SSENN_D_MAX" \
+  --delta-d "$SSENN_DELTA_D" \
+  --block-size "$SSENN_BLOCK_SIZE" \
+  --top-k-blocks "$SSENN_TOP_K_BLOCKS" \
+  --max-seq-len "$SSENN_SEQ_LEN" \
+  --attn-top-k "$SSENN_ATTN_TOP_K" \
+  --dtype "$SSENN_DTYPE" \
+  --kahan-mode "$SSENN_KAHAN" \
+  --device "$SSENN_DEVICE" \
+  --epochs 14 \
+  --batch-size 32 \
+  --ckpt-every-steps 50 \
+  --sleep-every-epochs 0 \
+  --auto-resume
+```
+
+### الخلية (5): التوليد السريع بذاكرة $O(1)$ من `best_frozen_w0.pt` (`generate`)
+
+```bash
+# === الخلية (5): الاستدلال المجمّد بذاكرة O(1) من best_frozen_w0.pt داخل الخزنة ===
+# غيّر نص --prompt بما يناسب لغتك (العربية أو الفرنسية أو الإنجليزية بفضل MultilingualByteBPETokenizer)
+!python -m trainer.cli generate \
+  --vault-dir "$SSENN_VAULT_DIR" \
+  --prompt "Once upon a time" \
+  --max-new-tokens 60 \
+  --device "$SSENN_DEVICE"
 ```
 
 > [!TIP]
-> يدعم الجيل الحديث من بطاقات Colab (`L4 24GB` و `A100 40GB/80GB` و `TPU v5e/v5p`) دقة `bfloat16` فطرياً. أما على بطاقة **`T4 16GB`** (معمارية Turing)، فيمكنك استخدام `--dtype float16` مع تفعيل `--kahan-mode full` تلقائياً لمنع تلاشي التحديثات الصغيرة (`sub-ULP`) وتحقيق تدريب رقمي مستقر.
+> يدعم الجيل الحديث من بطاقات Colab (`L4 24GB` و `A100 40GB/80GB` و `TPU v5e/v5p`) دقة `bfloat16` فطرياً. أما على بطاقة **`T4 16GB`** (معمارية Turing)، فتضبط الخلية (1) الدقة تلقائياً إلى `--dtype float16` مع تفعيل `--kahan-mode full` لمنع تلاشي التحديثات الصغيرة (`sub-ULP`) وتحقيق تدريب رقمي مستقر.
 
 ---
 
