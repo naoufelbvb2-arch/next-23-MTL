@@ -132,6 +132,8 @@ class AtomicCheckpointVault:
         self.backup_path = self.vault_dir / "checkpoint_backup.pt"
         self.best_frozen_path = self.vault_dir / "best_frozen_w0.pt"
         self.telemetry_path = self.vault_dir / "training_telemetry.jsonl"
+        self._latest_verified: bool = False
+        self._latest_verified_size: int = -1
 
     def save_checkpoint(self, payload: dict) -> dict:
         """
@@ -151,12 +153,22 @@ class AtomicCheckpointVault:
 
         # Promote prior healthy checkpoint_latest.pt -> checkpoint_backup.pt
         if self.latest_path.exists():
-            ok_prev, _, _ = _load_and_verify_envelope(self.latest_path)
-            if ok_prev:
-                _atomic_copy_file(self.latest_path, self.backup_path)
+            try:
+                cur_size = int(self.latest_path.stat().st_size)
+            except OSError:
+                cur_size = -1
+            if self._latest_verified and cur_size == self._latest_verified_size:
+                os.replace(self.latest_path, self.backup_path)
+                _fsync_parent_dir(self.backup_path)
+            else:
+                ok_prev, _, _ = _load_and_verify_envelope(self.latest_path)
+                if ok_prev:
+                    _atomic_copy_file(self.latest_path, self.backup_path)
 
         os.replace(stage_tmp, self.latest_path)
         _fsync_parent_dir(self.latest_path)
+        self._latest_verified = True
+        self._latest_verified_size = int(self.latest_path.stat().st_size)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         return {
@@ -281,6 +293,8 @@ class AtomicCheckpointVault:
         `mode='truncate'` truncates file to 32 bytes; `mode='bitflip'` flips bytes
         near the middle of the file.
         """
+        self._latest_verified = False
+        self._latest_verified_size = -1
         target = self.latest_path if which == "latest" else self.backup_path
         if not target.exists():
             raise FileNotFoundError(f"Target checkpoint does not exist: {target}")

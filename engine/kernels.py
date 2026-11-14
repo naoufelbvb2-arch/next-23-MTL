@@ -155,6 +155,19 @@ class MixedPrecisionCompensator:
         self._res_w0: dict[int | str, torch.Tensor] = {}
         self._res_k: dict[int | str, torch.Tensor] = {}
 
+    @staticmethod
+    def _resize_or_init_residual(
+        old_t: torch.Tensor | None, shape: tuple[int, int], device: torch.device
+    ) -> torch.Tensor:
+        if old_t is not None and old_t.shape == shape and old_t.device == device:
+            return old_t
+        new_t = torch.zeros(shape, device=device, dtype=torch.float32)
+        if old_t is not None and old_t.device == device and old_t.ndim == 2:
+            r_min = min(old_t.shape[0], shape[0])
+            c_min = min(old_t.shape[1], shape[1])
+            new_t[:r_min, :c_min].copy_(old_t[:r_min, :c_min])
+        return new_t
+
     @torch.no_grad()
     def get_residuals(
         self, key_id: int | str, shape: tuple[int, int], device: torch.device
@@ -163,16 +176,22 @@ class MixedPrecisionCompensator:
             return None, None, None
         if self.mode == "anchor_k":
             self._res_w.pop(key_id, None)
-            rw0 = self._res_w0.get(key_id)
-            if rw0 is None or rw0.shape != shape or rw0.device != device:
-                self._res_w0[key_id] = torch.zeros(shape, device=device, dtype=torch.float32)
-                self._res_k[key_id] = torch.zeros(shape, device=device, dtype=torch.float32)
+            self._res_w0[key_id] = self._resize_or_init_residual(
+                self._res_w0.get(key_id), shape, device
+            )
+            self._res_k[key_id] = self._resize_or_init_residual(
+                self._res_k.get(key_id), shape, device
+            )
             return None, self._res_w0[key_id], self._res_k[key_id]
-        rw = self._res_w.get(key_id)
-        if rw is None or rw.shape != shape or rw.device != device:
-            self._res_w[key_id] = torch.zeros(shape, device=device, dtype=torch.float32)
-            self._res_w0[key_id] = torch.zeros(shape, device=device, dtype=torch.float32)
-            self._res_k[key_id] = torch.zeros(shape, device=device, dtype=torch.float32)
+        self._res_w[key_id] = self._resize_or_init_residual(
+            self._res_w.get(key_id), shape, device
+        )
+        self._res_w0[key_id] = self._resize_or_init_residual(
+            self._res_w0.get(key_id), shape, device
+        )
+        self._res_k[key_id] = self._resize_or_init_residual(
+            self._res_k.get(key_id), shape, device
+        )
         return self._res_w[key_id], self._res_w0[key_id], self._res_k[key_id]
 
 
@@ -243,7 +262,7 @@ def fused_spring_update_inplace(
         )
         wf.nan_to_num_(nan=0.0, posinf=64.0, neginf=-64.0)
         w0f.nan_to_num_(nan=0.0, posinf=64.0, neginf=-64.0)
-        kf.nan_to_num_(nan=0.0, posinf=stiff_ceil, neginf=0.0)
+        kf.nan_to_num_(nan=0.0, posinf=(0.98 if cubic_shield else stiff_ceil), neginf=0.0)
 
         w.copy_(wf.to(w.dtype))
         w0.copy_(w0f.to(w0.dtype))
@@ -324,6 +343,9 @@ def _fused_fp32_core_inplace(
     else:
         w0.addcmul_(buf_gate, buf_stretch, value=eta_0)
 
+    # Snapshot already-armored cells before updating k so non-armored cells stay capped at stiff_ceil
+    was_high_armor = (k >= 0.85) if cubic_shield else None
+
     # 3. Stiffness consolidation: k += beta_k_eff * |w_new - w0| * (1 - k) * active_row_gate
     buf_stretch.abs_()
     if isinstance(beta_k_eff, torch.Tensor):
@@ -338,13 +360,14 @@ def _fused_fp32_core_inplace(
             buf_stretch.mul_(active_row_gate.to(dtype=buf_stretch.dtype, device=buf_stretch.device))
         k.addcmul_(buf_stretch, buf_gate, value=float(beta_k_eff))
 
-    if cubic_shield:
-        # Preserve already-armored rows (>= 0.85) cleanly above ceiling while capping new rows
-        high_armor = k >= 0.85
-        if high_armor.any():
-            k.clamp_(0.0, 0.98)
-        else:
-            k.clamp_(0.0, stiff_ceil)
+    if cubic_shield and was_high_armor is not None and bool(was_high_armor.any().item()):
+        k.clamp_(min=0.0)
+        max_bounds = torch.where(
+            was_high_armor,
+            torch.full_like(k, 0.98),
+            torch.full_like(k, float(stiff_ceil)),
+        )
+        torch.minimum(k, max_bounds, out=k)
     else:
         k.clamp_(0.0, stiff_ceil)
 

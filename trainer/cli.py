@@ -30,7 +30,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from benchmarks.english_dataset import build_english_tinystories_corpus  # noqa: E402
-from engine.tokenizer import EnglishSubwordTokenizer  # noqa: E402
+from engine.tokenizer import (  # noqa: E402
+    EnglishSubwordTokenizer,
+    MultilingualByteBPETokenizer,
+    load_tokenizer,
+)
 from models.config_v3 import SSENNConfig  # noqa: E402
 from models.model_v3_production import SSENNProductionModel  # noqa: E402
 from trainer.checkpoint_vault import AtomicCheckpointVault, PreemptionSignalHandler  # noqa: E402
@@ -201,7 +205,10 @@ def cmd_prepare_data(args: argparse.Namespace) -> int:
         train_stories = docs[:n_train]
         val_stories = docs[n_train:]
 
-    tokenizer = EnglishSubwordTokenizer(max_vocab_size=args.vocab_size)
+    if getattr(args, "tokenizer_type", "english_subword") == "multilingual_bpe":
+        tokenizer = MultilingualByteBPETokenizer(max_vocab_size=args.vocab_size)
+    else:
+        tokenizer = EnglishSubwordTokenizer(max_vocab_size=args.vocab_size)
     tokenizer.fit(train_stories + val_stories, pad_to_max_vocab=not args.no_pad_vocab)
     tok_path = out_dir / "tokenizer.json"
     tokenizer.save(tok_path)
@@ -248,7 +255,7 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     tok_path = Path(args.tokenizer) if args.tokenizer else (data_dir / "tokenizer.json")
     if tok_path.exists():
-        tokenizer = EnglishSubwordTokenizer.load(tok_path)
+        tokenizer = load_tokenizer(tok_path)
         shutil.copy2(tok_path, vault_dir / "tokenizer.json")
     else:
         tokenizer = None
@@ -295,14 +302,6 @@ def cmd_train(args: argparse.Namespace) -> int:
             seed=args.seed,
         )
 
-        # Pre-materialize compact validation minibatches for side-effect-free epoch eval
-        val_batches: list[tuple[torch.Tensor, torch.Tensor]] = []
-        n_val = len(val_ds)
-        v_bs = min(args.batch_size, max(n_val, 1))
-        for start in range(0, n_val, v_bs):
-            idxs = list(range(start, min(start + v_bs, n_val)))
-            val_batches.append(val_ds.get_batch(idxs))
-
         if args.sleep_min_epoch < 0:
             raise ValueError(f"--sleep-min-epoch must be >= 0, got {args.sleep_min_epoch}")
         trainer = ElasticCloudTrainer(
@@ -328,7 +327,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         sig_handler = PreemptionSignalHandler(register_os_signals=True)
         res = trainer.fit(
             train_dataset=train_ds,
-            val_batches=val_batches,
+            val_batches=val_ds,
             epochs=args.epochs,
             batch_size=args.batch_size,
             pad_id=pad_id,
@@ -405,7 +404,7 @@ def _resolve_frozen_model_and_tokenizer(args: argparse.Namespace) -> tuple[SSENN
         raise FileNotFoundError(
             "Tokenizer file not found. Pass --tokenizer PATH pointing to tokenizer.json."
         )
-    tokenizer = EnglishSubwordTokenizer.load(tok_path)
+    tokenizer = load_tokenizer(tok_path)
     return model, tokenizer
 
 
@@ -472,6 +471,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use built-in connected English TinyStories corpus.",
     )
     p_prep.add_argument("--out-dir", type=str, required=True, help="Output shard & tokenizer directory.")
+    p_prep.add_argument(
+        "--tokenizer-type",
+        type=str,
+        default="english_subword",
+        choices=("english_subword", "multilingual_bpe"),
+        help="Tokenizer engine: legacy english_subword or lossless MultilingualByteBPETokenizer.",
+    )
     p_prep.add_argument("--vocab-size", type=int, default=2048, help="Tokenizer max vocabulary size.")
     p_prep.add_argument("--seq-len", type=int, default=36, help="Causal training sequence length T.")
     p_prep.add_argument("--train-ratio", type=float, default=0.90, help="Train split fraction.")

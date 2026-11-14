@@ -4,7 +4,11 @@ from .dynamic_spring_layer import DynamicSpringLayer
 from .sparse_attention import SparseCausalAttention
 from .dfa_router import DFARouter
 from .causal_context import CausalContext
-from .tokenizer import EnglishSubwordTokenizer
+from .tokenizer import (
+    EnglishSubwordTokenizer,
+    MultilingualByteBPETokenizer,
+    load_tokenizer,
+)
 from .kernels import (
     TensorAllocationTracker,
     SpringScratchBuffer,
@@ -25,6 +29,8 @@ __all__ = [
     "DFARouter",
     "CausalContext",
     "EnglishSubwordTokenizer",
+    "MultilingualByteBPETokenizer",
+    "load_tokenizer",
     "TensorAllocationTracker",
     "SpringScratchBuffer",
     "MixedPrecisionCompensator",

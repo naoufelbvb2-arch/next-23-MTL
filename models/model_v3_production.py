@@ -271,6 +271,8 @@ class SSENNProductionModel(nn.Module):
             self._alloc_full_training_buffers(device, w_dtype, gen)
 
         self.rejuvenated_slots: list[list[int]] = [[] for _ in range(self.num_layers)]
+        self._rejuv_idx_tensors: list[torch.Tensor | None] = [None for _ in range(self.num_layers)]
+        self._sync_rejuv_idx_tensors()
         self.total_recycled_cells_per_layer: list[int] = [0 for _ in range(self.num_layers)]
         self.current_phase_slots: list[list[int]] = [[] for _ in range(self.num_layers)]
         self.growth_log: list[dict] = []
@@ -460,6 +462,13 @@ class SSENNProductionModel(nn.Module):
     def get_allocated_dimensions(self) -> list[int]:
         return [int(layer.w0.shape[0] if self.frozen else layer.d_active) for layer in self.spring_layers]
 
+    def _sync_rejuv_idx_tensors(self) -> None:
+        dev = self.model_device
+        self._rejuv_idx_tensors = [
+            torch.tensor(slots, dtype=torch.long, device=dev) if slots else None
+            for slots in self.rejuvenated_slots
+        ]
+
     @torch.no_grad()
     def to_device_and_dtype(
         self,
@@ -540,6 +549,7 @@ class SSENNProductionModel(nn.Module):
         if self._kernel_scratch is not None:
             self._kernel_scratch = SpringScratchBuffer()
 
+        self._sync_rejuv_idx_tensors()
         self._reset_step_cache()
         return self
 
@@ -1088,8 +1098,8 @@ class SSENNProductionModel(nn.Module):
                 comp_key=f"layer_{l_idx}",
             )
 
-            if self.rejuvenated_slots[l_idx]:
-                dorm_idx = torch.tensor(self.rejuvenated_slots[l_idx], dtype=torch.long, device=self.model_device)
+            dorm_idx = self._rejuv_idx_tensors[l_idx]
+            if dorm_idx is not None:
                 layer.w[dorm_idx, :] = 0.0
                 layer.w0[dorm_idx, :] = 0.0
                 layer.k[dorm_idx, :] = 0.0
@@ -1130,6 +1140,10 @@ class SSENNProductionModel(nn.Module):
             compensator=self.compensator,
             comp_key="output_head",
         )
+        if self.head_armor_mask.any() and self.head_w0_bedrock is not None:
+            h_bed = self.head_w0_bedrock[self.head_armor_mask, :d_last]
+            self.head_w0[self.head_armor_mask, :d_last].copy_(h_bed)
+            self.head_w[self.head_armor_mask, :d_last].copy_(h_bed)
 
         self._reset_step_cache()
         return {
@@ -1141,17 +1155,18 @@ class SSENNProductionModel(nn.Module):
 
     @torch.no_grad()
     def step_neurogenesis(self, mean_ce_loss: float | None = None) -> dict:
-        """Frustration-driven waking of `delta_d` dormant cells with deterministic on-demand rows."""
+        """Frustration-driven waking of `delta_d` cells (reviving recycled slots before new growth)."""
         if self.frozen or self.delta_d <= 0:
-            return {"woke_total": 0, "dims": self.get_allocated_dimensions()}
+            return {"woke_total": 0, "grew": False, "dims": self.get_allocated_dimensions()}
 
         cfg = self.config
         woke_total = 0
+        rejuv_modified = False
         old_max_d = max(layer.d_active for layer in self.spring_layers)
         bound_d = 1.0 / math.sqrt(float(self.d_max))
 
         for l_idx, layer in enumerate(self.spring_layers):
-            if layer.d_active >= self.d_max:
+            if layer.d_active >= self.d_max and not self.rejuvenated_slots[l_idx]:
                 continue
             if (self.current_epoch - layer.last_growth_epoch) < cfg.neurogenesis_cooldown:
                 continue
@@ -1171,10 +1186,41 @@ class SSENNProductionModel(nn.Module):
                 )
             )
             if triggered:
-                woke = layer.grow_active(self.delta_d, salt=self.current_epoch + 1)
-                if woke > 0:
+                woke_layer = 0
+                if self.rejuvenated_slots[l_idx]:
+                    reused_slots = self.rejuvenated_slots[l_idx][: self.delta_d]
+                    self.rejuvenated_slots[l_idx] = self.rejuvenated_slots[l_idx][len(reused_slots) :]
+                    rejuv_modified = True
+                    n_reused = len(reused_slots)
+                    rows = _deterministic_uniform_rows(
+                        n_reused,
+                        self.d_max,
+                        bound_d,
+                        seed=layer.seed + 100003 * (self.current_epoch + 1) + 7919 * layer.layer_id + reused_slots[0],
+                        device=self.model_device,
+                        dtype=self.weight_dtype,
+                    )
+                    slot_idx = torch.tensor(reused_slots, dtype=torch.long, device=self.model_device)
+                    layer.w[slot_idx, :] = rows
+                    layer.w0[slot_idx, :] = rows
+                    layer.k[slot_idx, :] = 0.0
+                    layer.win_counts[slot_idx] = 0.0
+                    layer.active_mask[slot_idx] = 1.0
+                    self.armor_locked_masks[l_idx][slot_idx] = False
+                    woke_layer += n_reused
+
+                rem_wake = self.delta_d - woke_layer
+                # Keep d_active strictly aligned to block_size for contiguous block-sparse kernels
+                rem_wake_aligned = (rem_wake // self.block_size) * self.block_size
+                if rem_wake_aligned > 0 and layer.d_active < self.d_max:
+                    woke_layer += layer.grow_active(rem_wake_aligned, salt=self.current_epoch + 1)
+
+                if woke_layer > 0:
                     layer.last_growth_epoch = self.current_epoch
-                    woke_total += woke
+                    woke_total += woke_layer
+
+        if rejuv_modified:
+            self._sync_rejuv_idx_tensors()
 
         new_max_d = max(layer.d_active for layer in self.spring_layers)
         if new_max_d > old_max_d:
@@ -1197,7 +1243,7 @@ class SSENNProductionModel(nn.Module):
                 "woke_total": woke_total,
                 "dims": dims,
             })
-        return {"woke_total": woke_total, "dims": dims}
+        return {"woke_total": woke_total, "grew": bool(woke_total > 0), "dims": dims}
 
     @torch.no_grad()
     def end_epoch(self, epoch: int | None = None, mean_ce_loss: float | None = None) -> dict:
@@ -1338,10 +1384,14 @@ class SSENNProductionModel(nn.Module):
             self.head_w0_bedrock[seen_mask, :d_eff].copy_(self.head_w0[seen_mask, :d_eff])
             self.phase_seen_targets.zero_()
 
+        self._sync_rejuv_idx_tensors()
         record = {
             "phase_id": int(phase_id),
             "merged_per_layer": merged_per_layer,
             "pruned_per_layer": pruned_per_layer,
+            "merged_total": int(sum(merged_per_layer)),
+            "pruned_total": int(sum(pruned_per_layer)),
+            "locked_total": int(sum(locked_per_layer)),
             "recycled_total": sum(merged_per_layer) + sum(pruned_per_layer),
             "locked_per_layer": locked_per_layer,
             "active_dims": self.get_active_dimensions(),
@@ -1724,7 +1774,7 @@ class SSENNProductionModel(nn.Module):
                     settle_alpha = (0.95 + 0.05 * (k_s.float() / 0.85).clamp(0.0, 1.0)).to(layer.w0.dtype)
                     layer.w0[:d_act, :d_eff][settle_mask] = w0_s + (w_s - w0_s) * settle_alpha
 
-            unlocked_vocab = ~self.locked_excl_vocab_mask
+            unlocked_vocab = ~(self.head_armor_mask | self.locked_excl_vocab_mask)
             if unlocked_vocab.any():
                 hw = self.head_w[unlocked_vocab, :d_last]
                 hw0 = self.head_w0[unlocked_vocab, :d_last]
@@ -1916,6 +1966,7 @@ class SSENNProductionModel(nn.Module):
         self.has_multiword_entities = bool(meta["has_multiword_entities"])
         self.attn_v_topk = int(meta["attn_v_topk"])
         self.rejuvenated_slots = copy.deepcopy(meta["rejuvenated_slots"])
+        self._sync_rejuv_idx_tensors()
         self.total_recycled_cells_per_layer = list(meta["total_recycled_cells_per_layer"])
         self.current_phase_slots = copy.deepcopy(meta["current_phase_slots"])
         self.growth_log = copy.deepcopy(meta["growth_log"])
@@ -1970,6 +2021,136 @@ class SSENNProductionModel(nn.Module):
             "has_multiword_entities": bool(self.has_multiword_entities),
             "w0_tensors": w0_tensors,
         }
+
+    @torch.no_grad()
+    def export_frozen_w0_state_nondestructive(
+        self,
+        map_location: str | torch.device = "cpu",
+    ) -> tuple[dict, dict]:
+        """
+        Exports a settled, dormant-pruned `Frozen W0 Only` artifact directly to
+        `map_location` (typically CPU) WITHOUT mutating the live training model or
+        duplicating full `(w, w0, k, dfa, Kahan)` buffers in GPU VRAM.
+        Bit-exact with `clone -> production_freeze(True) -> export_frozen_w0_state()`.
+        """
+        target_loc = torch.device(map_location)
+        mb = 1024.0 * 1024.0
+
+        def _count_w0_stats(wt: dict) -> tuple[int, int]:
+            total_params = 0
+            total_bytes = 0
+            for key, val in wt.items():
+                tensors = val if key == "layers_w0" else (val,)
+                for t in tensors:
+                    total_params += int(t.numel())
+                    total_bytes += int(t.numel()) * int(t.element_size())
+            return total_params, total_bytes
+
+        if self.frozen:
+            frozen_state = self.export_frozen_w0_state()
+            wt = frozen_state["w0_tensors"]
+            for k in list(wt.keys()):
+                if k == "layers_w0":
+                    wt[k] = [t.to(device=target_loc).clone() for t in wt[k]]
+                else:
+                    wt[k] = wt[k].to(device=target_loc).clone()
+            after_params, after_bytes = _count_w0_stats(wt)
+            after_mb = after_bytes / mb
+            freeze_stats = {
+                "frozen": True,
+                "before_live_mb": after_mb,
+                "after_live_mb": after_mb,
+                "before_params": after_params,
+                "after_params": after_params,
+                "memory_saved_pct": 0.0,
+                "compacted_dims": list(frozen_state["layer_d_active"]),
+            }
+            return frozen_state, freeze_stats
+
+        before = self.count_parameters_breakdown()
+        d_eff, d_last = self._effective_dims()
+
+        # Attention projections (settled temporarily without mutating live buffers)
+        attn_w0: dict[str, torch.Tensor] = {}
+        for p in ("q", "k", "v"):
+            w0_copy = getattr(self, f"{p}_w0")[:d_eff, :d_eff].detach().clone()
+            if not self.attn_armor_locked:
+                w_t = getattr(self, f"{p}_w")[:d_eff, :d_eff]
+                w0_t = getattr(self, f"{p}_w0")[:d_eff, :d_eff]
+                k_t = getattr(self, f"{p}_k")[:d_eff, :d_eff]
+                settle_alpha = (0.95 + 0.05 * (k_t.float() / 0.85).clamp(0.0, 1.0)).to(w0_t.dtype)
+                w0_copy.add_((w_t - w0_t) * settle_alpha)
+            attn_w0[f"{p}_w0"] = w0_copy.contiguous().to(device=target_loc)
+
+        # Hidden spring capsule layers
+        layers_w0: list[torch.Tensor] = []
+        compacted_dims: list[int] = []
+        for l_idx, layer in enumerate(self.spring_layers):
+            d_act = int(layer.d_active)
+            compacted_dims.append(d_act)
+            lw0_copy = layer.w0[:d_act, :d_eff].detach().clone()
+            settle_mask = ~self.armor_locked_masks[l_idx][:d_act].clone()
+            if self.rejuvenated_slots[l_idx]:
+                settle_mask[self.rejuvenated_slots[l_idx]] = False
+            if settle_mask.any():
+                w_s = layer.w[:d_act, :d_eff][settle_mask]
+                w0_s = lw0_copy[settle_mask]
+                k_s = layer.k[:d_act, :d_eff][settle_mask]
+                settle_alpha = (0.95 + 0.05 * (k_s.float() / 0.85).clamp(0.0, 1.0)).to(lw0_copy.dtype)
+                lw0_copy[settle_mask] = w0_s + (w_s - w0_s) * settle_alpha
+            layers_w0.append(lw0_copy.contiguous().to(device=target_loc))
+
+        # Output head
+        hw0_copy = self.head_w0[:, :d_last].detach().clone()
+        unlocked_vocab = ~(self.head_armor_mask | self.locked_excl_vocab_mask)
+        if unlocked_vocab.any():
+            hw = self.head_w[unlocked_vocab, :d_last]
+            hw0 = hw0_copy[unlocked_vocab]
+            hk = self.head_k[unlocked_vocab, :d_last]
+            settle_alpha = (0.95 + 0.05 * (hk.float() / 0.85).clamp(0.0, 1.0)).to(hw0_copy.dtype)
+            hw0_copy[unlocked_vocab] = hw0 + (hw - hw0) * settle_alpha
+        hw0_out = hw0_copy.contiguous().to(device=target_loc)
+
+        w0_tensors = {
+            "token_embedding": self.token_embedding[:, :d_eff].detach().contiguous().to(device=target_loc).clone(),
+            "pos_embedding": self.pos_embedding[:, :d_eff].detach().contiguous().to(device=target_loc).clone(),
+            "alibi_pos_encoding": self.alibi_pos_encoding[:, :d_eff].detach().contiguous().to(device=target_loc).clone(),
+            "alibi_causal_weights": self.alibi_causal_weights.detach().to(device=target_loc).clone(),
+            "cap_proj": self.cap_proj[:d_eff, :d_eff].detach().contiguous().to(device=target_loc).clone(),
+            "lag1_proj": self.lag1_proj[:d_eff, :d_eff].detach().contiguous().to(device=target_loc).clone(),
+            "lag2_proj": self.lag2_proj[:d_eff, :d_eff].detach().contiguous().to(device=target_loc).clone(),
+            "q_w0": attn_w0["q_w0"],
+            "k_w0": attn_w0["k_w0"],
+            "v_w0": attn_w0["v_w0"],
+            "head_w0": hw0_out,
+            "token_salience": self.token_salience.detach().to(device=target_loc).clone(),
+            "capacitor_alpha": self.capacitor_alpha.detach().to(device=target_loc).clone(),
+            "layers_w0": layers_w0,
+        }
+        frozen_state = {
+            "format_version": "ssenn_v3_frozen_w0_1.0",
+            "config": self.config.to_dict(),
+            "d_eff": int(d_eff),
+            "d_last": int(d_last),
+            "layer_d_active": compacted_dims,
+            "attn_v_topk": int(self.attn_v_topk),
+            "has_multiword_entities": bool(self.has_multiword_entities),
+            "w0_tensors": w0_tensors,
+        }
+        after_params, after_bytes = _count_w0_stats(w0_tensors)
+        after_live_mb = after_bytes / mb
+        before_live_mb = float(before["total_live_mb"])
+        saved_pct = ((before_live_mb - after_live_mb) / max(before_live_mb, 1e-9)) * 100.0
+        freeze_stats = {
+            "frozen": True,
+            "before_live_mb": before_live_mb,
+            "after_live_mb": after_live_mb,
+            "before_params": int(before["live_buffer_params"]),
+            "after_params": after_params,
+            "memory_saved_pct": saved_pct,
+            "compacted_dims": compacted_dims,
+        }
+        return frozen_state, freeze_stats
 
     @classmethod
     @torch.no_grad()

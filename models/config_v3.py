@@ -308,6 +308,14 @@ class SSENNConfig:
         frozen_at_init_params = init_frontend + init_spring_w
         frozen_at_max_params = max_frontend + max_spring_w
 
+        # Exact registered live buffers breakdown (adds alibi_pos_encoding, alibi_causal_weights,
+        # 7x 1D vocab stat/armor vectors, and 3x L layer win tracking vectors)
+        def _extra_live_buffers(d: int) -> int:
+            return (T * d) + (T * T) + (7 * V) + (3 * L * d)
+
+        exact_live_at_init = init_active_params + _extra_live_buffers(Di)
+        exact_live_at_max = max_train_params + _extra_live_buffers(Dm)
+
         return {
             "dtype": self.dtype,
             "dtype_bytes": b,
@@ -317,9 +325,11 @@ class SSENNConfig:
             "kahan_savings_vs_full_pct": kahan_savings_vs_full_pct,
             "init_active_params": init_active_params,
             "init_active_mb": (init_active_params * b) / mb,
+            "exact_live_buffer_params_at_init": exact_live_at_init,
             "max_train_params": max_train_params,
             "max_train_mb": (max_train_params * b) / mb,
             "max_train_gb": (max_train_params * b) / gb,
+            "exact_live_buffer_params_at_max": exact_live_at_max,
             "dfa_params": max_dfa,
             "dfa_mb": (max_dfa * b) / mb,
             "naive_dfa_params": naive_dfa_params,

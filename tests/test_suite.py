@@ -847,6 +847,230 @@ class TestSpringMVPArchitecture(unittest.TestCase):
             ]
             self.assertEqual([rec["epoch"] for rec in sleep_telemetry], [4])
 
+    def test_14_release_3_1_surgical_fixes_and_multilingual_bpe(self):
+        """
+        v3.1.0 Gate:
+          1. MultilingualByteBPETokenizer 0-<unk> lossless Arabic/French/English/code roundtrip & auto-detect loader.
+          2. CLI prepare-data --tokenizer-type multilingual_bpe -> train -> generate end-to-end.
+          3. Non-destructive CPU frozen W_0 export (0.00e+00 parity vs live production_freeze, zero live mutation).
+          4. Kahan residual growth preservation & per-element high-armor ceiling enforcement.
+          5. Block-aligned neurogenesis rejuvenation, config exact_live_buffer_params_at_max,
+             streaming MMap val eval parity, and AtomicCheckpointVault backup rotation/reset.
+        """
+        import contextlib
+        import io
+        import tempfile
+        import unicodedata
+
+        from engine import (
+            EnglishSubwordTokenizer,
+            MixedPrecisionCompensator,
+            MultilingualByteBPETokenizer,
+            fused_spring_update_inplace,
+            load_tokenizer,
+        )
+        from trainer import AtomicCheckpointVault, MMapTokenDataset, evaluate_validation_batches
+        from trainer.cli import main as cli_main
+
+        samples = [
+            "السلام عليكم! كيفَ حالُكَ اليومَ؟ الذكاءُ الاصطناعيُّ يتطوّرُ بسرعةٍ مذهلة 🚀.",
+            "Bonjour l'univers! Les réseaux élastiques apprennent sans rétropropagation: café, déjà vu.",
+            "def spring_step(w: float, k: float = 0.85) -> float:\n    return (w * k) + 1.0  # == exact",
+        ]
+        tok_bpe = MultilingualByteBPETokenizer(max_vocab_size=512).fit(samples * 4, pad_to_max_vocab=True)
+        self.assertEqual(tok_bpe.vocab_size, 512)
+        tok_eng = EnglishSubwordTokenizer(max_vocab_size=128).fit(["hello world testing"], pad_to_max_vocab=True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = pathlib.Path(tmpdir)
+
+            # 1. Auto-detect load_tokenizer + 0-<unk> lossless Unicode NFC roundtrip
+            bpe_path = tmp_root / "tok_bpe.json"
+            eng_path = tmp_root / "tok_eng.json"
+            tok_bpe.save(bpe_path)
+            tok_eng.save(eng_path)
+            loaded_bpe = load_tokenizer(bpe_path)
+            loaded_eng = load_tokenizer(eng_path)
+            self.assertIsInstance(loaded_bpe, MultilingualByteBPETokenizer)
+            self.assertIsInstance(loaded_eng, EnglishSubwordTokenizer)
+
+            unseen = "اختبارٌ جديدٌ: C'est très rapide & 100% lossless 🧠!"
+            ids_unseen = loaded_bpe.encode(unseen, add_bos=True, add_eos=True)
+            self.assertNotIn(loaded_bpe.unk_id, ids_unseen)
+            self.assertEqual(
+                loaded_bpe.decode(ids_unseen, skip_special_tokens=True),
+                unicodedata.normalize("NFC", unseen),
+            )
+            for s in samples:
+                ids = loaded_bpe.encode(s, add_bos=True, add_eos=True)
+                self.assertNotIn(loaded_bpe.unk_id, ids)
+                self.assertEqual(
+                    loaded_bpe.decode(ids, skip_special_tokens=True),
+                    unicodedata.normalize("NFC", s),
+                )
+
+            # 2. CLI prepare-data --tokenizer-type multilingual_bpe -> train -> generate
+            corpus_file = tmp_root / "multi_corpus.txt"
+            corpus_file.write_text("\n\n".join(samples * 10), encoding="utf-8")
+            multi_data = tmp_root / "multi_data"
+            multi_vault = tmp_root / "multi_vault"
+            out_buf = io.StringIO()
+            with contextlib.redirect_stdout(out_buf):
+                rc_prep = cli_main([
+                    "prepare-data",
+                    "--input-file", str(corpus_file),
+                    "--out-dir", str(multi_data),
+                    "--tokenizer-type", "multilingual_bpe",
+                    "--vocab-size", "512",
+                    "--seq-len", "20",
+                    "--seed", "11",
+                ])
+            self.assertEqual(rc_prep, 0)
+            self.assertIsInstance(load_tokenizer(multi_data / "tokenizer.json"), MultilingualByteBPETokenizer)
+
+            with contextlib.redirect_stdout(out_buf):
+                rc_tr = cli_main([
+                    "train",
+                    "--data-dir", str(multi_data),
+                    "--vault-dir", str(multi_vault),
+                    "--num-layers", "2",
+                    "--d-init", "16",
+                    "--d-max", "32",
+                    "--delta-d", "16",
+                    "--block-size", "16",
+                    "--top-k-blocks", "1",
+                    "--max-seq-len", "20",
+                    "--attn-top-k", "4",
+                    "--dtype", "float32",
+                    "--kahan-mode", "off",
+                    "--epochs", "2",
+                    "--batch-size", "16",
+                    "--quiet",
+                ])
+            self.assertEqual(rc_tr, 0)
+            self.assertTrue((multi_vault / "best_frozen_w0.pt").exists())
+
+            gen_buf = io.StringIO()
+            with contextlib.redirect_stdout(gen_buf):
+                rc_gen = cli_main([
+                    "generate",
+                    "--vault-dir", str(multi_vault),
+                    "--prompt", "السلام عليك",
+                    "--max-new-tokens", "6",
+                ])
+            self.assertEqual(rc_gen, 0)
+            self.assertIn("السلام عليك", gen_buf.getvalue())
+
+            # 3. Streaming validation parity (MMapTokenDataset vs list of batches)
+            with MMapTokenDataset(multi_data, shard_name="val_shard", verify_checksum=True) as val_ds:
+                cfg_eval = SSENNConfig(
+                    vocab_size=512, num_layers=2, d_init=16, d_max=32, delta_d=16,
+                    block_size=16, top_k_blocks=1, max_seq_len=20, attn_top_k=4,
+                    dtype="float32", kahan_mode="off", device="cpu", seed=17,
+                )
+                m_eval = SSENNProductionModel(cfg_eval)
+                n_val = len(val_ds)
+                list_batches = [
+                    val_ds.get_batch(list(range(start, min(start + 8, n_val))))
+                    for start in range(0, n_val, 8)
+                ]
+                s_res = evaluate_validation_batches(m_eval, val_ds, pad_id=val_ds.pad_id, batch_size=8)
+                l_res = evaluate_validation_batches(m_eval, list_batches, pad_id=val_ds.pad_id, batch_size=8)
+                self.assertEqual(s_res["valid_tokens"], l_res["valid_tokens"])
+                self.assertAlmostEqual(s_res["ce"], l_res["ce"], places=6)
+                self.assertAlmostEqual(s_res["acc_pct"], l_res["acc_pct"], places=6)
+                self.assertAlmostEqual(s_res["ppl"], l_res["ppl"], places=5)
+
+            # 4. AtomicCheckpointVault backup rotation & corruption reset
+            vault = AtomicCheckpointVault(tmp_root / "rot_vault")
+            vault.save_checkpoint({"step": 1, "tensor": torch.arange(8)})
+            self.assertTrue(vault.latest_path.exists())
+            self.assertFalse(vault.backup_path.exists())
+            vault.save_checkpoint({"step": 2, "tensor": torch.arange(8)})
+            self.assertTrue(vault.latest_path.exists() and vault.backup_path.exists())
+            vault.corrupt_file_for_test("latest")
+            self.assertFalse(vault._latest_verified)
+            self.assertEqual(vault._latest_verified_size, -1)
+            loaded = vault.load_latest_valid_checkpoint()
+            self.assertTrue(loaded["found"] and loaded["source"] == "backup")
+            self.assertEqual(loaded["payload"]["step"], 1)
+
+        # 5. Non-destructive frozen W_0 export parity + zero live mutation
+        cfg_nd = SSENNConfig(
+            vocab_size=260, num_layers=2, d_init=16, d_max=32, delta_d=16,
+            block_size=16, top_k_blocks=1, max_seq_len=16, attn_top_k=4,
+            dtype="float32", kahan_mode="off", device="cpu", seed=23,
+        )
+        m1 = SSENNProductionModel(cfg_nd)
+        m2 = SSENNProductionModel(cfg_nd)
+        x = torch.randint(4, 260, (4, 16))
+        y = torch.randint(4, 260, (4, 16))
+        m1.train_minibatch(x, y, pad_id=0)
+        m2.load_full_checkpoint_state(m1.get_full_checkpoint_state())
+        pre_w = m1.spring_layers[0].w.clone()
+        pre_k = m1.spring_layers[0].k.clone()
+        exp_state, _ = m1.export_frozen_w0_state_nondestructive(map_location="cpu")
+        self.assertFalse(m1.frozen)
+        self.assertTrue(torch.equal(m1.spring_layers[0].w, pre_w))
+        self.assertTrue(torch.equal(m1.spring_layers[0].k, pre_k))
+        m2.production_freeze(prune_dormant=True)
+        ref_state = m2.export_frozen_w0_state()
+        for key, val in exp_state["w0_tensors"].items():
+            if isinstance(val, torch.Tensor):
+                self.assertEqual((val - ref_state["w0_tensors"][key]).abs().max().item(), 0.0)
+            elif isinstance(val, list):
+                for idx_l, lt in enumerate(val):
+                    self.assertEqual((lt - ref_state["w0_tensors"][key][idx_l]).abs().max().item(), 0.0)
+
+        # 6. Kahan residual retention across growth + per-element bedrock bound
+        comp = MixedPrecisionCompensator(mode="full")
+        _, rw0, rk = comp.get_residuals("layer0", (4, 8), torch.device("cpu"))
+        rw0.fill_(0.0025)
+        rk.fill_(-0.00125)
+        _, rw0_g, rk_g = comp.get_residuals("layer0", (8, 8), torch.device("cpu"))
+        self.assertTrue(torch.allclose(rw0_g[:4], torch.full((4, 8), 0.0025)))
+        self.assertTrue(torch.allclose(rk_g[:4], torch.full((4, 8), -0.00125)))
+        self.assertTrue(torch.all(rw0_g[4:] == 0.0) and torch.all(rk_g[4:] == 0.0))
+
+        kw = torch.tensor([[1.0, 1.0]])
+        kw0 = torch.tensor([[0.0, 0.0]])
+        kk = torch.tensor([[0.90, 0.20]])
+        kdrv = torch.tensor([[10.0, 10.0]])
+        fused_spring_update_inplace(
+            w=kw, w0=kw0, k=kk, driving_signal=kdrv,
+            eta_w=0.05, eta_0=0.02, gamma=0.01, beta_k_eff=0.90, stiff_ceil=0.80,
+            cubic_shield=True,
+        )
+        self.assertGreaterEqual(float(kk[0, 0]), 0.89)
+        self.assertLessEqual(float(kk[0, 0]), 0.98 + 1e-6)
+        self.assertLessEqual(float(kk[0, 1]), 0.80 + 1e-6)
+
+        # 7. Exact buffer count & block-aligned neurogenesis slot revival + sleep metrics
+        cfg_exact = SSENNConfig(
+            vocab_size=260, num_layers=2, d_init=32, d_max=32, delta_d=16,
+            block_size=16, top_k_blocks=1, max_seq_len=16, attn_top_k=4,
+            dtype="float32", kahan_mode="off", device="cpu",
+        )
+        m_exact = SSENNProductionModel(cfg_exact)
+        self.assertEqual(
+            cfg_exact.estimate_memory_footprint()["exact_live_buffer_params_at_max"],
+            m_exact.count_parameters_breakdown()["live_buffer_params"],
+        )
+
+        m_exact.current_epoch = 5
+        m_exact.epoch_block_win_counts[0].fill_(10.0)
+        m_exact.rejuvenated_slots[0] = [1, 2, 3]
+        m_exact._sync_rejuv_idx_tensors()
+        ng_res = m_exact.step_neurogenesis(mean_ce_loss=2.0)
+        self.assertTrue(ng_res["grew"])
+        self.assertEqual(ng_res["woke_total"], 3)
+        self.assertEqual(m_exact.spring_layers[0].d_active % 16, 0)
+        self.assertIsNone(m_exact._rejuv_idx_tensors[0])
+        self.assertEqual(m_exact.forward(x[:2]).shape, (2, 16, 260))
+        sl_res = m_exact.sleep_consolidate()
+        for k_req in ("merged_total", "pruned_total", "locked_total"):
+            self.assertIn(k_req, sl_res)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

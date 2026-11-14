@@ -38,17 +38,29 @@ from .mmap_dataset import MMapTokenDataset, ResumableBatchStreamer
 @torch.no_grad()
 def evaluate_validation_batches(
     model: SSENNProductionModel,
-    val_batches: Sequence[tuple[torch.Tensor, torch.Tensor]],
+    val_batches: Sequence[tuple[torch.Tensor, torch.Tensor]] | MMapTokenDataset | None,
     pad_id: int = 0,
+    batch_size: int = 32,
 ) -> dict[str, float]:
-    """Side-effect-free validation accuracy, mean CE loss, and perplexity."""
-    if not val_batches:
+    """Side-effect-free validation accuracy, mean CE loss, and perplexity (supports O(1) RAM MMap streaming)."""
+    if val_batches is None or len(val_batches) == 0:
         return {"acc_pct": 0.0, "ce": 0.0, "ppl": 1.0, "valid_tokens": 0}
     correct = 0
     valid = 0
     ce_sum = 0.0
     dev = model.model_device
-    for x_b, y_b in val_batches:
+
+    if isinstance(val_batches, MMapTokenDataset):
+        n_val = len(val_batches)
+        step_bs = max(1, int(batch_size))
+        batch_iter = (
+            val_batches.get_batch(list(range(start, min(start + step_bs, n_val))))
+            for start in range(0, n_val, step_bs)
+        )
+    else:
+        batch_iter = iter(val_batches)
+
+    for x_b, y_b in batch_iter:
         x_d = x_b.to(device=dev)
         y_d = y_b.to(device=dev)
         logits = model.forward(x_d)
@@ -178,8 +190,16 @@ class ElasticCloudTrainer:
                 "resumed_batch_cursor": 0,
             }
 
+        target_dev = self.config.resolve_torch_device()
+        target_dtype = str(self.config.dtype)
         payload = loaded["payload"]
         self.model = SSENNProductionModel.from_checkpoint_state(payload["model_state"])
+        cur_dev = self.model.model_device
+        dev_mismatch = (cur_dev.type != target_dev.type) or (
+            target_dev.index is not None and cur_dev.index != target_dev.index
+        )
+        if dev_mismatch or self.model.config.dtype != target_dtype:
+            self.model.to_device_and_dtype(device=target_dev, dtype=target_dtype)
         self.config = self.model.config
 
         ts = payload.get("trainer_state", {})
@@ -251,10 +271,7 @@ class ElasticCloudTrainer:
         if not self.keep_best_frozen:
             return None
 
-        ckpt_snap = self.model.get_full_checkpoint_state()
-        clone = SSENNProductionModel.from_checkpoint_state(ckpt_snap)
-        freeze_stats = clone.production_freeze(prune_dormant=True)
-        w0_state = clone.export_frozen_w0_state()
+        w0_state, freeze_stats = self.model.export_frozen_w0_state_nondestructive(map_location="cpu")
         w0_state["val_metrics"] = {
             "epoch": int(epoch),
             "global_step": int(self.global_step),
@@ -280,7 +297,7 @@ class ElasticCloudTrainer:
     def fit(
         self,
         train_dataset: MMapTokenDataset,
-        val_batches: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        val_batches: Sequence[tuple[torch.Tensor, torch.Tensor]] | MMapTokenDataset | None = None,
         epochs: int = 6,
         batch_size: int = 32,
         pad_id: int = 0,
@@ -466,12 +483,15 @@ class ElasticCloudTrainer:
                 last_train_acc = (float(ep_correct) / max(ep_valid, 1)) * 100.0
                 growth_info = self.model.end_epoch(epoch=ep, mean_ce_loss=last_train_ce)
 
+                has_val = val_batches is not None and len(val_batches) > 0
                 val_metrics = (
-                    evaluate_validation_batches(self.model, val_batches, pad_id=pad_id)
-                    if val_batches
+                    evaluate_validation_batches(
+                        self.model, val_batches, pad_id=pad_id, batch_size=batch_size
+                    )
+                    if has_val
                     else {"acc_pct": 0.0, "ce": 0.0, "ppl": 1.0, "valid_tokens": 0}
                 )
-                if val_batches:
+                if has_val:
                     self._maybe_export_best_frozen(val_metrics, epoch=ep)
 
                 if (

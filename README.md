@@ -1,10 +1,11 @@
-# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0, v2.0 & v3.0.1)
+# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0, v2.0 & v3.1.0)
 **الشبكات العصبية المرنة ذاتية التشكيل — إطار تعلم موضعي خالٍ من الانتشار العكسي للتوليد المتسلسل والتعلم المستمر**
 
-*A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Dual-Horizon Sparse Causal Attention, Hardware-Accelerated Kernels, Fault-Tolerant Cloud Training, and O(1) Stateful Inference*
+*A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Dual-Horizon Sparse Causal Attention, Hardware-Accelerated Kernels, Multilingual Byte-BPE, Fault-Tolerant Cloud Training, and O(1) Stateful Inference*
 
-[![Release v3.0.1](https://img.shields.io/badge/Release-v3.0.1%20Production-brightgreen)](./docs/V3_PRODUCTION_TRAINING_GUIDE.md)
+[![Release v3.1.0](https://img.shields.io/badge/Release-v3.1.0%20Production-brightgreen)](./docs/V3_PRODUCTION_TRAINING_GUIDE.md)
 [![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(38%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
+[![Test Suite 14/14](https://img.shields.io/badge/Tests-14%2F14%20Passing-brightgreen)](./tests/test_suite.py)
 [![v3.0 Phase 3.3 Fault-Tolerant](https://img.shields.io/badge/Phase%203.3-0.00e%2B00%20Kill%2FSIGTERM%20%7C%2032.2M%20tok%2Fs-blueviolet)](./benchmarks/bench_v3_trainer_fault_tolerance.py)
 [![v3.0 Phase 3.2 Production Model](https://img.shields.io/badge/Phase%203.2-92.62%25%20Frozen%20W0%20%7C%200.00e%2B00%20Resume-blue)](./benchmarks/bench_v3_production_model.py)
 [![v3.0 Phase 3.1 Kernels & O(1) Cache](https://img.shields.io/badge/Phase%203.1-0.00%20MB%20Upd%20%7C%2099.2%25%20DFA%20Saved%20%7C%207.31x%20O(1)-orange)](./benchmarks/bench_v3_kernels_speed.py)
@@ -93,8 +94,8 @@ next-23-MTL/
 │   ├── sparse_attention.py           # Zero-autograd Sparse Causal Self-Attention (Top-K = 3..5)
 │   ├── dfa_router.py                 # Fixed & Adaptive Direct Feedback Alignment (B^(l) matrices)
 │   ├── causal_context.py             # Autoregressive causal context processor
-│   ├── kernels.py                    # v3.0 Phase 3.1 fused kernels, FactorizedDFA, Kahan BF16 & O(1) Cache
-│   └── tokenizer.py                  # Hybrid English Word + BPE Subword Tokenizer (V=2048..4096)
+│   ├── kernels.py                    # v3.1.0 fused kernels, FactorizedDFA, Kahan growth retention & O(1) Cache
+│   └── tokenizer.py                  # EnglishSubwordTokenizer & lossless MultilingualByteBPETokenizer (0 <unk>)
 ├── models/                           # حزمة النماذج المعزولة (v1.0, v2.0 Scaled & v3.0 Production)
 │   ├── __init__.py
 │   ├── model_mvp.py                  # Base SpringGenerativeNetwork (MVP)
@@ -107,8 +108,8 @@ next-23-MTL/
 ├── trainer/                          # حزمة التدريب السحابي المقاوم للأعطال وواجهة سطر الأوامر (v3.0 Phases 3.3–3.4)
 │   ├── __init__.py
 │   ├── mmap_dataset.py               # BinaryShardBuilder, MMapTokenDataset (O(1) RAM) & ResumableBatchStreamer
-│   ├── checkpoint_vault.py           # AtomicCheckpointVault (SHA-256 + backup fallback) & SIGTERM watchdog
-│   ├── colab_orchestrator.py         # ElasticCloudTrainer (mid-epoch resume, non-destructive best_frozen_w0.pt)
+│   ├── checkpoint_vault.py           # AtomicCheckpointVault (SHA-256 + O(1) backup rotation) & SIGTERM watchdog
+│   ├── colab_orchestrator.py         # ElasticCloudTrainer (streaming MMap val, CPU non-destructive best_frozen_w0)
 │   └── cli.py                        # Unified CLI: python -m trainer.cli {estimate,prepare-data,train,generate}
 ├── benchmarks/                       # حزمة التجارب المعملية والبيانات
 │   ├── __init__.py
@@ -129,9 +130,9 @@ next-23-MTL/
 │   └── bench_v3_trainer_fault_tolerance.py # v3.0 Phase 3.3: MMap O(1), Kill/Corrupt/SIGTERM recovery parity
 ├── tests/                            # حزمة التحقق الصارم وفحص AST
 │   ├── __init__.py
-│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (38 files, 13 tests)
+│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (38 files, 14 tests)
 ├── docs/                             # الأوراق البحثية وسجل الإصلاحات وأدلة الإنتاج
-│   ├── V3_PRODUCTION_TRAINING_GUIDE.md # v3.0.0 Bilingual Production Manual (Google Colab, 5TB Drive, 15M-7B+ Scaling)
+│   ├── V3_PRODUCTION_TRAINING_GUIDE.md # v3.1.0 Bilingual Production Manual (Google Colab, Drive, Multilingual BPE)
 │   ├── RESEARCH_PAPER_SS_ENN.md      # Full technical paper, equations, empirical tables & reproducibility
 │   ├── V2_ENGINEERING_LOG_AND_FIXES.md # Detailed v2.0 & v3.0 Phases 3.1–3.4 engineering upgrades & audit
 │   ├── LIMITATIONS_AND_V2_ROADMAP.md # Critical scaling analysis & SS-ENN v2.0 execution roadmap
@@ -159,18 +160,19 @@ python tests/test_suite.py
 python train_eval.py
 ```
 
-### 3. واجهة الإطلاق الإنتاجية الموحدة (`v3.0.1 Unified CLI`) — سطر واحد للتقدير، التجهيز، التدريب، والتوليد
+### 3. واجهة الإطلاق الإنتاجية الموحدة (`v3.1.0 Unified CLI`) — سطر واحد للتقدير، التجهيز، التدريب، والتوليد
 ```bash
 # 1) فحص الذاكرة والتوصية بالعتاد قبل حجز الـ GPU (مثال 7B مع anchor_k)
 python -m trainer.cli estimate --vocab-size 32000 --num-layers 32 --d-init 3072 --d-max 6656 --delta-d 512 --top-k-blocks 32 --max-seq-len 2048 --attn-top-k 16 --dtype bfloat16 --kahan-mode anchor_k
 
-# 2) تجهيز البيانات الثنائية (uint16 / SHA-256) مع تقطيع النصوص الطويلة دون هدر
+# 2) تجهيز البيانات الثنائية (uint16 / SHA-256) للمدونة الإنجليزية أو متعددة اللغات (--tokenizer-type multilingual_bpe)
 python -m trainer.cli prepare-data --builtin-tinystories --out-dir ./shards_data --vocab-size 2048 --seq-len 36
+python -m trainer.cli prepare-data --input-file ./corpus.txt --out-dir ./multi_shards --tokenizer-type multilingual_bpe --vocab-size 8192 --seq-len 128
 
 # 3) التدريب المقاوم للانقطاع والاستئناف التلقائي (--seq-len يُستنتج من الشظية و --sleep-every-epochs 0 افتراضياً)
 python -m trainer.cli train --data-dir ./shards_data --vault-dir ./ssenn_vault --epochs 14 --ckpt-every-steps 20 --sleep-every-epochs 0 --auto-resume
 
-# 4) التوليد السريع بذاكرة O(1) من النموذج المجمّد best_frozen_w0.pt
+# 4) التوليد السريع بذاكرة O(1) من النموذج المجمّد best_frozen_w0.pt (بكشف تلقائي للمُرمِّز)
 python -m trainer.cli generate --vault-dir ./ssenn_vault --prompt "Once upon a time" --max-new-tokens 40
 ```
 
@@ -220,7 +222,7 @@ python benchmarks/bench_v3_trainer_fault_tolerance.py
 
 ## التوثيق العلمي وأدلة الإنتاج | Research Documentation & Production Manual
 
-- **[الدليل الهندسي الشامل للتدريب الإنتاجي على Google Colab & Drive (`docs/V3_PRODUCTION_TRAINING_GUIDE.md`)](./docs/V3_PRODUCTION_TRAINING_GUIDE.md):** الدليل الكامل للإصدار الثالث **`v3.0.0`** شاملاً ربط `5TB Google Drive`، تحضير شظايا `mmap`، جدول الأبعاد اليدوية من `15M` إلى `7B+` (`full` vs `anchor_k`)، المراقبة عبر `training_telemetry.jsonl`، والتوليد بذاكرة $O(1)$.
+- **[الدليل الهندسي الشامل للتدريب الإنتاجي على Google Colab & Drive (`docs/V3_PRODUCTION_TRAINING_GUIDE.md`)](./docs/V3_PRODUCTION_TRAINING_GUIDE.md):** الدليل الكامل للإصدار **`v3.1.0`** شاملاً ربط `5TB Google Drive`، تحضير شظايا `mmap` (مع دعم `MultilingualByteBPETokenizer`)، جدول الأبعاد اليدوية من `15M` إلى `7B+` (`full` vs `anchor_k`)، المراقبة عبر `training_telemetry.jsonl`، والتوليد بذاكرة $O(1)$.
 - **[الورقة البحثية المتكاملة (`docs/RESEARCH_PAPER_SS_ENN.md`)](./docs/RESEARCH_PAPER_SS_ENN.md):** الاشتقاق النظري لقوانين النابض الثلاثة، معادلات التوجيه المباشر (`DFA`)، التجارب الكاملة للإصدارات `v1.0–v3.0`، وظاهرة التشكيل الذاتي وترشيح الضوضاء عبر نقطة الارتكاز (`Anchor Denoising Effect`).
 - **[سجل الإصلاحات والترقيات الفيزيائية وسجلات الإنتاج (`docs/V2_ENGINEERING_LOG_AND_FIXES.md`)](./docs/V2_ENGINEERING_LOG_AND_FIXES.md):** التوثيق الرياضي والبرمجي التفصيلي لمراحل **`v2.0 (2.1–2.5)`** و**`v3.0 (3.1–3.4)`** وكافة الجداول المعملية.
 - **[وثيقة الحدود المعمارية وخارطة طريق الإصدار الثاني (`docs/LIMITATIONS_AND_V2_ROADMAP.md`)](./docs/LIMITATIONS_AND_V2_ROADMAP.md):** مراجعة نقدية شاملة للسبع عقبات القياسية نحو نماذج `1B` ومصفوفة التقدم التنفيذية.

@@ -1,5 +1,5 @@
-# دليل التدريب الإنتاجي الشامل على السحابة و Google Colab & Drive — SS-ENN v3.0.1
-**Comprehensive Production Training Manual for Google Colab, 5TB Google Drive Vaults & Local Acceleration (`v3.0.1`)**
+# دليل التدريب الإنتاجي الشامل على السحابة و Google Colab & Drive — SS-ENN v3.1.0
+**Comprehensive Production Training Manual for Google Colab, 5TB Google Drive Vaults, Multilingual Byte-BPE & Zero-Copy Cloud Export (`v3.1.0`)**
 
 ---
 
@@ -24,10 +24,9 @@ flowchart LR
 ```
 
 ### الأدوار الأساسية للوحدات الإنتاجية
-- **`engine/kernels.py`**: تحديث موضعي مدمج خالٍ من التخصيص (`fused_spring_update_inplace`, `0.00 MB` تحديث للأوزان)، ضرب مقصوص للكتل النشطة، `FactorizedHighwayDFA` لتقليص ذاكرة التوجيه بنسبة حتى `99.20%` عند `V=32,000`، ومعوّض الدقة المختلطة `MixedPrecisionCompensator` (`Kahan FP32`)، وذاكرة الاستدلال $O(1)$ (`SpringInferenceCache`).
-- **`models/config_v3.py` & `models/model_v3_production.py`**: ضبط يدوي صريح لكافة الأبعاد (`SSENNConfig`) مع مقدّر بصمة ذاكرة بدون تخصيص (`estimate_memory_footprint()`)، وترسيب مرن نهائي (`Final Elastic Settlement`) داخل `production_freeze()` يضمن مطابقة `Frozen W0` لدقة ما قبل التجميد.
-- **`trainer/mmap_dataset.py`**: شرائح ثنائية فائقة السرعة تُقرأ بذاكرة خرائط مقيّدة بـ `O(1)` (`1.93 KB` بيانات وصفية حتى لملايين الرموز وبمعدل تدفق يتجاوز `32M tok/s`) مع استئناف حتمي لموضع الحقبة والدفعة (`get_streamer_state()`).
-- **`trainer/checkpoint_vault.py` & `trainer/colab_orchestrator.py`**: حفظ ذري مضاعف الجيل مع بصمة تحقق `SHA-256` وارتداد ذاتي تلقائي إلى `checkpoint_backup.pt` عند تلف الملف الرئيسي، وتصدير غير مدمر لأفضل نسخة مجمّدة (`best_frozen_w0.pt`).
+- **`engine/kernels.py` & `engine/tokenizer.py`**: تحديث موضعي مدمج خالٍ من التخصيص (`fused_spring_update_inplace`, `0.00 MB` تحديث للأوزان)، حفظ متبقيات `Kahan FP32` عبر نمو `Neurogenesis` وقفل سقف الصلابة المسلّحة لكل عنصر على حدة، `FactorizedHighwayDFA` لتقليص ذاكرة التوجيه بنسبة حتى `99.20%` عند `V=32,000`، وذاكرة الاستدلال $O(1)$ (`SpringInferenceCache`). إضافةً إلى مُرمِّز **`MultilingualByteBPETokenizer`** متعدد اللغات بلا فقدان (`0 <unk>` للعربية والتشكيل والفرنسية والإنجليزية والبرمجة مع كشف ذاتي عبر `load_tokenizer`).
+- **`models/config_v3.py` & `models/model_v3_production.py`**: ضبط يدوي صريح لكافة الأبعاد (`SSENNConfig`) مع مقدّر بصمة ذاكرة بدون تخصيص (`estimate_memory_footprint()` مع حقول `exact_live_buffer_params_at_init/max`)، إحياء متوافق مع كتلة `block_size` لفتحات `Neurogenesis`، وتصدير غير مدمر مباشرة نحو الـ CPU (`export_frozen_w0_state_nondestructive`) بتطابق `0.00e+00` مع `production_freeze()` ودون مضاعفة VRAM.
+- **`trainer/mmap_dataset.py` & `trainer/checkpoint_vault.py` & `trainer/colab_orchestrator.py`**: تدفق شرائح ثنائية بذاكرة $O(1)$، تقييم تحقق متدفق مباشرةً عبر `MMapTokenDataset`، دوران ذري للنسخ الاحتياطي $O(1)$ عبر `os.replace` عند تطابق حجم الـ checksum في `AtomicCheckpointVault`، وحارس `SIGINT/SIGTERM` مع ارتداد ذاتي إلى `checkpoint_backup.pt`.
 - **`trainer/cli.py`**: بوابة تشغيل موحدة بأربعة أوامر (`estimate`, `prepare-data`, `train`, `generate`).
 
 ---
@@ -71,7 +70,11 @@ if torch.cuda.is_available():
 
 ## 3. تجهيز البيانات الضخمة على Google Drive (`prepare-data`)
 
-يقوم الأمر الفرعي `prepare-data` بتدريب/تجهيز `EnglishSubwordTokenizer` (`tokenizer.json`) وتحويل المدونات النصية إلى شظايا ثنائية مضغوطة:
+يقوم الأمر الفرعي `prepare-data` بتجهيز مُرمِّز النصوص (`tokenizer.json`) عبر خيارين متوافقين عكسياً (`--tokenizer-type`):
+1. **`english_subword`** *(الافتراضي للحفاظ على التوافقية)*: `EnglishSubwordTokenizer` الموجه للمدونات الإنجليزية.
+2. **`multilingual_bpe`** *(جديد في `v3.1.0`)*: **`MultilingualByteBPETokenizer`** على مستوى البايت (`UTF-8 + Unicode NFC`)، يدعم **العربية (بما فيها التشكيل)، الفرنسية، الإنجليزية، الإيموجي، والأكواد البرمجية** بانعدام تام لرمز المجهول (`0 <unk>`) واسترجاع غير منقوص بنسبة `100%`، مع كشف تلقائي عند التحميل في `train` و `generate` عبر `load_tokenizer()`.
+
+مواصفات التخزين والمعالجة:
 - نوع البيانات تلقائياً **`uint16`** إذا كان `vocab_size <= 65536` (بايتان فقط لكل رمز، أي `2 GB` تخزن **`1 مليار رمز`** بالكامل)، أو **`uint32`** للمفردات الأكبر.
 - **تقطيع النصوص الطويلة دون هدر (`v3.0.1 Strided Chunking`):** عندما يتجاوز طول الفقرة أو القصة نافذة `row_stride = seq_len + 1`، يقسّم `BinaryShardBuilder.build_from_stories` التسلسل تلقائياً إلى نوافذ متتالية بخطوة `seq_len` (مع الاحتفاظ بأي ذيل أخير بطول `>= 4` رموز)، فلا تضيع بقية السطور الطويلة في `--input-file`.
 - يُحفظ لكل شظية ملف `.meta.json` يتضمن بصمة التحقق **`SHA-256`** للتأكد من سلامة النقل بين SSD و Google Drive.
@@ -79,7 +82,16 @@ if torch.cuda.is_available():
 ### أ. تجهيز بياناتك النصية الخاصة (أو مدونة القصص المدمجة للاختبار السريع)
 
 ```bash
-# 1) تحويل ملف نصي ضخم على Google Drive إلى شظايا ثنائية سريعة محلياً (أو على Drive مباشرة)
+# 1) تحويل ملف نصي متعدد اللغات (عربي/فرنسي/إنجليزي/برمجة) إلى شظايا ثنائية عبر Byte-BPE
+python -m trainer.cli prepare-data \
+  --input-file /content/drive/MyDrive/datasets/multilingual_corpus.txt \
+  --out-dir /content/drive/MyDrive/SS_ENN_Shards/multi_32k \
+  --tokenizer-type multilingual_bpe \
+  --vocab-size 32000 \
+  --seq-len 128 \
+  --train-ratio 0.95
+
+# 2) أو تحويل ملف إنجليزي بالمُرمِّز الكلاسيكي (english_subword افتراضياً)
 python -m trainer.cli prepare-data \
   --input-file /content/drive/MyDrive/datasets/english_corpus.txt \
   --out-dir /content/drive/MyDrive/SS_ENN_Shards/run_32k \
@@ -87,7 +99,7 @@ python -m trainer.cli prepare-data \
   --seq-len 128 \
   --train-ratio 0.95
 
-# 2) أو تجربة سريعة باستعمال مدونة TinyStories المدمجة في المستودع
+# 3) أو تجربة سريعة باستعمال مدونة TinyStories المدمجة في المستودع
 python -m trainer.cli prepare-data \
   --builtin-tinystories \
   --out-dir /content/shards_demo \
@@ -179,7 +191,7 @@ for line in log_path.read_text(encoding="utf-8").splitlines()[-10:]:
 أنواع الأحداث القياسية المسجلة:
 - `periodic_checkpoint`: رقم الحقبة، الدفعة التالية `next_batch_cursor`، الخطوة العالمية `global_step`، وزمن الحفظ `save_ms`.
 - `epoch_end`: `train_acc_pct`, `train_ce`, `val_acc_pct`, `val_ppl`, الأبعاد الفعالة `active_dims`, وهل توسعت الشبكة `grew`.
-- `best_frozen_w0_exported`: يُطلق تلقائياً عند تسجيل أعلى `val_acc_pct`، حيث يستنسخ نسخة معزولة ويجمدها (`Final Elastic Settlement + prune_dormant`) إلى `best_frozen_w0.pt` دون إيقاف التدريب الحي.
+- `best_frozen_w0_exported`: يُطلق تلقائياً عند تسجيل أعلى `val_acc_pct` عبر `export_frozen_w0_state_nondestructive(map_location="cpu")` لحساب وحفظ `best_frozen_w0.pt` مباشرة إلى ذاكرة CPU (`Final Elastic Settlement + prune_dormant`) بتطابق `0.00e+00` ودون إيقاف التدريب أو مضاعفة ذاكرة VRAM.
 - `emergency_preemption_save` / `corrupt_checkpoint_fallback` / `checkpoint_resumed` / `sleep_consolidation`.
 
 ### 5.3 التوليد الفوري من النموذج المجمّد `best_frozen_w0.pt` بذاكرة $O(1)$
