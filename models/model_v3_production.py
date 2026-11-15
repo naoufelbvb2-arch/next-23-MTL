@@ -807,9 +807,13 @@ class SSENNProductionModel(nn.Module):
     ) -> torch.Tensor:
         in_dim = a_prev_eff.shape[1]
         if self.frozen:
-            w_sub = layer.w0[:, :in_dim] if layer.w0.shape[1] != in_dim else layer.w0
+            d_sub = layer.d_active
+            w_sub = (
+                layer.w0[:d_sub, :in_dim]
+                if (layer.w0.shape[0] != d_sub or layer.w0.shape[1] != in_dim)
+                else layer.w0
+            )
             z_act = F.linear(a_prev_eff, w_sub)
-            d_sub = z_act.shape[1]
         else:
             d_sub = layer.d_active
             z_act = F.linear(a_prev_eff, layer.w[:d_sub, :in_dim])
@@ -921,9 +925,10 @@ class SSENNProductionModel(nn.Module):
 
         if self.frozen:
             h_w0 = cached_head_w0 if cached_head_w0 is not None else self.head_w0
-            in_dim = h_w0.shape[1]
+            in_dim = min(h_w0.shape[1], d_last)
             a_head = a[:, :in_dim] if a.shape[1] != in_dim else a
-            logits = F.linear(a_head, h_w0)
+            h_w0_eff = h_w0[:, :in_dim] if h_w0.shape[1] != in_dim else h_w0
+            logits = F.linear(a_head, h_w0_eff)
         else:
             a_head = a[:, :d_last] if a.shape[1] != d_last else a
             logits = F.linear(a_head, self.head_w[:, :d_last])
@@ -1105,9 +1110,9 @@ class SSENNProductionModel(nn.Module):
                 layer.k[dorm_idx, :] = 0.0
             if self.armor_locked_masks[l_idx][:d_act].any() and l_idx < len(self.layer_w0_bedrock):
                 locked = self.armor_locked_masks[l_idx][:d_act]
-                bed = self.layer_w0_bedrock[l_idx][:d_act][locked, :d_eff]
-                layer.w0[:d_act][locked, :d_eff].copy_(bed)
-                layer.w[:d_act][locked, :d_eff].copy_(bed)
+                bed = self.layer_w0_bedrock[l_idx][:d_act, :d_eff][locked]
+                layer.w0[:d_act, :d_eff][locked] = bed
+                layer.w[:d_act, :d_eff][locked] = bed
 
             if layer._last_a is not None:
                 unlocked_gate = (~self.armor_locked_masks[l_idx][:d_act]).float().unsqueeze(1)
@@ -1141,9 +1146,9 @@ class SSENNProductionModel(nn.Module):
             comp_key="output_head",
         )
         if self.head_armor_mask.any() and self.head_w0_bedrock is not None:
-            h_bed = self.head_w0_bedrock[self.head_armor_mask, :d_last]
-            self.head_w0[self.head_armor_mask, :d_last].copy_(h_bed)
-            self.head_w[self.head_armor_mask, :d_last].copy_(h_bed)
+            h_bed = self.head_w0_bedrock[:, :d_last][self.head_armor_mask]
+            self.head_w0[:, :d_last][self.head_armor_mask] = h_bed
+            self.head_w[:, :d_last][self.head_armor_mask] = h_bed
 
         self._reset_step_cache()
         return {
@@ -1235,6 +1240,9 @@ class SSENNProductionModel(nn.Module):
             self.head_w[:, old_max_d:new_max_d].copy_(cols_w)
             self.head_w0[:, old_max_d:new_max_d].copy_(cols_w)
             self.head_k[:, old_max_d:new_max_d].zero_()
+            if self.head_armor_mask.any():
+                self.head_w[:, old_max_d:new_max_d][self.head_armor_mask] = 0.0
+                self.head_w0[:, old_max_d:new_max_d][self.head_armor_mask] = 0.0
 
         dims = self.get_allocated_dimensions()
         if woke_total > 0:
@@ -1273,7 +1281,7 @@ class SSENNProductionModel(nn.Module):
         cfg = self.config
         m_thresh = cfg.sleep_merge_threshold if merge_cosine_threshold is None else float(merge_cosine_threshold)
         p_ratio = cfg.sleep_prune_ratio if prune_ratio is None else float(prune_ratio)
-        d_eff, _ = self._effective_dims()
+        d_eff, d_last = self._effective_dims()
 
         while len(self.layer_w0_bedrock) < self.num_layers:
             self.layer_w0_bedrock.append(
@@ -1360,7 +1368,7 @@ class SSENNProductionModel(nn.Module):
             active_surv = [j for j in cand if j not in set(self.rejuvenated_slots[l_idx])]
             if active_surv:
                 s_idx = torch.tensor(active_surv, dtype=torch.long, device=self.model_device)
-                self.layer_w0_bedrock[l_idx][s_idx, :d_eff].copy_(layer.w0[s_idx, :d_eff])
+                self.layer_w0_bedrock[l_idx][:, :d_eff][s_idx] = layer.w0[:, :d_eff][s_idx]
                 k_lock = torch.linspace(
                     cfg.sleep_lock_min_k,
                     cfg.sleep_lock_max_k,
@@ -1368,7 +1376,7 @@ class SSENNProductionModel(nn.Module):
                     device=self.model_device,
                     dtype=layer.k.dtype,
                 ).unsqueeze(-1)
-                layer.k[s_idx, :d_eff].copy_(k_lock.expand(-1, d_eff))
+                layer.k[:, :d_eff][s_idx] = k_lock.expand(-1, d_eff)
                 self.armor_locked_masks[l_idx][s_idx] = True
 
             merged_per_layer.append(merged)
@@ -1377,11 +1385,15 @@ class SSENNProductionModel(nn.Module):
 
         seen_mask = self.phase_seen_targets > 0
         if seen_mask.any():
-            self.head_w0[seen_mask, :d_eff].lerp_(self.head_w[seen_mask, :d_eff], 0.50)
-            self.head_w[seen_mask, :d_eff].copy_(self.head_w0[seen_mask, :d_eff])
-            self.head_k[seen_mask, :d_eff].clamp_(min=cfg.sleep_lock_min_k, max=cfg.sleep_lock_max_k)
+            hw0_view = self.head_w0[:, :d_last]
+            hw_view = self.head_w[:, :d_last]
+            hk_view = self.head_k[:, :d_last]
+            blended = hw0_view[seen_mask].lerp(hw_view[seen_mask], 0.50)
+            hw0_view[seen_mask] = blended
+            hw_view[seen_mask] = blended
+            hk_view[seen_mask] = hk_view[seen_mask].clamp(min=cfg.sleep_lock_min_k, max=cfg.sleep_lock_max_k)
             self.head_armor_mask[seen_mask] = True
-            self.head_w0_bedrock[seen_mask, :d_eff].copy_(self.head_w0[seen_mask, :d_eff])
+            self.head_w0_bedrock[:, :d_last][seen_mask] = blended
             self.phase_seen_targets.zero_()
 
         self._sync_rejuv_idx_tensors()

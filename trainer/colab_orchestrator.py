@@ -299,6 +299,7 @@ class ElasticCloudTrainer:
         train_dataset: MMapTokenDataset,
         val_batches: Sequence[tuple[torch.Tensor, torch.Tensor]] | MMapTokenDataset | None = None,
         epochs: int = 6,
+        start_epoch: int = 1,
         batch_size: int = 32,
         pad_id: int = 0,
         shuffle: bool = True,
@@ -326,7 +327,7 @@ class ElasticCloudTrainer:
             drop_last=drop_last,
             base_seed=seed,
             prefetch_batches=prefetch_batches,
-            start_epoch=1,
+            start_epoch=int(start_epoch),
         )
 
         resume_info = {

@@ -5,6 +5,7 @@ Supports special tokens (<pad>, <bos>, <eos>, <unk>), subword fallback for rare/
 morphological variants, and vectorized batch encoding/decoding.
 Strictly zero autograd / zero backward().
 """
+import heapq
 import json
 import re
 import unicodedata
@@ -497,24 +498,22 @@ class MultilingualByteBPETokenizer:
 
         target_merges = self.max_vocab_size - len(self.id_to_token)
         min_freq = max(1, int(min_frequency))
+        heap: list[tuple[int, int, int]] = [
+            (-count, pair[0], pair[1])
+            for pair, count in pair_counts.items()
+            if count >= min_freq
+        ]
+        heapq.heapify(heap)
 
         for _ in range(max(0, target_merges)):
-            # Prune zero/stale counts while finding the deterministic maximum-frequency pair
             best_pair = None
-            best_score = (min_freq - 1, 0, 0)
-            stale_pairs: list[tuple[int, int]] = []
-            for pair, count in pair_counts.items():
-                if count <= 0:
-                    stale_pairs.append(pair)
-                    continue
-                if count >= min_freq:
-                    score = (count, -pair[0], -pair[1])
-                    if score > best_score:
-                        best_score = score
-                        best_pair = pair
-            for sp in stale_pairs:
-                pair_counts.pop(sp, None)
-                pair_indices.pop(sp, None)
+            while heap:
+                neg_c, a_cand, b_cand = heapq.heappop(heap)
+                c_cand = -neg_c
+                pair_cand = (a_cand, b_cand)
+                if c_cand >= min_freq and pair_counts.get(pair_cand, 0) == c_cand:
+                    best_pair = pair_cand
+                    break
 
             if best_pair is None:
                 break
@@ -532,6 +531,7 @@ class MultilingualByteBPETokenizer:
 
             affected = list(pair_indices.pop(best_pair, ()))
             pair_counts.pop(best_pair, None)
+            touched: set[tuple[int, int]] = set()
 
             for idx in affected:
                 old_seq = words[idx]
@@ -547,6 +547,7 @@ class MultilingualByteBPETokenizer:
                             pair_counts.pop(p_old, None)
                             pair_indices.pop(p_old, None)
                         else:
+                            touched.add(p_old)
                             pset = pair_indices.get(p_old)
                             if pset is not None:
                                 pset.discard(idx)
@@ -558,11 +559,17 @@ class MultilingualByteBPETokenizer:
                     for k in range(len(new_seq) - 1):
                         p_new = (new_seq[k], new_seq[k + 1])
                         pair_counts[p_new] += f
+                        touched.add(p_new)
                         pset = pair_indices.get(p_new)
                         if pset is None:
                             pair_indices[p_new] = {idx}
                         else:
                             pset.add(idx)
+
+            for tp in touched:
+                tc = pair_counts.get(tp, 0)
+                if tc >= min_freq:
+                    heapq.heappush(heap, (-tc, tp[0], tp[1]))
 
         if pad_to_max_vocab:
             unused_idx = 0
@@ -600,7 +607,7 @@ class MultilingualByteBPETokenizer:
                 new_id = self._merges[best_rank][2]
                 ids = self._merge_pair_in_seq(ids, a, b, new_id)
 
-        if len(self._chunk_cache) >= 65536:
+        if len(self._chunk_cache) >= 262144:
             self._chunk_cache.clear()
         self._chunk_cache[chunk] = ids
         return ids
