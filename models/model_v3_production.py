@@ -1138,17 +1138,36 @@ class SSENNProductionModel(nn.Module):
             eta_0=cfg.lr_head_0,
             gamma=cfg.gamma_head,
             beta_k_eff=cfg.beta_k_head,
-            stiff_ceil=1.0,
+            stiff_ceil=0.78,
             active_row_gate=None,
-            cubic_shield=False,
+            cubic_shield=True,
             scratch=self._kernel_scratch,
             compensator=self.compensator,
             comp_key="output_head",
         )
-        if self.head_armor_mask.any() and self.head_w0_bedrock is not None:
-            h_bed = self.head_w0_bedrock[:, :d_last][self.head_armor_mask]
-            self.head_w0[:, :d_last][self.head_armor_mask] = h_bed
-            self.head_w[:, :d_last][self.head_armor_mask] = h_bed
+        if self.head_w0_bedrock is not None and (self.head_armor_mask.any() or self.locked_excl_vocab_mask.any()):
+            locked_last_cols = self.armor_locked_masks[-1][:d_last]
+            if locked_last_cols.any():
+                lock_cols_idx = locked_last_cols.nonzero(as_tuple=True)[0]
+                excl_rows = self.locked_excl_vocab_mask | (
+                    self.head_armor_mask & (self.phase_seen_targets == 0)
+                )
+                if excl_rows.any():
+                    er_idx = excl_rows.nonzero(as_tuple=True)[0]
+                    bed_excl = self.head_w0_bedrock[er_idx[:, None], lock_cols_idx[None, :]]
+                    self.head_w0[er_idx[:, None], lock_cols_idx[None, :]] = bed_excl
+                    self.head_w[er_idx[:, None], lock_cols_idx[None, :]] = bed_excl
+
+                shared_rows = self.head_armor_mask & (self.phase_seen_targets > 0) & (~self.locked_excl_vocab_mask)
+                if shared_rows.any():
+                    sr_idx = shared_rows.nonzero(as_tuple=True)[0]
+                    bed_shared = self.head_w0_bedrock[sr_idx[:, None], lock_cols_idx[None, :]]
+                    self.head_w0[sr_idx[:, None], lock_cols_idx[None, :]] = (
+                        self.head_w0[sr_idx[:, None], lock_cols_idx[None, :]].lerp(bed_shared, 0.08)
+                    )
+                    self.head_w[sr_idx[:, None], lock_cols_idx[None, :]] = (
+                        self.head_w[sr_idx[:, None], lock_cols_idx[None, :]].lerp(bed_shared, 0.08)
+                    )
 
         self._reset_step_cache()
         return {
@@ -1214,11 +1233,21 @@ class SSENNProductionModel(nn.Module):
                     self.armor_locked_masks[l_idx][slot_idx] = False
                     woke_layer += n_reused
 
-                rem_wake = self.delta_d - woke_layer
-                # Keep d_active strictly aligned to block_size for contiguous block-sparse kernels
-                rem_wake_aligned = (rem_wake // self.block_size) * self.block_size
-                if rem_wake_aligned > 0 and layer.d_active < self.d_max:
-                    woke_layer += layer.grow_active(rem_wake_aligned, salt=self.current_epoch + 1)
+                if len(self.sleep_logs) > 0:
+                    if layer.d_active < self.d_max and err_val >= cfg.neurogenesis_err_thresh * 1.5:
+                        rem_cap = ((min(self.delta_d, self.d_max - layer.d_active)) // self.block_size) * self.block_size
+                        if rem_cap > 0:
+                            old_d = layer.d_active
+                            grown = layer.grow_active(rem_cap, salt=self.current_epoch + 1)
+                            if grown > 0:
+                                self.armor_locked_masks[l_idx][old_d : old_d + grown] = False
+                                woke_layer += grown
+                else:
+                    rem_wake = self.delta_d - woke_layer
+                    # Keep d_active strictly aligned to block_size for contiguous block-sparse kernels
+                    rem_wake_aligned = (rem_wake // self.block_size) * self.block_size
+                    if rem_wake_aligned > 0 and layer.d_active < self.d_max:
+                        woke_layer += layer.grow_active(rem_wake_aligned, salt=self.current_epoch + 1)
 
                 if woke_layer > 0:
                     layer.last_growth_epoch = self.current_epoch
@@ -1364,24 +1393,42 @@ class SSENNProductionModel(nn.Module):
 
             self.total_recycled_cells_per_layer[l_idx] += merged + n_prune
 
-            # Stage 3: Snapshot bedrock & lock surviving phase cells
+            # Stage 3: Balanced Survivor Locking (top 50% of survivors, capped at 60% of d_act total)
             active_surv = [j for j in cand if j not in set(self.rejuvenated_slots[l_idx])]
+            locked_surv: list[int] = []
+            plastic_surv: list[int] = []
             if active_surv:
-                s_idx = torch.tensor(active_surv, dtype=torch.long, device=self.model_device)
-                self.layer_w0_bedrock[l_idx][:, :d_eff][s_idx] = layer.w0[:, :d_eff][s_idx]
-                k_lock = torch.linspace(
-                    cfg.sleep_lock_min_k,
-                    cfg.sleep_lock_max_k,
-                    steps=len(active_surv),
-                    device=self.model_device,
-                    dtype=layer.k.dtype,
-                ).unsqueeze(-1)
-                layer.k[:, :d_eff][s_idx] = k_lock.expand(-1, d_eff)
-                self.armor_locked_masks[l_idx][s_idx] = True
+                util_map = {j: u for u, j in util_ranked}
+                active_sorted = sorted(active_surv, key=lambda j: util_map.get(j, 0.0), reverse=True)
+                already_locked = int(self.armor_locked_masks[l_idx][:d_act].sum().item())
+                max_total_locked = int(0.60 * float(d_act))
+                cap_avail = max(0, max_total_locked - already_locked)
+                half_target = max(1, len(active_sorted) // 2) if len(active_sorted) > 1 else 1
+                n_lock = min(half_target, cap_avail)
+                locked_surv = active_sorted[:n_lock]
+                plastic_surv = active_sorted[n_lock:]
+
+                if locked_surv:
+                    s_idx = torch.tensor(locked_surv, dtype=torch.long, device=self.model_device)
+                    self.layer_w0_bedrock[l_idx][:, :d_eff][s_idx] = layer.w0[:, :d_eff][s_idx]
+                    k_lock = torch.linspace(
+                        cfg.sleep_lock_min_k,
+                        cfg.sleep_lock_max_k,
+                        steps=len(locked_surv),
+                        device=self.model_device,
+                        dtype=layer.k.dtype,
+                    ).unsqueeze(-1)
+                    layer.k[:, :d_eff][s_idx] = k_lock.expand(-1, d_eff)
+                    self.armor_locked_masks[l_idx][s_idx] = True
+
+                if plastic_surv:
+                    p_idx = torch.tensor(plastic_surv, dtype=torch.long, device=self.model_device)
+                    layer.k[:, :d_eff][p_idx] = layer.k[:, :d_eff][p_idx] * 0.25
+                    self.armor_locked_masks[l_idx][p_idx] = False
 
             merged_per_layer.append(merged)
             pruned_per_layer.append(n_prune)
-            locked_per_layer.append(len(active_surv))
+            locked_per_layer.append(len(locked_surv))
 
         seen_mask = self.phase_seen_targets > 0
         if seen_mask.any():
@@ -1391,10 +1438,28 @@ class SSENNProductionModel(nn.Module):
             blended = hw0_view[seen_mask].lerp(hw_view[seen_mask], 0.50)
             hw0_view[seen_mask] = blended
             hw_view[seen_mask] = blended
-            hk_view[seen_mask] = hk_view[seen_mask].clamp(min=cfg.sleep_lock_min_k, max=cfg.sleep_lock_max_k)
+
+            locked_last_cols = self.armor_locked_masks[-1][:d_last]
+            r_idx = seen_mask.nonzero(as_tuple=True)[0]
+            if locked_last_cols.any():
+                c_lock = locked_last_cols.nonzero(as_tuple=True)[0]
+                hk_view[r_idx[:, None], c_lock[None, :]] = hk_view[
+                    r_idx[:, None], c_lock[None, :]
+                ].clamp(min=cfg.sleep_lock_min_k, max=cfg.sleep_lock_max_k)
+            plastic_last_cols = ~locked_last_cols
+            if plastic_last_cols.any():
+                c_plas = plastic_last_cols.nonzero(as_tuple=True)[0]
+                hk_view[r_idx[:, None], c_plas[None, :]] = (
+                    hk_view[r_idx[:, None], c_plas[None, :]] * 0.25
+                ).clamp(max=0.25)
+
             self.head_armor_mask[seen_mask] = True
             self.head_w0_bedrock[:, :d_last][seen_mask] = blended
             self.phase_seen_targets.zero_()
+
+        # Reset neurogenesis cooldown at phase boundary so next phase can expand cleanly
+        for layer in self.spring_layers:
+            layer.last_growth_epoch = -100
 
         self._sync_rejuv_idx_tensors()
         record = {
@@ -1682,6 +1747,40 @@ class SSENNProductionModel(nn.Module):
                     logits[cand_id] -= 2.5 * self.config.refractory_loop_penalty * float(fg_cnt)
         return logits
 
+    @staticmethod
+    @torch.no_grad()
+    def _sample_next_token(
+        logits_1d: torch.Tensor,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+    ) -> int:
+        """Select next token deterministically (temperature <= 0) or via temperature/top-k/top-p sampling."""
+        if temperature <= 0.0:
+            return int(torch.argmax(logits_1d).item())
+
+        scaled = logits_1d / float(temperature)
+        k_val = int(top_k)
+        if 0 < k_val < scaled.numel():
+            top_vals, _ = torch.topk(scaled, k_val)
+            scaled = scaled.masked_fill(scaled < top_vals[-1], float("-inf"))
+
+        p_val = float(top_p)
+        if 0.0 < p_val < 1.0:
+            sorted_logits, sorted_indices = torch.sort(scaled, descending=True)
+            cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_remove = cum_probs > p_val
+            sorted_remove[1:] = sorted_remove[:-1].clone()
+            sorted_remove[0] = False
+            if sorted_remove.any():
+                scaled = scaled.clone()
+                scaled[sorted_indices[sorted_remove]] = float("-inf")
+
+        if torch.isneginf(scaled).all():
+            return int(torch.argmax(logits_1d).item())
+        probs = F.softmax(scaled, dim=-1)
+        return int(torch.multinomial(probs, num_samples=1).item())
+
     @torch.no_grad()
     def generate(
         self,
@@ -1690,6 +1789,9 @@ class SSENNProductionModel(nn.Module):
         eos_id: int = 2,
         enable_refractory_gate: bool = True,
         use_fast_cache: bool = True,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
     ) -> list[int]:
         out = list(prompt_ids)
         if not out:
@@ -1711,7 +1813,7 @@ class SSENNProductionModel(nn.Module):
                     l_work = logits.float().clone() if logits.dtype != torch.float32 else logits.clone()
                     if enable_refractory_gate:
                         l_work = self._apply_refractory_gate_logits(l_work, out, cache=cache)
-                    nxt = int(torch.argmax(l_work).item())
+                    nxt = self._sample_next_token(l_work, temperature=temperature, top_k=top_k, top_p=top_p)
                     out.append(nxt)
                     if nxt == eos_id or step_i + 1 >= steps_to_gen:
                         break
@@ -1725,7 +1827,7 @@ class SSENNProductionModel(nn.Module):
             l_work = logits.float().clone() if logits.dtype != torch.float32 else logits.clone()
             if enable_refractory_gate:
                 l_work = self._apply_refractory_gate_logits(l_work, out, cache=None)
-            nxt = int(torch.argmax(l_work).item())
+            nxt = self._sample_next_token(l_work, temperature=temperature, top_k=top_k, top_p=top_p)
             out.append(nxt)
             if nxt == eos_id:
                 break
@@ -1753,6 +1855,19 @@ class SSENNProductionModel(nn.Module):
             "kahan_residual_mb": kahan_bytes / mb,
             "total_live_mb": (live_bytes + kahan_bytes) / mb,
         }
+
+    def _compute_head_settled_w0(self, hw0_base: torch.Tensor, d_last: int) -> torch.Tensor:
+        """Settles unlocked rows and the unlocked column subspace of shared armored rows."""
+        locked_last_cols = self.armor_locked_masks[-1][:d_last]
+        hw = self.head_w[:, :d_last]
+        hk = self.head_k[:, :d_last]
+        settle_alpha = (0.95 + 0.05 * (hk.float() / 0.85).clamp(0.0, 1.0)).to(hw0_base.dtype)
+        head_settle_mask = (~self.locked_excl_vocab_mask).unsqueeze(1).expand(-1, d_last).clone()
+        if locked_last_cols.any() and self.head_armor_mask.any():
+            hr_idx = self.head_armor_mask.nonzero(as_tuple=True)[0]
+            hc_idx = locked_last_cols.nonzero(as_tuple=True)[0]
+            head_settle_mask[hr_idx[:, None], hc_idx[None, :]] = False
+        return torch.where(head_settle_mask, hw0_base + (hw - hw0_base) * settle_alpha, hw0_base)
 
     @torch.no_grad()
     def production_freeze(self, prune_dormant: bool = True) -> dict:
@@ -1786,13 +1901,7 @@ class SSENNProductionModel(nn.Module):
                     settle_alpha = (0.95 + 0.05 * (k_s.float() / 0.85).clamp(0.0, 1.0)).to(layer.w0.dtype)
                     layer.w0[:d_act, :d_eff][settle_mask] = w0_s + (w_s - w0_s) * settle_alpha
 
-            unlocked_vocab = ~(self.head_armor_mask | self.locked_excl_vocab_mask)
-            if unlocked_vocab.any():
-                hw = self.head_w[unlocked_vocab, :d_last]
-                hw0 = self.head_w0[unlocked_vocab, :d_last]
-                hk = self.head_k[unlocked_vocab, :d_last]
-                settle_alpha = (0.95 + 0.05 * (hk.float() / 0.85).clamp(0.0, 1.0)).to(hw0.dtype)
-                self.head_w0[unlocked_vocab, :d_last] = hw0 + (hw - hw0) * settle_alpha
+            self.head_w0[:, :d_last] = self._compute_head_settled_w0(self.head_w0[:, :d_last], d_last)
 
             if prune_dormant:
                 # Compact frontend projections & embeddings cleanly to [:d_eff]
@@ -2112,15 +2221,8 @@ class SSENNProductionModel(nn.Module):
                 lw0_copy[settle_mask] = w0_s + (w_s - w0_s) * settle_alpha
             layers_w0.append(lw0_copy.contiguous().to(device=target_loc))
 
-        # Output head
-        hw0_copy = self.head_w0[:, :d_last].detach().clone()
-        unlocked_vocab = ~(self.head_armor_mask | self.locked_excl_vocab_mask)
-        if unlocked_vocab.any():
-            hw = self.head_w[unlocked_vocab, :d_last]
-            hw0 = hw0_copy[unlocked_vocab]
-            hk = self.head_k[unlocked_vocab, :d_last]
-            settle_alpha = (0.95 + 0.05 * (hk.float() / 0.85).clamp(0.0, 1.0)).to(hw0_copy.dtype)
-            hw0_copy[unlocked_vocab] = hw0 + (hw - hw0) * settle_alpha
+        # Output head: settle unlocked rows and unlocked column subspace of shared armored rows
+        hw0_copy = self._compute_head_settled_w0(self.head_w0[:, :d_last].detach().clone(), d_last)
         hw0_out = hw0_copy.contiguous().to(device=target_loc)
 
         w0_tensors = {

@@ -420,6 +420,9 @@ def cmd_generate(args: argparse.Namespace) -> int:
         eos_id=tokenizer.eos_id,
         enable_refractory_gate=not args.disable_refractory,
         use_fast_cache=not args.slow_cache,
+        temperature=float(args.temperature),
+        top_k=int(args.top_k),
+        top_p=float(args.top_p),
     )
     elapsed_s = max(time.perf_counter() - t0, 1e-6)
     gen_tokens = max(0, len(out_ids) - len(prompt_ids))
@@ -549,6 +552,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_gen.add_argument("--device", type=str, default="cpu", help="Inference device (cpu, cuda).")
     p_gen.add_argument("--disable-refractory", action="store_true", help="Disable inference refractory gate.")
     p_gen.add_argument("--slow-cache", action="store_true", help="Use O(T^2) recomputation instead of O(1) cache.")
+    p_gen.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 = greedy argmax).")
+    p_gen.add_argument("--top-k", type=int, default=0, help="Top-k sampling filter when temperature > 0.")
+    p_gen.add_argument("--top-p", type=float, default=1.0, help="Nucleus top-p sampling cutoff when temperature > 0.")
     p_gen.set_defaults(func=cmd_generate)
 
     return parser

@@ -237,7 +237,7 @@ def run_suite(args: argparse.Namespace) -> dict:
                 salient_anchor_slots=1, dtype=dtype, kahan_mode=kahan_mode, device=device, seed=42,
             )
             p1_epochs = 2
-            p2_epochs = 2
+            p2_epochs = 4
             batch_size = 16
             ckpt_steps = 4
             expected_train_params = None
@@ -674,7 +674,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--device", type=str, default="auto", help="auto, cuda, or cpu.")
     p.add_argument("--dtype", type=str, default="auto", choices=("auto", "float16", "bfloat16", "float32"), help="Weight precision.")
     p.add_argument("--p1-epochs", type=int, default=2, help="Phase 1 foundational epochs.")
-    p.add_argument("--p2-epochs", type=int, default=2, help="Phase 2 continual retraining epochs.")
+    p.add_argument("--p2-epochs", type=int, default=4, help="Phase 2 continual retraining epochs.")
     p.add_argument("--batch-size", type=int, default=64, help="Training/validation minibatch size.")
     p.add_argument("--ckpt-every-steps", type=int, default=100, help="Periodic checkpoint interval in steps.")
     p.add_argument("--max-steps-per-phase", type=int, default=None, help="Optional step cap per phase for quick runs.")
