@@ -394,6 +394,14 @@ def run_suite(args: argparse.Namespace) -> dict:
             del probe_trainer
             gc.collect()
 
+            p1_ep_hist = list(p1_res["epochs_history"])
+            if not p1_ep_hist and trainer.vault.telemetry_path.exists():
+                for line in trainer.vault.telemetry_path.read_text(encoding="utf-8").splitlines():
+                    if line.strip():
+                        ev = json.loads(line)
+                        if ev.get("event") == "epoch_end":
+                            p1_ep_hist.append(ev)
+
             p1_val_metrics = evaluate_validation_batches(trainer.model, p1_val_ds, pad_id=tok.pad_id, batch_size=batch_size)
             exp2 = {
                 "status": p1_res["status"],
@@ -401,15 +409,15 @@ def run_suite(args: argparse.Namespace) -> dict:
                 "tok_s": float(p1_res["tok_s"]),
                 "vram_peak_mb": p1_vram_peak_mb,
                 "final_step": int(p1_res["final_global_step"]),
-                "last_train_acc_pct": float(p1_res["last_train_acc_pct"]),
-                "last_train_ce": float(p1_res["last_train_ce"]),
+                "last_train_acc_pct": float(p1_ep_hist[-1]["train_acc_pct"]) if (p1_ep_hist and p1_res["last_train_acc_pct"] == 0.0) else float(p1_res["last_train_acc_pct"]),
+                "last_train_ce": float(p1_ep_hist[-1]["train_ce"]) if (p1_ep_hist and p1_res["last_train_ce"] == 0.0) else float(p1_res["last_train_ce"]),
                 "val_acc_pct": float(p1_val_metrics["acc_pct"]),
                 "val_ppl": float(p1_val_metrics["ppl"]),
                 "allocated_dims_after_p1": list(trainer.model.get_allocated_dimensions()),
                 "growth_events": list(trainer.model.growth_log),
                 "mean_stiffness_k": p1_stiff["k_bar"],
                 "atomic_vault_resume_diff": float(resume_diff),
-                "epochs_history": p1_res["epochs_history"],
+                "epochs_history": p1_ep_hist,
             }
             results["experiment_2_phase1"] = exp2
             print(
@@ -614,7 +622,7 @@ def run_suite(args: argparse.Namespace) -> dict:
         # Experiment 6: Hardware-Calibrated Scaling & Cost Projection Table
         # ------------------------------------------------------------------
         print("\n[Experiment 6] Hardware-Calibrated Scaling & Colab Compute-Unit Projection (125M -> 7B)")
-        measured_train_tok_s = max(exp2["tok_s"], 1.0)
+        measured_train_tok_s = max(exp2["tok_s"] if exp2["tok_s"] > 0.0 else exp3["p2_tok_s"], 1.0)
         scaling_rows = _estimate_scaling_table(cfg, measured_tok_s=measured_train_tok_s, gpu_name=gpu_name)
         results["experiment_6_scaling_projection"] = scaling_rows
 

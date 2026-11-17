@@ -66,15 +66,35 @@ def _serialize_payload_with_checksum(payload: dict) -> dict:
     }
 
 
-def _atomic_torch_save_envelope(target_path: Path, envelope: dict) -> None:
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target_path.with_name(f"{target_path.name}.tmp.{os.getpid()}")
-    with open(tmp_path, "wb") as f:
+def _fuse_safe_replace(src: Path, dst: Path, retries: int = 5) -> None:
+    """Atomic replace with brief backoff for cloud FUSE mounts (e.g., Google Drive)."""
+    for attempt in range(retries):
+        try:
+            os.replace(src, dst)
+            _fsync_parent_dir(dst)
+            return
+        except (FileNotFoundError, PermissionError, OSError):
+            if attempt + 1 >= retries:
+                raise
+            time.sleep(0.15 * float(attempt + 1))
+
+
+def _write_envelope_to_file(path: Path, envelope: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
         torch.save(envelope, f)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp_path, target_path)
-    _fsync_parent_dir(target_path)
+
+
+def _atomic_torch_save_envelope(target_path: Path, envelope: dict) -> None:
+    tmp_path = target_path.with_name(f"{target_path.name}.tmp.{os.getpid()}")
+    _write_envelope_to_file(tmp_path, envelope)
+    try:
+        _fuse_safe_replace(tmp_path, target_path)
+    except FileNotFoundError:
+        _write_envelope_to_file(target_path, envelope)
+        _fsync_parent_dir(target_path)
 
 
 def _atomic_copy_file(src_path: Path, dst_path: Path) -> None:
@@ -84,8 +104,7 @@ def _atomic_copy_file(src_path: Path, dst_path: Path) -> None:
         shutil.copyfileobj(src_f, dst_f, length=1024 * 1024)
         dst_f.flush()
         os.fsync(dst_f.fileno())
-    os.replace(tmp_path, dst_path)
-    _fsync_parent_dir(dst_path)
+    _fuse_safe_replace(tmp_path, dst_path)
 
 
 def _load_and_verify_envelope(path: Path) -> tuple[bool, dict | None, str | None]:
@@ -144,12 +163,9 @@ class AtomicCheckpointVault:
         t0 = time.perf_counter()
         envelope = _serialize_payload_with_checksum(payload)
 
-        # Stage new checkpoint into temp file & sync BEFORE modifying latest/backup
-        stage_tmp = self.vault_dir / f".stage_latest.tmp.{os.getpid()}"
-        with open(stage_tmp, "wb") as f:
-            torch.save(envelope, f)
-            f.flush()
-            os.fsync(f.fileno())
+        # Stage new checkpoint into non-dotfile temp file & sync BEFORE modifying latest/backup
+        stage_tmp = self.vault_dir / f"{self.latest_path.name}.stage.{os.getpid()}"
+        _write_envelope_to_file(stage_tmp, envelope)
 
         # Promote prior healthy checkpoint_latest.pt -> checkpoint_backup.pt
         if self.latest_path.exists():
@@ -158,17 +174,26 @@ class AtomicCheckpointVault:
             except OSError:
                 cur_size = -1
             if self._latest_verified and cur_size == self._latest_verified_size:
-                os.replace(self.latest_path, self.backup_path)
-                _fsync_parent_dir(self.backup_path)
+                _fuse_safe_replace(self.latest_path, self.backup_path)
             else:
                 ok_prev, _, _ = _load_and_verify_envelope(self.latest_path)
                 if ok_prev:
                     _atomic_copy_file(self.latest_path, self.backup_path)
 
-        os.replace(stage_tmp, self.latest_path)
-        _fsync_parent_dir(self.latest_path)
+        try:
+            _fuse_safe_replace(stage_tmp, self.latest_path)
+        except (FileNotFoundError, OSError):
+            # Fallback if cloud FUSE unindexed stage_tmp before rename; backup_path is already preserved
+            _atomic_torch_save_envelope(self.latest_path, envelope)
+            try:
+                stage_tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
         self._latest_verified = True
-        self._latest_verified_size = int(self.latest_path.stat().st_size)
+        try:
+            self._latest_verified_size = int(self.latest_path.stat().st_size)
+        except OSError:
+            self._latest_verified_size = int(envelope["payload_size_bytes"])
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         return {
