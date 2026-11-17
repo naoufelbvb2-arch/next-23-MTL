@@ -1,12 +1,13 @@
-# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0, v2.0 & v3.1.0)
+# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0, v2.0 & v3.1.3)
 **الشبكات العصبية المرنة ذاتية التشكيل — إطار تعلم موضعي خالٍ من الانتشار العكسي للتوليد المتسلسل والتعلم المستمر**
 
 *A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Dual-Horizon Sparse Causal Attention, Hardware-Accelerated Kernels, Multilingual Byte-BPE, Fault-Tolerant Cloud Training, and O(1) Stateful Inference*
 
-[![Release v3.1.0](https://img.shields.io/badge/Release-v3.1.0%20Production-brightgreen)](./docs/V3_PRODUCTION_TRAINING_GUIDE.md)
-[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(38%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
+[![Release v3.1.3](https://img.shields.io/badge/Release-v3.1.3%20T4%20Calibrated-brightgreen)](./docs/V3_PRODUCTION_TRAINING_GUIDE.md)
+[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(39%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
 [![Test Suite 14/14](https://img.shields.io/badge/Tests-14%2F14%20Passing-brightgreen)](./tests/test_suite.py)
-[![v3.0 Phase 3.3 Fault-Tolerant](https://img.shields.io/badge/Phase%203.3-0.00e%2B00%20Kill%2FSIGTERM%20%7C%2032.2M%20tok%2Fs-blueviolet)](./benchmarks/bench_v3_trainer_fault_tolerance.py)
+[![Tesla T4 50M GPU](https://img.shields.io/badge/Tesla%20T4%2050M-38.6k--41.8k%20tok%2Fs%20%7C%201.49%20GB%20VRAM-blue)](./benchmarks/bench_v3_50m_gpu_suite.py)
+[![v3.0 Phase 3.3 Fault-Tolerant](https://img.shields.io/badge/Phase%203.3-0.00e%2B00%20Kill%2FSIGTERM%20%7C%2067.0M%20MMap%20tok%2Fs-blueviolet)](./benchmarks/bench_v3_trainer_fault_tolerance.py)
 [![v3.0 Phase 3.2 Production Model](https://img.shields.io/badge/Phase%203.2-92.62%25%20Frozen%20W0%20%7C%200.00e%2B00%20Resume-blue)](./benchmarks/bench_v3_production_model.py)
 [![v3.0 Phase 3.1 Kernels & O(1) Cache](https://img.shields.io/badge/Phase%203.1-0.00%20MB%20Upd%20%7C%2099.2%25%20DFA%20Saved%20%7C%207.31x%20O(1)-orange)](./benchmarks/bench_v3_kernels_speed.py)
 [![Milestone 2.5 Reward Alignment](https://img.shields.io/badge/Milestone%202.5-100%25%20Aligned%20%7C%200%25%20Rejected%20%7C%20Zero--RL-brightgreen)](./benchmarks/bench_v2_reward_alignment.py)
@@ -60,9 +61,9 @@
 
 ---
 
-## الحصيلة المعملية للتجارب الأربع عشرة | Empirical Benchmark Suite (v1.0, v2.0 & v3.0.0)
+## الحصيلة المعملية للتجارب الخمس عشرة | Empirical Benchmark Suite (v1.0 – v3.1.3)
 
-تخضع جميع ملفات المستودع (38 ملفاً برمجياً) لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
+تخضع جميع ملفات المستودع (39 ملفاً برمجياً) لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
 
 | # | الاختبار المعملي (`Benchmark`) | السكريبت التنفيذي | التحدي وحجم البيانات | الأبعاد النشطة النهائية ($D_{\text{active}}$) | توفير السعة / الذاكرة | الدقة بعد التجميد ($W_0$ فقط) | النتيجة الفيزيائية البارزة |
 | :-: | :--- | :--- | :--- | :--- | :---: | :---: | :--- |
@@ -80,6 +81,7 @@
 | **12** | **النوى المدمجة، DFA المفكك، وذاكرة $O(1)$ (`v3.0 Phase 3.1`)** | [`benchmarks/bench_v3_kernels_speed.py`](./benchmarks/bench_v3_kernels_speed.py) | `394` قصة إنجليزية (`V=2,048 -> 32,000`) عبر `4L/12L` مع أمان `BF16` (`Kahan`) | `[256]*4` و `[256]*12` مع الكتل النشطة $U/N$ و `FactorizedHighwayDFA` | **`0.00 MB`** تخصيص تحديث (`97.70 MB` خطوة مقابل `226.70 MB`) و **`99.20%`** توفير DFA (`32K`) | **`90.88%` (`4L`)** و **`92.38%` (`12L Fac`, `PPL 1.67`)**؛ وتطابق **`100.00%`** لذاكرة $O(1)$ | تسريع تدريب **`1.60x`** (`19,450 tok/s`)، بث DFA **`8.09x`**، توليد $O(1)$ حتى **`7.31x`** (`100%` تطابق)، و`BF16 Kahan Cos=0.936` (`0 NaN`) |
 | **13** | **الإعدادات اليدوية والنموذج الإنتاجي الموحد (`v3.0 Phase 3.2`)** | [`benchmarks/bench_v3_production_model.py`](./benchmarks/bench_v3_production_model.py) | تقدير بصمة `1.66M -> 7.11B` + تدريب وتجميد وضغط + استئناف `FP32/BF16` | نمو من `d_init=64 -> [128]*6` ومؤشرات `anchor_k` على مقياس `7B` | توفير **`55.3%`** (`6.44 -> 2.87 MB`) و**`33.3%`** بوضع `anchor_k` (`19.71 -> 13.14 GB`) | **`92.62%`** (`Frozen W0` دون أي هبوط عن `92.62%`، `Val PPL=1.82`) | مطابقة استئناف **`0.00e+00`** (`FP32` و `BF16`)، استدلال $O(1)$ **`2.64x`** (`100%` تطابق)، و`100%` اتساق كيانات |
 | **14** | **التدريب السحابي المقاوم للانقطاع و`MMap` (`v3.0 Phase 3.3`)** | [`benchmarks/bench_v3_trainer_fault_tolerance.py`](./benchmarks/bench_v3_trainer_fault_tolerance.py) | تدفق `2.11M` رمز + قتل منتصف الحقبة + إتلاف (`truncate/bitflip`) + `SIGTERM` | `SSENNConfig` + `AtomicCheckpointVault` (`SHA-256`) + `MMapTokenDataset` | ذاكرة وصفية **`1.93 KB`** (`O(1)`) ومؤقت تدفق **`0.28 MB`** لملف `4.03 MB` | **`90.62%`** (قتل مفاجئ) و **`92.62%`** (تعافي `backup`، `PPL 1.87`) و **`90.54%`** (`best_frozen_w0.pt`) | تدفق **`32.23M tok/s`**، مطابقة **`0.00e+00`** عبر `FP32/BF16`، وتعافٍ ذاتي **`100%`** |
+| **15** | **التجربة الميدانية `Scale-50M` على `Tesla T4 GPU` وبيانات HuggingFace (`v3.1.1–v3.1.3`)** | [`benchmarks/bench_v3_50m_gpu_suite.py`](./benchmarks/bench_v3_50m_gpu_suite.py) | `8.27M` توكن حقيقي (`TinyStories 5.02M` -> `Simple Wiki 2.45M`, `V=12,288`, `0-<unk>`, `FP16+Kahan`) | `384 -> [448]*8` ثم توسع بعد النوم إلى **`[576]*8`** (`50.05M` تدريب) | **`-86.4%`** (`199.45 -> 27.19 MB`) و**`-83.0%`** عند `576` (`36.82 MB`) | `TinyStories`: **`25.57%` (`PPL 79.2`)** \| التعلّم المستمر (`v3.1.2`): `P2 = 14.24%` (`PPL 363.5`) | سرعة **`38.6k–41.8k tok/s`**، ذروة **`1,485.8 MB` (`1.49 GB`) VRAM**، بث `MMap` **`67.0M tok/s`**، و$O(1)$ حتى **`2.96x`** |
 
 ---
 
@@ -127,10 +129,11 @@ next-23-MTL/
 │   ├── bench_v2_reward_alignment.py  # v2.0 Milestone 2.5: Reward-modulated three-factor plasticity & RL-free alignment
 │   ├── bench_v3_kernels_speed.py     # v3.0 Phase 3.1: Fused in-place kernels, Factorized DFA, O(1) cache & BF16 audit
 │   ├── bench_v3_production_model.py  # v3.0 Phase 3.2: Manual config estimator, compact freeze & checkpoint resume parity
-│   └── bench_v3_trainer_fault_tolerance.py # v3.0 Phase 3.3: MMap O(1), Kill/Corrupt/SIGTERM recovery parity
+│   ├── bench_v3_trainer_fault_tolerance.py # v3.0 Phase 3.3: MMap O(1), Kill/Corrupt/SIGTERM recovery parity
+│   └── bench_v3_50m_gpu_suite.py     # v3.1.3 Tesla T4 50M GPU suite on real HuggingFace shards (6 experiments)
 ├── tests/                            # حزمة التحقق الصارم وفحص AST
 │   ├── __init__.py
-│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (38 files, 14 tests)
+│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (39 files, 14 tests)
 ├── docs/                             # الأوراق البحثية وسجل الإصلاحات وأدلة الإنتاج
 │   ├── V3_PRODUCTION_TRAINING_GUIDE.md # v3.1.0 Bilingual Production Manual (Google Colab, Drive, Multilingual BPE)
 │   ├── RESEARCH_PAPER_SS_ENN.md      # Full technical paper, equations, empirical tables & reproducibility
@@ -216,6 +219,9 @@ python benchmarks/bench_v3_production_model.py
 
 # 13. Fault-Tolerant Cloud Trainer, Atomic Vault, Corrupt Backup Recovery & MMap Streamer (v3.0 Phase 3.3)
 python benchmarks/bench_v3_trainer_fault_tolerance.py
+
+# 14. Scale-50M GPU Scientific Suite (v3.1.3 Smoke Audit / Full HuggingFace Shards)
+python benchmarks/bench_v3_50m_gpu_suite.py --smoke-test
 ```
 
 ---
