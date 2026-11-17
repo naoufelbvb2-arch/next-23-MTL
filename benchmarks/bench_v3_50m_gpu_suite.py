@@ -667,10 +667,10 @@ def run_suite(args: argparse.Namespace) -> dict:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="SS-ENN v3.1.0 50M GPU Scientific Benchmark Suite (Zero-Autograd)")
+    p = argparse.ArgumentParser(description="SS-ENN v3.1.3 50M GPU Scientific Benchmark Suite (Zero-Autograd)")
     p.add_argument("--phase1-dir", type=str, default="/content/local_50m/shards_phase1_stories", help="Phase 1 stories shard dir.")
     p.add_argument("--phase2-dir", type=str, default="/content/local_50m/shards_phase2_knowledge", help="Phase 2 knowledge shard dir.")
-    p.add_argument("--output-dir", type=str, default="/content/drive/MyDrive/SS_ENN_Workspace/exp_50m_scientific/results", help="Output vault & report directory.")
+    p.add_argument("--output-dir", type=str, default="/content/drive/MyDrive/SS_ENN_Workspace/exp_50m_scientific/results_v3_1_3", help="Output vault & report directory.")
     p.add_argument("--device", type=str, default="auto", help="auto, cuda, or cpu.")
     p.add_argument("--dtype", type=str, default="auto", choices=("auto", "float16", "bfloat16", "float32"), help="Weight precision.")
     p.add_argument("--p1-epochs", type=int, default=2, help="Phase 1 foundational epochs.")

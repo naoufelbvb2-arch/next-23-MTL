@@ -220,6 +220,8 @@ class SSENNProductionModel(nn.Module):
         self.current_epoch: int = 0
         self.reward_baseline: float = 0.0
         self.attn_armor_locked: bool = False
+        self.attn_locked_dim: int = 0
+        self._post_sleep_continual: bool = False
         self.has_multiword_entities: bool = False
         self.attn_v_topk: int = min(8, self.d_init)
 
@@ -821,7 +823,12 @@ class SSENNProductionModel(nn.Module):
         n_tok = z_act.shape[0]
         b_size = self.block_size
         n_blocks = max(1, d_sub // b_size)
-        k_blk = min(self.layer_top_k_blocks[l_idx], n_blocks)
+        base_k = self.layer_top_k_blocks[l_idx]
+        if (len(self.sleep_logs) > 0 or self._post_sleep_continual) and d_sub > self.d_init:
+            prop_k = int(round(float(base_k) * float(d_sub) / float(self.d_init)))
+            k_blk = min(n_blocks, max(base_k, prop_k))
+        else:
+            k_blk = min(base_k, n_blocks)
 
         z_blocks = z_act.view(n_tok, n_blocks, b_size)
         block_energy = torch.sqrt(z_blocks.float().pow(2).mean(dim=-1) + 1e-6)
@@ -981,9 +988,14 @@ class SSENNProductionModel(nn.Module):
         v_delta = attn_err * g_prime * v_mask
         drv_v = torch.matmul(v_delta.t(), x_flat).div_(max(n_total, 1.0))
 
+        d_lock = min(self.attn_locked_dim, d_eff) if self.attn_locked_dim > 0 else 0
+
+        v_w_sub = self.v_w[:d_eff, :d_eff]
+        v_w0_sub = self.v_w0[:d_eff, :d_eff]
+        v_lock_anchor = v_w0_sub[:d_lock, :d_lock].clone() if d_lock > 0 else None
         fused_spring_update_inplace(
-            w=self.v_w[:d_eff, :d_eff],
-            w0=self.v_w0[:d_eff, :d_eff],
+            w=v_w_sub,
+            w0=v_w0_sub,
             k=self.v_k[:d_eff, :d_eff],
             driving_signal=drv_v,
             eta_w=cfg.lr_attn_w,
@@ -995,13 +1007,19 @@ class SSENNProductionModel(nn.Module):
             compensator=self.compensator,
             comp_key="attn_v",
         )
+        if v_lock_anchor is not None:
+            v_w0_sub[:d_lock, :d_lock].copy_(v_lock_anchor)
+            v_w_sub[:d_lock, :d_lock].copy_(v_lock_anchor)
 
         qk_err = attn_err * 0.25
         drv_qk = torch.matmul(qk_err.t(), x_flat).div_(max(n_total, 1.0))
         for prefix in ("q", "k"):
+            w_sub = getattr(self, f"{prefix}_w")[:d_eff, :d_eff]
+            w0_sub = getattr(self, f"{prefix}_w0")[:d_eff, :d_eff]
+            qk_lock_anchor = w0_sub[:d_lock, :d_lock].clone() if d_lock > 0 else None
             fused_spring_update_inplace(
-                w=getattr(self, f"{prefix}_w")[:d_eff, :d_eff],
-                w0=getattr(self, f"{prefix}_w0")[:d_eff, :d_eff],
+                w=w_sub,
+                w0=w0_sub,
                 k=getattr(self, f"{prefix}_k")[:d_eff, :d_eff],
                 driving_signal=drv_qk,
                 eta_w=cfg.lr_attn_w,
@@ -1013,6 +1031,9 @@ class SSENNProductionModel(nn.Module):
                 compensator=self.compensator,
                 comp_key=f"attn_{prefix}",
             )
+            if qk_lock_anchor is not None:
+                w0_sub[:d_lock, :d_lock].copy_(qk_lock_anchor)
+                w_sub[:d_lock, :d_lock].copy_(qk_lock_anchor)
 
     @torch.no_grad()
     def train_minibatch(
@@ -1163,10 +1184,10 @@ class SSENNProductionModel(nn.Module):
                     sr_idx = shared_rows.nonzero(as_tuple=True)[0]
                     bed_shared = self.head_w0_bedrock[sr_idx[:, None], lock_cols_idx[None, :]]
                     self.head_w0[sr_idx[:, None], lock_cols_idx[None, :]] = (
-                        self.head_w0[sr_idx[:, None], lock_cols_idx[None, :]].lerp(bed_shared, 0.08)
+                        self.head_w0[sr_idx[:, None], lock_cols_idx[None, :]].lerp(bed_shared, 0.55)
                     )
                     self.head_w[sr_idx[:, None], lock_cols_idx[None, :]] = (
-                        self.head_w[sr_idx[:, None], lock_cols_idx[None, :]].lerp(bed_shared, 0.08)
+                        self.head_w[sr_idx[:, None], lock_cols_idx[None, :]].lerp(bed_shared, 0.55)
                     )
 
         self._reset_step_cache()
@@ -1283,9 +1304,35 @@ class SSENNProductionModel(nn.Module):
         return {"woke_total": woke_total, "grew": bool(woke_total > 0), "dims": dims}
 
     @torch.no_grad()
+    def _calibrate_post_sleep_capsule_norms(self) -> None:
+        """Equilibrates unlocked vs locked capsule row norms during post-sleep continual phases."""
+        if not self.sleep_logs:
+            return
+        d_eff, _ = self._effective_dims()
+        for l_idx, layer in enumerate(self.spring_layers):
+            d_act = layer.d_active
+            locked_mask = self.armor_locked_masks[l_idx][:d_act]
+            unlocked_mask = ~locked_mask.clone()
+            if self.rejuvenated_slots[l_idx]:
+                unlocked_mask[self.rejuvenated_slots[l_idx]] = False
+            row_norms = layer.w[:d_act, :d_eff].float().norm(p=2, dim=-1)
+            active_lk = locked_mask & (row_norms > 1e-7)
+            active_un = unlocked_mask & (row_norms > 1e-7)
+            if not (active_lk.any() and active_un.any()):
+                continue
+            mean_lk = float(row_norms[active_lk].mean().item())
+            mean_un = float(row_norms[active_un].mean().item())
+            if mean_lk > 1e-7 and mean_un > 1.15 * mean_lk:
+                scale = (1.10 * mean_lk) / mean_un
+                layer.w[:d_act, :d_eff][active_un] = (layer.w[:d_act, :d_eff][active_un].float() * scale).to(layer.w.dtype)
+                layer.w0[:d_act, :d_eff][active_un] = (layer.w0[:d_act, :d_eff][active_un].float() * scale).to(layer.w0.dtype)
+
+    @torch.no_grad()
     def end_epoch(self, epoch: int | None = None, mean_ce_loss: float | None = None) -> dict:
         self.current_epoch = int(epoch) if epoch is not None else (self.current_epoch + 1)
         growth_info = self.step_neurogenesis(mean_ce_loss=mean_ce_loss)
+        if self.sleep_logs:
+            self._calibrate_post_sleep_capsule_norms()
         for l_idx, layer in enumerate(self.spring_layers):
             self._last_epoch_block_wins[l_idx].copy_(self.epoch_block_win_counts[l_idx])
             self.epoch_block_win_counts[l_idx].zero_()
@@ -1401,10 +1448,10 @@ class SSENNProductionModel(nn.Module):
                 util_map = {j: u for u, j in util_ranked}
                 active_sorted = sorted(active_surv, key=lambda j: util_map.get(j, 0.0), reverse=True)
                 already_locked = int(self.armor_locked_masks[l_idx][:d_act].sum().item())
-                max_total_locked = int(0.60 * float(d_act))
+                max_total_locked = int(0.72 * float(d_act))
                 cap_avail = max(0, max_total_locked - already_locked)
-                half_target = max(1, len(active_sorted) // 2) if len(active_sorted) > 1 else 1
-                n_lock = min(half_target, cap_avail)
+                lock_target = max(1, int(round(0.75 * float(len(active_sorted))))) if len(active_sorted) > 1 else 1
+                n_lock = min(lock_target, cap_avail)
                 locked_surv = active_sorted[:n_lock]
                 plastic_surv = active_sorted[n_lock:]
 
@@ -1456,6 +1503,16 @@ class SSENNProductionModel(nn.Module):
             self.head_armor_mask[seen_mask] = True
             self.head_w0_bedrock[:, :d_last][seen_mask] = blended
             self.phase_seen_targets.zero_()
+
+        # Pre-Sleep Attention Subspace Lock: deposit [:d_eff, :d_eff] & freeze anchor square
+        for prefix in ("q", "k", "v"):
+            w_sub = getattr(self, f"{prefix}_w")[:d_eff, :d_eff]
+            w0_sub = getattr(self, f"{prefix}_w0")[:d_eff, :d_eff]
+            k_sub = getattr(self, f"{prefix}_k")[:d_eff, :d_eff]
+            w0_sub.copy_(w_sub)
+            k_sub.clamp_(min=cfg.sleep_lock_min_k, max=cfg.sleep_lock_max_k)
+        self.attn_locked_dim = max(self.attn_locked_dim, int(d_eff))
+        self._post_sleep_continual = True
 
         # Reset neurogenesis cooldown at phase boundary so next phase can expand cleanly
         for layer in self.spring_layers:
@@ -2000,6 +2057,8 @@ class SSENNProductionModel(nn.Module):
                 "current_epoch": int(self.current_epoch),
                 "reward_baseline": float(self.reward_baseline),
                 "attn_armor_locked": bool(self.attn_armor_locked),
+                "attn_locked_dim": int(self.attn_locked_dim),
+                "post_sleep_continual": bool(self._post_sleep_continual or len(self.sleep_logs) > 0),
                 "has_multiword_entities": bool(self.has_multiword_entities),
                 "attn_v_topk": int(self.attn_v_topk),
                 "rejuvenated_slots": copy.deepcopy(self.rejuvenated_slots),
@@ -2084,6 +2143,7 @@ class SSENNProductionModel(nn.Module):
         self.current_epoch = int(meta["current_epoch"])
         self.reward_baseline = float(meta["reward_baseline"])
         self.attn_armor_locked = bool(meta["attn_armor_locked"])
+        self.attn_locked_dim = int(meta.get("attn_locked_dim", 0))
         self.has_multiword_entities = bool(meta["has_multiword_entities"])
         self.attn_v_topk = int(meta["attn_v_topk"])
         self.rejuvenated_slots = copy.deepcopy(meta["rejuvenated_slots"])
@@ -2092,6 +2152,7 @@ class SSENNProductionModel(nn.Module):
         self.current_phase_slots = copy.deepcopy(meta["current_phase_slots"])
         self.growth_log = copy.deepcopy(meta["growth_log"])
         self.sleep_logs = copy.deepcopy(meta["sleep_logs"])
+        self._post_sleep_continual = bool(meta.get("post_sleep_continual", len(self.sleep_logs) > 0))
         self.alignment_logs = copy.deepcopy(meta["alignment_logs"])
         self._rejuv_gen.set_state(meta["rejuv_gen_state"].cpu().clone())
         self._reset_step_cache()
@@ -2140,6 +2201,7 @@ class SSENNProductionModel(nn.Module):
             "layer_d_active": [int(layer.w0.shape[0]) for layer in self.spring_layers],
             "attn_v_topk": int(self.attn_v_topk),
             "has_multiword_entities": bool(self.has_multiword_entities),
+            "post_sleep_continual": bool(len(self.sleep_logs) > 0 or self._post_sleep_continual),
             "w0_tensors": w0_tensors,
         }
 
@@ -2249,6 +2311,7 @@ class SSENNProductionModel(nn.Module):
             "layer_d_active": compacted_dims,
             "attn_v_topk": int(self.attn_v_topk),
             "has_multiword_entities": bool(self.has_multiword_entities),
+            "post_sleep_continual": bool(len(self.sleep_logs) > 0 or self._post_sleep_continual),
             "w0_tensors": w0_tensors,
         }
         after_params, after_bytes = _count_w0_stats(w0_tensors)
@@ -2300,4 +2363,5 @@ class SSENNProductionModel(nn.Module):
             layer.w0.copy_(lw0.to(device=dev, dtype=w_dt))
         model.attn_v_topk = int(frozen_state["attn_v_topk"])
         model.has_multiword_entities = bool(frozen_state["has_multiword_entities"])
+        model._post_sleep_continual = bool(frozen_state.get("post_sleep_continual", False))
         return model
