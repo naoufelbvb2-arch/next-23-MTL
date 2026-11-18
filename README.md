@@ -1,11 +1,12 @@
-# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0, v2.0 & v3.1.3)
-**الشبكات العصبية المرنة ذاتية التشكيل — إطار تعلم موضعي خالٍ من الانتشار العكسي للتوليد المتسلسل والتعلم المستمر**
+# next-23-MTL | Self-Sizing Elastic Neural Networks (SS-ENN v1.0 – v4.1.0)
+**الشبكات العصبية المرنة ذاتية التشكيل — إطار تعلم موضعي خالٍ من الانتشار العكسي للتوليد المتسلسل والتدريب التأسيسي والتعلم المستمر**
 
-*A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Dual-Horizon Sparse Causal Attention, Hardware-Accelerated Kernels, Multilingual Byte-BPE, Fault-Tolerant Cloud Training, and O(1) Stateful Inference*
+*A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Multi-Head Sparse Causal Attention, Trainable Embeddings, Weight-Mirrored DFA, Fault-Tolerant Cloud Training, and O(1) Stateful Inference*
 
-[![Release v3.1.3](https://img.shields.io/badge/Release-v3.1.3%20T4%20Calibrated-brightgreen)](./docs/V3_PRODUCTION_TRAINING_GUIDE.md)
+[![Release v4.1.0](https://img.shields.io/badge/Release-v4.1.0%20Foundation%20PPL%2037.37-brightgreen)](./docs/V3_PRODUCTION_TRAINING_GUIDE.md)
 [![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(39%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
-[![Test Suite 14/14](https://img.shields.io/badge/Tests-14%2F14%20Passing-brightgreen)](./tests/test_suite.py)
+[![Test Suite 16/16](https://img.shields.io/badge/Tests-16%2F16%20Passing-brightgreen)](./tests/test_suite.py)
+[![v4.1.0 PPL Breakthrough](https://img.shields.io/badge/TinyStories%20PPL-79.20%20%E2%86%92%2037.37%20(-52.8%25)-blue)](./docs/RESEARCH_PAPER_SS_ENN.md)
 [![Tesla T4 50M GPU](https://img.shields.io/badge/Tesla%20T4%2050M-38.6k--41.8k%20tok%2Fs%20%7C%201.49%20GB%20VRAM-blue)](./benchmarks/bench_v3_50m_gpu_suite.py)
 [![v3.0 Phase 3.3 Fault-Tolerant](https://img.shields.io/badge/Phase%203.3-0.00e%2B00%20Kill%2FSIGTERM%20%7C%2067.0M%20MMap%20tok%2Fs-blueviolet)](./benchmarks/bench_v3_trainer_fault_tolerance.py)
 [![v3.0 Phase 3.2 Production Model](https://img.shields.io/badge/Phase%203.2-92.62%25%20Frozen%20W0%20%7C%200.00e%2B00%20Resume-blue)](./benchmarks/bench_v3_production_model.py)
@@ -61,7 +62,7 @@
 
 ---
 
-## الحصيلة المعملية للتجارب الخمس عشرة | Empirical Benchmark Suite (v1.0 – v3.1.3)
+## الحصيلة المعملية للتجارب الست عشرة | Empirical Benchmark Suite (v1.0 – v4.1.0)
 
 تخضع جميع ملفات المستودع (39 ملفاً برمجياً) لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
 
@@ -82,6 +83,25 @@
 | **13** | **الإعدادات اليدوية والنموذج الإنتاجي الموحد (`v3.0 Phase 3.2`)** | [`benchmarks/bench_v3_production_model.py`](./benchmarks/bench_v3_production_model.py) | تقدير بصمة `1.66M -> 7.11B` + تدريب وتجميد وضغط + استئناف `FP32/BF16` | نمو من `d_init=64 -> [128]*6` ومؤشرات `anchor_k` على مقياس `7B` | توفير **`55.3%`** (`6.44 -> 2.87 MB`) و**`33.3%`** بوضع `anchor_k` (`19.71 -> 13.14 GB`) | **`92.62%`** (`Frozen W0` دون أي هبوط عن `92.62%`، `Val PPL=1.82`) | مطابقة استئناف **`0.00e+00`** (`FP32` و `BF16`)، استدلال $O(1)$ **`2.64x`** (`100%` تطابق)، و`100%` اتساق كيانات |
 | **14** | **التدريب السحابي المقاوم للانقطاع و`MMap` (`v3.0 Phase 3.3`)** | [`benchmarks/bench_v3_trainer_fault_tolerance.py`](./benchmarks/bench_v3_trainer_fault_tolerance.py) | تدفق `2.11M` رمز + قتل منتصف الحقبة + إتلاف (`truncate/bitflip`) + `SIGTERM` | `SSENNConfig` + `AtomicCheckpointVault` (`SHA-256`) + `MMapTokenDataset` | ذاكرة وصفية **`1.93 KB`** (`O(1)`) ومؤقت تدفق **`0.28 MB`** لملف `4.03 MB` | **`90.62%`** (قتل مفاجئ) و **`92.62%`** (تعافي `backup`، `PPL 1.87`) و **`90.54%`** (`best_frozen_w0.pt`) | تدفق **`32.23M tok/s`**، مطابقة **`0.00e+00`** عبر `FP32/BF16`، وتعافٍ ذاتي **`100%`** |
 | **15** | **التجربة الميدانية `Scale-50M` على `Tesla T4 GPU` وبيانات HuggingFace (`v3.1.1–v3.1.3`)** | [`benchmarks/bench_v3_50m_gpu_suite.py`](./benchmarks/bench_v3_50m_gpu_suite.py) | `8.27M` توكن حقيقي (`TinyStories 5.02M` -> `Simple Wiki 2.45M`, `V=12,288`, `0-<unk>`, `FP16+Kahan`) | `50.05M` تدريب -> **`14.21M–19.26M` `Frozen W0`** (`[448]*8` -> **`[576]*8`**) | **`-86.4%`** (`27.19 MB`) إلى **`-83.0%`** (`36.82 MB`)، Diff **`0.00e+00`** | `TinyStories`: **`25.57%` (`PPL 79.2`)** \| التعلّم المستمر (`v3.1.2`): `P2 = 14.24%` (`PPL 363.5`) | سرعة **`36.3k–41.8k tok/s`**، ذروة **`1,485.8 MB` VRAM**، بث `MMap` **`67.0M tok/s`**، و$O(1)$ **`1.96x–2.96x`** |
+| **16** | **الجيل التأسيسي الموحد (`SS-ENN v4.0` & `v4.1.0` على `Tesla T4 GPU`)** | [`benchmarks/bench_v3_50m_gpu_suite.py`](./benchmarks/bench_v3_50m_gpu_suite.py) (`--foundation-v4`) | `TinyStories` (`5.02M` تدريب / `544K` تحقق، `V=12,288`, `4 epochs`, `sleep=0`, `FP16+Kahan`) | نمو مبكر إلى **`[512]*8` (`16.68M` `Frozen W0`, `21.63M Deployed`, `10.81M Active/Tok`)** | **`-89.55%`** (`305.25 -> 31.89 MB`, قرص **`31.73 MB`**)، Diff **`0.00e+00`** | **`32.41%` (`Val PPL 37.37`, `-52.8%` من `79.20`)**؛ و`v4.0`: `30.80%` (`PPL 40.48`, `-48.8%`) | انتباه `H=8` بـ $O(1)$ **`182.3 tok/s` (`2.56x`, تطابق `100%`)**، وتوليد سردي خالٍ من حلقات التكرار |
+
+### قفزة الجيل الرابع التأسيسي | SS-ENN v4.0 & v4.1 Foundation Architecture & Perplexity Breakthrough on Tesla T4
+
+حقق الجيل التأسيسي الموحد (**`v4.0` & `v4.1.0`**) مع `--sleep-every-epochs 0` هبوطاً قياسياً في الحيرة اللغوية بنسبة **`-52.8%`** على شظايا `TinyStories` الحقيقية (`5.02M` توكن) باستخدام نموذج **`Scale-50M`** بـ **`0% Autograd`** دون إضافة أي معاملات في المصفوفة المنشورة `Frozen W0`:
+
+| الإصدار (`Tesla T4 FP16 + Kahan`) | الإعدادات والركائز المفعّلة | `Val Acc` (`Frozen W0`) | **`Val PPL`** | التغير أمام `v3.1.3` | حجم النشر (`Frozen W0`) | سرعة التوليد $O(1)$ (`+128 tok`) |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **`v3.1.3` (الأساس، `2 epochs`)** | `H=1`، تضمينات مجمدة، DFA تقليدي | `25.57%` | `79.20` | — | `[448]*8` (`21.63M`) | `149.7 tok/s` (`2.09x`) |
+| **`v4.0` (`4 epochs`, `H=1`)** | تضمينات محررة + `Mirrored DFA` + `Impulse` | `30.80%` | **`40.48`** | **`-48.8%`** | `16.68M` (`31.73 MB`, `-88.95%`) | `116.8 tok/s` (`1.92x`, `100%` parity) |
+| **`v4.1.0` (`4 epochs`, `H=8`)** | **`+ Multi-Head H=8 + Early Neurogenesis + Penalty`** | **`32.41%`** | **`37.37`** | **`-52.8%`** | **`16,678,912` (`31.73 MB`, `-89.55%`, `Diff=0.00e+00`)** | **`182.3 tok/s` (`2.56x`, `100.00%` parity)** |
+
+**الركائز الهندسية الست للجيل الرابع (`0% Autograd`):**
+1. **`Trainable Token Embeddings & Frontend Projections`:** تحديث الصفوف النشطة في `token_embedding` و`cap_proj` و`lag1_proj` و`lag2_proj` محلياً مع تعويض `FP32 Kahan`، وقص معيار الصفوف (`Row-Norm Clipping`)، وتحديث `index_add_` خالي المزامنة (`_get_emb_counts_scratch`) بدلاً من `torch.unique`.
+2. **`Delayed Elastic Weight-Tying Pull`:** جذب ناعم نحو `head_w0` (`weight_tie_embedding_pull=0.02`) معاير بـ `lr_attn_0 * impulse` ومؤجَّل لما بعد الحقبة الأولى (`current_epoch >= 1`).
+3. **`RMS-Balanced Weight-Mirrored Highway DFA`:** مواءمة التوجيه العكسي المباشر في `FactorizedHighwayDFA` بمزج انعكاس مستقر `0.55 * head_w + 0.45 * head_w0` بمعيارية RMS موزونة (`dfa_mirror_blend=0.35`).
+4. **`Decoupled Cosine Impulse Schedule`:** تمرير `set_training_horizon(epochs)` لتطبيق تهدئة جيبية ناعمة على اللدونة السريعة $\eta_w$ (`1.12 -> 0.88`) مع **فصل وإبقاء معدل المرساة $\eta_0$ ثابتاً** لمنع انكماش equilibrium النابض.
+5. **`Zero-Extra-Param Multi-Head Sparse Spring Attention`:** تقسيم `q, k, v` إلى `num_attn_heads=8` (مع اختيار القاسم المشترك الأكبر تلقائياً `GCD`) بـ **صفر مصفوفات أوزان إضافية**، مع ميل `ALiBi` هندسي خاص بكل رأس، وتوجيه جاكوبيان `Softmax` محلي لـ `Q/K/V`، وتطابق **`100.00%`** بين `_build_vectorized_context()` و`SpringInferenceCache.forward_step_cached()`.
+6. **`Early-Window Neurogenesis + Repetition Penalty + Unified Deployed W0 Metrics`:** إنهاء التوليد العصبي قبل الحقبة الأخيرة (`stop_neurogenesis_last_epoch=True`, `neurogenesis_cutoff_ratio=0.75`) مع خطوة ترسيب نهائية `W0 EMA`، وبوابة عقوبة التكرار والحضور النافذية (`frequency_penalty` / `presence_penalty` / `penalty_window`) في `generate()` و`cli.py`، وعرض مقاييس **`Deployed W0`** (`21.63M`), **`Active Params / Token`** (`10.81M`), و**`Training State Elements`** (`40.80M`) موحدةً في `estimate_memory_footprint()`.
 
 ---
 
@@ -130,10 +150,10 @@ next-23-MTL/
 │   ├── bench_v3_kernels_speed.py     # v3.0 Phase 3.1: Fused in-place kernels, Factorized DFA, O(1) cache & BF16 audit
 │   ├── bench_v3_production_model.py  # v3.0 Phase 3.2: Manual config estimator, compact freeze & checkpoint resume parity
 │   ├── bench_v3_trainer_fault_tolerance.py # v3.0 Phase 3.3: MMap O(1), Kill/Corrupt/SIGTERM recovery parity
-│   └── bench_v3_50m_gpu_suite.py     # v3.1.3 Tesla T4 50M GPU suite on real HuggingFace shards (6 experiments)
+│   └── bench_v3_50m_gpu_suite.py     # v4.1.0 / v3.1.3 Tesla T4 50M GPU suite (--foundation-v4 & 6-exp continual)
 ├── tests/                            # حزمة التحقق الصارم وفحص AST
 │   ├── __init__.py
-│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (39 files, 14 tests)
+│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (39 files, 16 tests)
 ├── docs/                             # الأوراق البحثية وسجل الإصلاحات وأدلة الإنتاج
 │   ├── V3_PRODUCTION_TRAINING_GUIDE.md # v3.1.0 Bilingual Production Manual (Google Colab, Drive, Multilingual BPE)
 │   ├── RESEARCH_PAPER_SS_ENN.md      # Full technical paper, equations, empirical tables & reproducibility
@@ -220,8 +240,9 @@ python benchmarks/bench_v3_production_model.py
 # 13. Fault-Tolerant Cloud Trainer, Atomic Vault, Corrupt Backup Recovery & MMap Streamer (v3.0 Phase 3.3)
 python benchmarks/bench_v3_trainer_fault_tolerance.py
 
-# 14. Scale-50M GPU Scientific Suite (v3.1.3 Smoke Audit / Full HuggingFace Shards)
+# 14. Scale-50M GPU Scientific Suite (v3.1.3 Smoke Audit / v4.1.0 Unified Foundation Mode)
 python benchmarks/bench_v3_50m_gpu_suite.py --smoke-test
+python benchmarks/bench_v3_50m_gpu_suite.py --smoke-test --foundation-v4 --p1-epochs 4
 ```
 
 ---

@@ -306,6 +306,24 @@ $$\delta_j^{(l)} = \left( B^{(l)} \mathbf{e} \right)_j \odot g'\left(z_j^{(l)}\r
    - وخلال آلاف خطوات `SoftMax CE` على المجال الجديد (`Phase 2`)، تتلقى كلمات `Phase 1` غير الحاضرة غالباً تحديثات سالبة $(0 - p_i)\mathbf{a}_{\text{free}}$ على الأعمدة الحرة `W_free` بينما تتراكم أوزان موجبة عالية لكلمات `Phase 2` عليها، فتطغى مساهمة $\mathbf{a}_{\text{free}} W_{\text{free}}^\top$ فوق $\mathbf{a}_{\text{lock}} W_{\text{lock}}^\top$.
    - يثبت هذا التحليل ضرورة فصل **طور التدريب التأسيسي الموحد (`Foundation Training` مع `--sleep-every-epochs 0`)** لاكتساب المعرفة العامة على مقياس `125M–7B` دون تجزئة، ومعالجة عزل بوابات الرأس والـ `ReLU` الصفري للخلايا التوسعية في أبحاث اللدونة المستمرة اللاحقة.
 
+### 5.11 SS-ENN v4.0 & v4.1 Foundation Architecture & Perplexity Breakthrough on Tesla T4
+
+استجابةً للاستنتاج التجريبي في القسم `5.10`، صُمم الجيل التأسيسي الرابع (`v4.0` و `v4.1.0`) للتدريب الموحد (`--sleep-every-epochs 0`) على نفس نموذج `Scale-50M` (`50,053,120` معامل تدريبي، `21,626,880` معامل `Deployed W0`، `10,814,080` معامل نشط/توكن، `float16 + full Kahan`) وعلى شظايا `roneneldan/TinyStories` الحقيقية (`5.02M` توكن تدريب / `544K` تحقق) فوق بطاقة `Tesla T4`، ليخفض الحيرة اللغوية إلى النصف تقريباً مع الحفاظ على **`0% Autograd`** وحجم النشر الثابت:
+
+| الإصدار (`Tesla T4 FP16`) | التقنيات المفعّلة | دقة التحقق (`Pre / Frozen W0`) | **`Val PPL` (`Pre / Frozen W0`)** | التغير أمام `v3.1.3` | حجم `Frozen W0` المنشور (`Diff`) | استدلال $O(1)$ عند `+128` |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **`v3.1.3` (الأساس، `2ep`)** | `H=1`، تضمينات مجمدة، DFA تقليدي | `25.57%` / `25.57%` | `79.20` / `79.20` | — | `[448]×8` (`21.63M`) | `149.7 tok/s` (`2.09x`) |
+| **`v4.0` (`4ep`, `H=1`)** | `Trainable Emb` + `Mirrored DFA` + `Impulse` | `30.75%` / `30.80%` | `40.53` / **`40.48`** | **`-48.8%`** | `16.68M` (`31.73 MB`, `-88.95%`, `0.00e+00`) | `116.8 tok/s` (`1.92x`, `100%`) |
+| **`v4.1.0` (`4ep`, `H=8`)** | **`+ Multi-Head H=8 + Early Neurogenesis + Rep Penalty`** | `32.40%` / **`32.41%`** | `37.39` / **`37.37`** | **`-52.8%`** | **`16,678,912` (`31.73 MB`, `-89.55%`, `0.00e+00`)** | **`182.3 tok/s` (`2.56x`, `100.00%`)** |
+
+**الركائز الهندسية الست للجيل الرابع (`0% Autograd`):**
+1. **`Trainable Token Embeddings & Frontend Projections`:** تحرير صفوف `token_embedding` وإسقاطات السياق (`cap_proj, lag1_proj, lag2_proj`) موضعياً بتعويض `FP32 Kahan`، وقص معيار الصفوف، وتحديث `index_add_` خالي المزامنة دون فرز `torch.unique`.
+2. **`Delayed Elastic Weight-Tying Pull`:** ربط مرن ناعم بين التضمينات و`head_w0` معاير بمعدل التعلم ومؤجَّل لما بعد الحقبة الأولى (`current_epoch >= 1`).
+3. **`RMS-Balanced Weight-Mirrored Highway DFA`:** مواءمة التوجيه العكسي المباشر في `FactorizedHighwayDFA` بمزج انعكاس مستقر `0.55 * head_w + 0.45 * head_w0` بمعيارية RMS موزونة (`dfa_mirror_blend=0.35`).
+4. **`Decoupled Cosine Impulse Schedule`:** فصل تهدئة معدل اللدونة $\eta_w$ (`1.12 -> 0.88`) عن معدل المرساة $\eta_0$ لمنع ارتداد الأوزان المتعلمة بفعل قوى الإرجاع المرنة $-\gamma k(w - w_0)$.
+5. **`Zero-Extra-Param Multi-Head Sparse Spring Attention`:** تقسيم `q, k, v` إلى `num_attn_heads=8` (مع مطابقة `GCD` التلقائية) بصفر معاملات إضافية، وتطبيق انحياز `ALiBi` هندسي خاص بكل رأس، وتوجيه محلي لإشارات `Q/K/V`، مع تطابق **`100.00%`** بين التمرير المتجهي وذاكرة الاستدلال $O(1)$.
+6. **`Early-Window Neurogenesis + Windowed Repetition Penalty + Unified Metrics`:** فتح الشرائح التوسعية مبكراً (`[448]` ثم `[512]` منذ الحقبة 2) مع تثبيت النمو قبل الحقبة الأخيرة وترسيب `W0 EMA`، وإضافة عقوبتي التكرار والحضور النافذتين (`frequency_penalty`, `presence_penalty`) وتوحيد مقاييس `Deployed W0` و`Active Params/Token`.
+
 ---
 
 ## 6. دليل قابلية إعادة الإنتاج والتشغيل (Reproducibility Guide)
@@ -314,12 +332,12 @@ $$\delta_j^{(l)} = \left( B^{(l)} \mathbf{e} \right)_j \odot g'\left(z_j^{(l)}\r
 # 1. تثبيت المتطلبات الأساسية
 pip install -r requirements.txt
 
-# 2. تشغيل حزمة التحقق الصارم (14 اختباراً) وفحص AST الشامل (39 ملفاً برمجياً)
+# 2. تشغيل حزمة التحقق الصارم (16 اختباراً) وفحص AST الشامل (39 ملفاً برمجياً)
 python tests/test_suite.py
 
-# 3. تشغيل تجربة النواة الأساسية (MVP) والواجهة الإنتاجية الموحدة (v3.1.x CLI)
+# 3. تشغيل تجربة النواة الأساسية (MVP) والواجهة الإنتاجية الموحدة (v4.1.0 CLI)
 python train_eval.py
-python -m trainer.cli estimate --vocab-size 32000 --num-layers 32 --d-init 3072 --d-max 6656 --delta-d 512 --dtype bfloat16 --kahan-mode anchor_k
+python -m trainer.cli estimate --vocab-size 32000 --num-layers 32 --d-init 3072 --d-max 6656 --delta-d 512 --dtype bfloat16 --kahan-mode anchor_k --num-attn-heads 8
 
 # 4. تشغيل حزمة الـ Benchmarks للإصدارات v1.0 و v2.0 و v3.0 / v3.1 (50M GPU Smoke Audit)
 python benchmarks/bench_capacity.py
@@ -336,6 +354,7 @@ python benchmarks/bench_v3_kernels_speed.py
 python benchmarks/bench_v3_production_model.py
 python benchmarks/bench_v3_trainer_fault_tolerance.py
 python benchmarks/bench_v3_50m_gpu_suite.py --smoke-test
+python benchmarks/bench_v3_50m_gpu_suite.py --smoke-test --foundation-v4 --p1-epochs 4
 ```
 
 ---

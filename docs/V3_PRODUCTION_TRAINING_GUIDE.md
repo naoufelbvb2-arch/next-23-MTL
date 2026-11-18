@@ -259,6 +259,8 @@ python -m trainer.cli prepare-data \
 | **`7B` (ضخم — `full`)** | `32,000` | `32` | `3072 -> 6656` | `512` | `16 / 32` | `2048` | `bfloat16` / `full` | `7.11B` | **`32.957 GB`** (`19.71 GB Kahan`) | **`3.95 GB`** | `79.20%` | **Colab A100 40GB (or A100 80GB)** |
 | **`7B` (`anchor_k -33%`)** | `32,000` | `32` | `3072 -> 6656` | `512` | `16 / 32` | `2048` | `bfloat16` / **`anchor_k`** | `7.11B` | **`26.387 GB`** (**`13.14 GB`** Kahan) | **`3.95 GB`** | `79.20%` | **Colab A100 40GB (or A100 80GB)** |
 
+> **مقاييس التوحيد المضافة في `v4.0 / v4.1.0` (`estimate_memory_footprint()` & `cli.py estimate`):** يعرض المقدر أيضاً القيم الإنتاجية الدقيقة للنشر: `deployed_w0_params` (`Deployed W0 Size`)، `active_params_per_token` (`Active Params / Token`)، و`training_state_elements` (`Training State Elements`). على مقياس `Scale-50M` (`FP16 + full`): **`50,053,120`** max train -> **`21,626,880`** `Deployed W0` (`41.25 MB`)، **`10,814,080`** `Active/Tok`، و**`40,796,160`** `Training State Elements`.
+
 > [!IMPORTANT]
 > **متى تختار `kahan_mode="full"` ومتى تختار `kahan_mode="anchor_k"`؟**
 > - استخدم **`kahan_mode="full"`** لجميع النماذج حتى **`3B`**، حيث تتوافر سعة VRAM كافية للاحتفاظ بمتبقيات `FP32` الثلاث (`_res_w`, `_res_w0`, `_res_k`)؛ مما يمنح أقصى دقة تراكمية للصلابات والأوزان في `BF16/FP16`.
@@ -370,3 +372,38 @@ python -m trainer.cli generate \
 | **`350M Medium`** (`full Kahan`) | **`1.76 GB`** | `289.5 MB` | **`6,569 tok/s`** (`~4.23h` / `~8.29 CU`) | **`15,438 tok/s`** (`~1.80h` / `~8.67 CU`) | **`40,729 tok/s`** (`~0.68h` / `~8.92 CU`) |
 | **`1.3B Large`** (`full Kahan`) | **`6.61 GB`** | `927.0 MB` | **`2,403 tok/s`** (`~11.56h` / `~22.66 CU`) | **`5,647 tok/s`** (`~4.92h` / `~23.71 CU`) | **`14,900 tok/s`** (`~1.86h` / `~24.39 CU`) |
 | **`7B Anchor-K`** (`anchor_k`) | **`26.39 GB`** | `4,049.5 MB` | `OOM` (يتجاوز `16 GB`) | `OOM` (يتجاوز `24 GB`) | **`4,426 tok/s`** (`~6.28h` / `~82.09 CU`) |
+
+---
+
+## 7. SS-ENN v4.0 & v4.1 Foundation Architecture & Perplexity Breakthrough on Tesla T4
+
+عند تشغيل طور **التدريب التأسيسي الموحد (`--foundation-v4` مع `--sleep-every-epochs 0`)** على شظية `roneneldan/TinyStories` الحقيقية (`5,016,810` توكن تدريب / `544,380` توكن تحقق، `V=12,288`، `0-<unk>`) على بطاقة **`Tesla T4` (`float16`, `kahan_mode="full"`)**، خفض الجيل الرابع الحيرة اللغوية بنسبة **`-52.8%`** مع توليد قصصي متماسك وصفر `Autograd` (`39` ملف بايثون، اختبارات `16/16 OK`):
+
+### 7.1 جدول المقارنة الثلاثي الميداني على `TinyStories` (`Tesla T4`, `Scale-50M`)
+
+| المقياس | **`v3.1.3`** (الأساس، `2 epochs`) | **`v4.0`** (`4 epochs`, `H=1`) | **`v4.1.0`** (`4 epochs`, `H=8` + نمو مبكر) |
+| :--- | :---: | :---: | :---: |
+| **حالة التدريب & التجميد** | `Pre-Sleep P1` (`[448]×8`) | `[448] (Ep1) -> [512] (Ep4)` | **`[448] (Ep1) -> [512] (Ep2..4 مستقر)`** |
+| **دقة التحقق (`Pre / Frozen W0`)** | `25.57%` / `25.57%` | `30.75%` / `30.80%` | **`32.40%` / `32.41%`** |
+| **الحيرة اللغوية (`Val PPL`)** | `79.20` | `40.53` -> **`40.48`** (**`-48.8%`**) | `37.39` -> **`37.37`** (**`-52.8%` إجمالاً**) |
+| **حجم النشر المجمّد (`Frozen W0`)** | `21.63M` (`41.25 MB` نظري) | `16,678,912` (`31.73 MB` قرص، `-88.95%`) | **`16,678,912` (`31.73 MB` قرص، `-89.55%`, `Diff=0.00e+00`)** |
+| **سرعة التدريب وذروة `VRAM`** | `37,170 tok/s` / `1,485.8 MB` | `23,670.9 tok/s` / `1,849.7 MB` | `23,590.3 tok/s` (`647.6s`) / `1,980.3 MB` |
+| **استدلال $O(1)$ عند `+128` توكن** | `149.7 tok/s` (`2.09x`) | `116.8 tok/s` (`1.92x`, `100%` parity) | **`182.3 tok/s` (`2.56x`, `100.00%` parity)** |
+
+### 7.2 الركائز الهندسية الست للجيل الرابع (`Zero-Autograd`)
+
+1. **`Trainable Token Embeddings & Frontend Projections`:** تحديث الصفوف النشطة في `token_embedding` وإسقاطات السياق `cap_proj`, `lag1_proj`, `lag2_proj` محلياً مع تعويض `FP32 Kahan` (`kahan_mode="full"` فقط)، وقص معيار الصفوف (`1.60 * sqrt(d_eff/3)`)، وتحديث `index_add_` خالي المزامنة عبر `_get_emb_counts_scratch` دون فرز `torch.unique`.
+2. **`Delayed Elastic Weight-Tying Pull`:** جذب ناعم نحو `head_w0` (`weight_tie_embedding_pull=0.02` معاير بـ `lr_attn_0 * impulse`) ومؤجل إلى `current_epoch >= 1`.
+3. **`RMS-Balanced Weight-Mirrored Highway DFA`:** مزج `e_base` في `FactorizedHighwayDFA.project_vocab_to_highway()` مع انعكاس مستقر `0.55 * head_w + 0.45 * head_w0` (`dfa_mirror_blend=0.35`) بتحجيم RMS موزون خالٍ من مزامنة `.item()`.
+4. **`Decoupled Cosine Impulse Schedule`:** تهدئة جيبية لمعدل اللدونة $\eta_w$ (`1.12 -> 0.88` عبر `set_training_horizon()`) مع فصل وإبقاء معدل المرساة $\eta_0$ ثابتاً لحماية استقرار الترسيب داخل $W_0$.
+5. **`Zero-Extra-Param Multi-Head Sparse Spring Attention`:** تقسيم مصفوفات `q, k, v` الحالية إلى `num_attn_heads=8` (مع اختيار القاسم المشترك الأكبر `GCD` تلقائياً عبر `resolve_effective_attn_heads()`) وميل `ALiBi` هندسي خاص بكل رأس، وتوجيه جاكوبيان `Softmax` محلي لـ `Q/K/V` مع تطابق **`100.00%`** أمام `SpringInferenceCache`.
+6. **`Early-Window Neurogenesis + Repetition Penalty + Unified Deployed Metrics`:** إيقاف التوسع قبل الحقبة الأخيرة (`stop_neurogenesis_last_epoch=True`, `neurogenesis_cutoff_ratio=0.75`) مع خطوة ترسيب نهائية `W0 EMA` (`_apply_final_w0_ema_pull()`), وبوابة عقوبة التكرار والحضور النافذية (`--frequency-penalty`, `--presence-penalty`, `--penalty-window`) في `generate()` و`cli.py`.
+
+```bash
+# أمر تشغيل السحابة الموحد لـ v4.1.0 على بطاقة GPU مع حفظ التقرير في results_v4_1:
+python benchmarks/bench_v3_50m_gpu_suite.py --foundation-v4 --num-attn-heads 8 \
+  --frequency-penalty 0.35 --presence-penalty 0.15 --penalty-window 64 \
+  --phase1-dir /content/local_50m/shards_phase1_stories \
+  --output-dir /content/drive/MyDrive/SS_ENN_Workspace/exp_50m_scientific/results_v4_1 \
+  --device cuda --dtype float16 --p1-epochs 4 --batch-size 64
+```
