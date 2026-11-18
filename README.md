@@ -4,9 +4,10 @@
 *A Backpropagation-Free Local Learning Framework via Spring Synapse Dynamics, Multi-Head Sparse Causal Attention, Trainable Embeddings, Weight-Mirrored DFA, Fault-Tolerant Cloud Training, and O(1) Stateful Inference*
 
 [![Release v4.1.0](https://img.shields.io/badge/Release-v4.1.0%20Foundation%20PPL%2037.37-brightgreen)](./docs/V3_PRODUCTION_TRAINING_GUIDE.md)
-[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(39%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
+[![Zero-Autograd AST Verified](https://img.shields.io/badge/Autograd-0%25%20(40%20Files%20AST%20Verified)-success)](./tests/test_suite.py)
 [![Test Suite 16/16](https://img.shields.io/badge/Tests-16%2F16%20Passing-brightgreen)](./tests/test_suite.py)
 [![v4.1.0 PPL Breakthrough](https://img.shields.io/badge/TinyStories%20PPL-79.20%20%E2%86%92%2037.37%20(-52.8%25)-blue)](./docs/RESEARCH_PAPER_SS_ENN.md)
+[![A100 Base-125M](https://img.shields.io/badge/A100%20125M-60.4k%20tok%2Fs%20%7C%20Stories%2033.14%20%7C%20Wiki%2095.27-blueviolet)](./benchmarks/bench_v4_125m_gpu_suite.py)
 [![Tesla T4 50M GPU](https://img.shields.io/badge/Tesla%20T4%2050M-38.6k--41.8k%20tok%2Fs%20%7C%201.49%20GB%20VRAM-blue)](./benchmarks/bench_v3_50m_gpu_suite.py)
 [![v3.0 Phase 3.3 Fault-Tolerant](https://img.shields.io/badge/Phase%203.3-0.00e%2B00%20Kill%2FSIGTERM%20%7C%2067.0M%20MMap%20tok%2Fs-blueviolet)](./benchmarks/bench_v3_trainer_fault_tolerance.py)
 [![v3.0 Phase 3.2 Production Model](https://img.shields.io/badge/Phase%203.2-92.62%25%20Frozen%20W0%20%7C%200.00e%2B00%20Resume-blue)](./benchmarks/bench_v3_production_model.py)
@@ -62,9 +63,9 @@
 
 ---
 
-## الحصيلة المعملية للتجارب الست عشرة | Empirical Benchmark Suite (v1.0 – v4.1.0)
+## الحصيلة المعملية للتجارب السبع عشرة | Empirical Benchmark Suite (v1.0 – v4.1.0 Base-125M)
 
-تخضع جميع ملفات المستودع (39 ملفاً برمجياً) لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
+تخضع جميع ملفات المستودع (40 ملفاً برمجياً) لفحص الشجرة النحوية المجردة (`AST Zero-Autograd Verification`) للتثبت برمجياً من الانعدام التام لأي استدعاء لـ `backward()` أو `grad`:
 
 | # | الاختبار المعملي (`Benchmark`) | السكريبت التنفيذي | التحدي وحجم البيانات | الأبعاد النشطة النهائية ($D_{\text{active}}$) | توفير السعة / الذاكرة | الدقة بعد التجميد ($W_0$ فقط) | النتيجة الفيزيائية البارزة |
 | :-: | :--- | :--- | :--- | :--- | :---: | :---: | :--- |
@@ -84,6 +85,7 @@
 | **14** | **التدريب السحابي المقاوم للانقطاع و`MMap` (`v3.0 Phase 3.3`)** | [`benchmarks/bench_v3_trainer_fault_tolerance.py`](./benchmarks/bench_v3_trainer_fault_tolerance.py) | تدفق `2.11M` رمز + قتل منتصف الحقبة + إتلاف (`truncate/bitflip`) + `SIGTERM` | `SSENNConfig` + `AtomicCheckpointVault` (`SHA-256`) + `MMapTokenDataset` | ذاكرة وصفية **`1.93 KB`** (`O(1)`) ومؤقت تدفق **`0.28 MB`** لملف `4.03 MB` | **`90.62%`** (قتل مفاجئ) و **`92.62%`** (تعافي `backup`، `PPL 1.87`) و **`90.54%`** (`best_frozen_w0.pt`) | تدفق **`32.23M tok/s`**، مطابقة **`0.00e+00`** عبر `FP32/BF16`، وتعافٍ ذاتي **`100%`** |
 | **15** | **التجربة الميدانية `Scale-50M` على `Tesla T4 GPU` وبيانات HuggingFace (`v3.1.1–v3.1.3`)** | [`benchmarks/bench_v3_50m_gpu_suite.py`](./benchmarks/bench_v3_50m_gpu_suite.py) | `8.27M` توكن حقيقي (`TinyStories 5.02M` -> `Simple Wiki 2.45M`, `V=12,288`, `0-<unk>`, `FP16+Kahan`) | `50.05M` تدريب -> **`14.21M–19.26M` `Frozen W0`** (`[448]*8` -> **`[576]*8`**) | **`-86.4%`** (`27.19 MB`) إلى **`-83.0%`** (`36.82 MB`)، Diff **`0.00e+00`** | `TinyStories`: **`25.57%` (`PPL 79.2`)** \| التعلّم المستمر (`v3.1.2`): `P2 = 14.24%` (`PPL 363.5`) | سرعة **`36.3k–41.8k tok/s`**، ذروة **`1,485.8 MB` VRAM**، بث `MMap` **`67.0M tok/s`**، و$O(1)$ **`1.96x–2.96x`** |
 | **16** | **الجيل التأسيسي الموحد (`SS-ENN v4.0` & `v4.1.0` على `Tesla T4 GPU`)** | [`benchmarks/bench_v3_50m_gpu_suite.py`](./benchmarks/bench_v3_50m_gpu_suite.py) (`--foundation-v4`) | `TinyStories` (`5.02M` تدريب / `544K` تحقق، `V=12,288`, `4 epochs`, `sleep=0`, `FP16+Kahan`) | نمو مبكر إلى **`[512]*8` (`16.68M` `Frozen W0`, `21.63M Deployed`, `10.81M Active/Tok`)** | **`-89.55%`** (`305.25 -> 31.89 MB`, قرص **`31.73 MB`**)، Diff **`0.00e+00`** | **`32.41%` (`Val PPL 37.37`, `-52.8%` من `79.20`)**؛ و`v4.0`: `30.80%` (`PPL 40.48`, `-48.8%`) | انتباه `H=8` بـ $O(1)$ **`182.3 tok/s` (`2.56x`, تطابق `100%`)**، وتوليد سردي خالٍ من حلقات التكرار |
+| **17** | **التدريب التأسيسي الهجين الموحد `Base-125M` على `NVIDIA A100-SXM4-80GB`** | [`benchmarks/bench_v4_125m_gpu_suite.py`](./benchmarks/bench_v4_125m_gpu_suite.py) | شظية هجينة مخلوطة **`25.00M`** توكن (`Stories 18M` + `Wiki 7M`، `seq_len=256`, `6 epochs`, `BF16+Full Kahan`) | **`114.56M`** تدريب $\rightarrow$ **`44.30M Deployed W0` (`20.45M Active/Tok`)**؛ توسع مبكر **`[1024]*12`** (`Ep3`) | **`-88.18%`** (`723.49 -> 85.49 MB`, قرص **`85.23 MB`** لـ `44.75M` معاملاً)، Diff **`0.00e+00`** | قصص **`31.02%` (`PPL 33.14` / `BPB 1.221`)**؛ ويكيبيديا **`22.67%` (`PPL 95.27` / `BPB 2.197`, `-73.8%`)**؛ مركب **`PPL 50.88`** | تدريب **`60,443.3 tok/s`** (`5.04 GB VRAM`)، بث `MMap` **`172.0M tok/s`**، و$O(1)$ **`122.6 tok/s` (`2.21x` عند `+128`، `100%`)** |
 
 ### قفزة الجيل الرابع التأسيسي | SS-ENN v4.0 & v4.1 Foundation Architecture & Perplexity Breakthrough on Tesla T4
 
@@ -150,10 +152,11 @@ next-23-MTL/
 │   ├── bench_v3_kernels_speed.py     # v3.0 Phase 3.1: Fused in-place kernels, Factorized DFA, O(1) cache & BF16 audit
 │   ├── bench_v3_production_model.py  # v3.0 Phase 3.2: Manual config estimator, compact freeze & checkpoint resume parity
 │   ├── bench_v3_trainer_fault_tolerance.py # v3.0 Phase 3.3: MMap O(1), Kill/Corrupt/SIGTERM recovery parity
-│   └── bench_v3_50m_gpu_suite.py     # v4.1.0 / v3.1.3 Tesla T4 50M GPU suite (--foundation-v4 & 6-exp continual)
+│   ├── bench_v3_50m_gpu_suite.py     # v4.1.0 / v3.1.3 Tesla T4 50M GPU suite (--foundation-v4 & 6-exp continual)
+│   └── bench_v4_125m_gpu_suite.py    # v4.1.0 NVIDIA A100 Base-125M 25M-tok dual-domain foundation suite
 ├── tests/                            # حزمة التحقق الصارم وفحص AST
 │   ├── __init__.py
-│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (39 files, 16 tests)
+│   └── test_suite.py                 # Strict unit & AST Zero-Autograd verification suite (40 files, 16 tests)
 ├── docs/                             # الأوراق البحثية وسجل الإصلاحات وأدلة الإنتاج
 │   ├── V3_PRODUCTION_TRAINING_GUIDE.md # v3.1.0 Bilingual Production Manual (Google Colab, Drive, Multilingual BPE)
 │   ├── RESEARCH_PAPER_SS_ENN.md      # Full technical paper, equations, empirical tables & reproducibility
@@ -243,6 +246,9 @@ python benchmarks/bench_v3_trainer_fault_tolerance.py
 # 14. Scale-50M GPU Scientific Suite (v3.1.3 Smoke Audit / v4.1.0 Unified Foundation Mode)
 python benchmarks/bench_v3_50m_gpu_suite.py --smoke-test
 python benchmarks/bench_v3_50m_gpu_suite.py --smoke-test --foundation-v4 --p1-epochs 4
+
+# 15. Base-125M Unified Hybrid Foundation Suite (NVIDIA A100 BF16 / Offline Smoke Test)
+python benchmarks/bench_v4_125m_gpu_suite.py --smoke-test
 ```
 
 ---

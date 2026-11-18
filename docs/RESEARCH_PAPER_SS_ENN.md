@@ -324,6 +324,18 @@ $$\delta_j^{(l)} = \left( B^{(l)} \mathbf{e} \right)_j \odot g'\left(z_j^{(l)}\r
 5. **`Zero-Extra-Param Multi-Head Sparse Spring Attention`:** تقسيم `q, k, v` إلى `num_attn_heads=8` (مع مطابقة `GCD` التلقائية) بصفر معاملات إضافية، وتطبيق انحياز `ALiBi` هندسي خاص بكل رأس، وتوجيه محلي لإشارات `Q/K/V`، مع تطابق **`100.00%`** بين التمرير المتجهي وذاكرة الاستدلال $O(1)$.
 6. **`Early-Window Neurogenesis + Windowed Repetition Penalty + Unified Metrics`:** فتح الشرائح التوسعية مبكراً (`[448]` ثم `[512]` منذ الحقبة 2) مع تثبيت النمو قبل الحقبة الأخيرة وترسيب `W0 EMA`، وإضافة عقوبتي التكرار والحضور النافذتين (`frequency_penalty`, `presence_penalty`) وتوحيد مقاييس `Deployed W0` و`Active Params/Token`.
 
+### 5.12 التوسع الإنتاجي إلى `Base-125M` على `NVIDIA A100-SXM4-80GB` وكسر حيرتي القصص والمعرفة في نموذج واحد
+
+بُنيت تجربة [`benchmarks/bench_v4_125m_gpu_suite.py`](../benchmarks/bench_v4_125m_gpu_suite.py) فوق الكود المجمّد **`v4.1.0`** (`L=12`, `d_init=640 -> d_max=1024`, `delta_d=128`, `H=8`, `top_k_blocks=8`, `seq_len=256`, `attn_top_k=16`, `salient_anchor_slots=4`, `bfloat16 + full Kahan`, **`40` ملف بايثون بلا Autograd**) لتدريب نموذج واحد على شظية هجينة مخلوطة بحجم **`25,000,189` توكن** (`18.00M` قصص `TinyStories` + `7.00M` موسوعة `Simple Wikipedia`، بصفر `<unk>`):
+
+| المقياس (`A100-SXM4-80GB BF16`) | القيمة المسجلة | المقارنة أمام خطوط الأساس |
+| :--- | :---: | :--- |
+| **أبعاد التخصيص والشبكة** | `114.56M Max Train` $\rightarrow$ **`44.30M Deployed W0`** (`[1024]×12`) | `Exact Buffers 115,007,488 == 115,007,488`؛ `20.45M Active/Tok` |
+| **كفاءة التدريب والذاكرة** | **`60,443.3 tok/s`** (`1,878.1s` لـ `6` حقب) \| ذروة **`5,158.1 MB` VRAM** | بث `MMap`: **`171.95M tok/s`**؛ استئناف ذري **`0.00e+00`** |
+| **تحقق `TinyStories` (`Frozen W0`)** | **`31.02%` \| `Val PPL = 33.14` (`BPB = 1.221`)** (ذروة `Ep5`: `33.05`) | تخطى حاجز `v4.1 50M` (**`37.37 -> 33.14`**) داخل نموذج هجين |
+| **تحقق `Simple Wiki` (`Frozen W0`)** | **`22.67%` \| `Val PPL = 95.27` (`BPB = 2.197`)** | هبوط **`-73.8%`** عن `v3.1.2` (`363.5` و`14.24%`) دون أي نوم مرحلي |
+| **المركب وضغط التجميد** | `Combined PPL = 50.88` (`BPB = 1.543`) \| **`85.23 MB` قرص (`-88.18%`)** | تصدير غير متلف **`0.00e+00`**؛ $O(1)$ عند `+128`: **`2.21x` (`100.00%`)** |
+
 ---
 
 ## 6. دليل قابلية إعادة الإنتاج والتشغيل (Reproducibility Guide)
@@ -332,7 +344,7 @@ $$\delta_j^{(l)} = \left( B^{(l)} \mathbf{e} \right)_j \odot g'\left(z_j^{(l)}\r
 # 1. تثبيت المتطلبات الأساسية
 pip install -r requirements.txt
 
-# 2. تشغيل حزمة التحقق الصارم (16 اختباراً) وفحص AST الشامل (39 ملفاً برمجياً)
+# 2. تشغيل حزمة التحقق الصارم (16 اختباراً) وفحص AST الشامل (40 ملفاً برمجياً)
 python tests/test_suite.py
 
 # 3. تشغيل تجربة النواة الأساسية (MVP) والواجهة الإنتاجية الموحدة (v4.1.0 CLI)
@@ -355,6 +367,7 @@ python benchmarks/bench_v3_production_model.py
 python benchmarks/bench_v3_trainer_fault_tolerance.py
 python benchmarks/bench_v3_50m_gpu_suite.py --smoke-test
 python benchmarks/bench_v3_50m_gpu_suite.py --smoke-test --foundation-v4 --p1-epochs 4
+python benchmarks/bench_v4_125m_gpu_suite.py --smoke-test
 ```
 
 ---
