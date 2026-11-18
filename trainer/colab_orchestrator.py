@@ -342,6 +342,7 @@ class ElasticCloudTrainer:
             resume_info = self.restore_from_vault(streamer=streamer)
 
         start_epoch = int(streamer.current_epoch)
+        self.model.set_training_horizon(int(epochs))
         last_save_wall = time.monotonic()
         t_fit_start = time.perf_counter()
         total_fit_tokens = 0

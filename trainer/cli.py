@@ -154,9 +154,11 @@ def cmd_estimate(args: argparse.Namespace) -> int:
         f"({fp['total_train_with_kahan_gb']:.3f} GB)"
     )
     print(
-        f"  Frozen W0 Deployment    : {fp['frozen_w0_mb']:>10.2f} MB  "
-        f"({fp['frozen_w0_gb']:.3f} GB | {_format_params(int(fp['frozen_w0_params']))})"
+        f"  Deployed W0 Size        : {fp['frozen_w0_mb']:>10.2f} MB  "
+        f"({fp['frozen_w0_gb']:.3f} GB | {_format_params(int(fp['deployed_w0_params']))})"
     )
+    print(f"  Active Params / Token   : {_format_params(int(fp['active_params_per_token']))}")
+    print(f"  Training State Elements : {_format_params(int(fp['training_state_elements']))}")
     print("-" * 88)
     print(f"  Recommended Accelerator : {hw}")
     print("=" * 88)

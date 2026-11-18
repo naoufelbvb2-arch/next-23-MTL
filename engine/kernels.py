@@ -457,6 +457,7 @@ def batch_active_block_union_update(
     scratch: SpringScratchBuffer | None = None,
     compensator: MixedPrecisionCompensator | None = None,
     comp_key: int | str | None = None,
+    lr_scale: float = 1.0,
 ) -> tuple[int, int]:
     """
     Active-Block Union Mini-Batch Kernel (Zero 5D Allocation):
@@ -497,6 +498,8 @@ def batch_active_block_union_update(
     win_norm_factor = (max(n_valid, 1.0) / (wins_per_cell * sparsity_ratio)).clamp(1.0, 8.0)
     effective_beta_k = layer.beta_k * maturity_stiff_gain * win_norm_factor * stiff_mult
 
+    eta_w_eff = float(layer.eta_w) * float(lr_scale)
+    eta_0_eff = float(layer.eta_0)
     if u_blocks == n_blocks:
         # Contiguous fast path: update full active slice strictly in-place (zero gather/scatter)
         driving_signal = torch.matmul(delta_mat.t(), a_prev_eff).div_(balanced_denom)
@@ -506,8 +509,8 @@ def batch_active_block_union_update(
             w0=layer.w0[:d_act, :d_eff],
             k=layer.k[:d_act, :d_eff],
             driving_signal=driving_signal,
-            eta_w=layer.eta_w,
-            eta_0=layer.eta_0,
+            eta_w=eta_w_eff,
+            eta_0=eta_0_eff,
             gamma=layer.gamma,
             beta_k_eff=effective_beta_k,
             stiff_ceil=stiff_ceil,
@@ -533,8 +536,8 @@ def batch_active_block_union_update(
             w0=w0_sub,
             k=k_sub,
             driving_signal=driving_sub,
-            eta_w=layer.eta_w,
-            eta_0=layer.eta_0,
+            eta_w=eta_w_eff,
+            eta_0=eta_0_eff,
             gamma=layer.gamma,
             beta_k_eff=beta_sub,
             stiff_ceil=stiff_ceil,
@@ -596,14 +599,28 @@ class FactorizedHighwayDFA(nn.Module):
 
     @torch.no_grad()
     def project_vocab_to_highway(
-        self, error_vec: torch.Tensor, head_w_active: torch.Tensor
+        self,
+        error_vec: torch.Tensor,
+        head_w_active: torch.Tensor,
+        head_w0_active: torch.Tensor | None = None,
+        mirror_blend: float = 0.65,
     ) -> torch.Tensor:
         """
         Single shared projection from vocabulary space [N, V] to highway space [N, D_last].
-        `head_w_active` has shape [V, D_last].
+        `head_w_active` has shape [V, D_last]. When `head_w0_active` is supplied, blends
+        column-normalized feedback with the RMS-calibrated transpose of `W_0` (Weight-Mirrored DFA).
         """
         col_norm_t = F.normalize(head_w_active.t(), p=2, dim=-1, eps=1e-6)  # [D_last, V]
-        return F.linear(error_vec, col_norm_t) * self.target_row_norm      # [N, D_last]
+        e_base = F.linear(error_vec, col_norm_t) * self.target_row_norm      # [N, D_last]
+        if head_w0_active is None or mirror_blend <= 0.0:
+            return e_base
+
+        b = min(1.0, max(0.0, float(mirror_blend)))
+        # Settled weight-mirrored Jacobian combining live head_w and anchor head_w0 with stable RMS scaling
+        w_mir_t = (0.55 * head_w_active.float() + 0.45 * head_w0_active.float()).t()
+        mean_col_norm = w_mir_t.pow(2).sum(dim=-1).mean().sqrt().clamp(min=1e-6)
+        e_mirror = F.linear(error_vec.float(), w_mir_t) * (self.target_row_norm / float(mean_col_norm.item()))
+        return ((1.0 - b) * e_base.float() + b * e_mirror).to(error_vec.dtype)
 
     @torch.no_grad()
     def broadcast_layer_error(

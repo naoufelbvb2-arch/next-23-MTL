@@ -17,6 +17,7 @@ Strictly Zero-Autograd.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import json
 import math
@@ -219,14 +220,32 @@ def run_suite(args: argparse.Namespace) -> dict:
         raise RuntimeError("AST Zero-Autograd verification failed!")
 
     device, dtype, kahan_mode, gpu_name = _resolve_device_and_dtype(args.device, args.dtype)
+    foundation_mode = bool(getattr(args, "foundation_v4", False))
+    suite_title = (
+        "SS-ENN v4.0 SCALE-50M UNIFIED FOUNDATION PPL SUITE (Zero-Autograd, sleep_every_epochs=0)"
+        if foundation_mode
+        else "SS-ENN v3.1.0 SCIENTIFIC GPU BENCHMARK SUITE (Zero-Autograd 6-Experiment Audit)"
+    )
     print("=" * 108)
-    print("SS-ENN v3.1.0 SCIENTIFIC GPU BENCHMARK SUITE (Zero-Autograd 6-Experiment Audit)")
+    print(suite_title)
     print("=" * 108)
     print(f"  AST Zero-Autograd : PASS ({file_cnt} Python files verified)")
     print(f"  Accelerator       : {gpu_name} (device={device}, dtype={dtype}, kahan_mode={kahan_mode})")
 
     temp_ctx = tempfile.TemporaryDirectory() if args.smoke_test else None
     try:
+        v4_overrides = (
+            dict(
+                trainable_embeddings=False,
+                embedding_lr_scale=0.0,
+                weight_tie_embedding_pull=0.0,
+                mirrored_dfa=False,
+                dfa_mirror_blend=0.0,
+                impulse_schedule=False,
+            )
+            if getattr(args, "v3_legacy", False)
+            else {}
+        )
         if args.smoke_test:
             tmp_root = pathlib.Path(temp_ctx.name)
             p1_dir, p2_dir = build_smoke_shards(tmp_root)
@@ -235,8 +254,9 @@ def run_suite(args: argparse.Namespace) -> dict:
                 vocab_size=512, num_layers=4, d_init=64, d_max=128, delta_d=32,
                 block_size=16, top_k_blocks=2, max_seq_len=64, attn_top_k=4,
                 salient_anchor_slots=1, dtype=dtype, kahan_mode=kahan_mode, device=device, seed=42,
+                **v4_overrides,
             )
-            p1_epochs = 2
+            p1_epochs = int(args.p1_epochs) if foundation_mode else 2
             p2_epochs = 4
             batch_size = 16
             ckpt_steps = 4
@@ -260,6 +280,7 @@ def run_suite(args: argparse.Namespace) -> dict:
                 kahan_mode=kahan_mode,
                 device=device,
                 seed=42,
+                **v4_overrides,
             )
             p1_epochs = int(args.p1_epochs)
             p2_epochs = int(args.p2_epochs)
@@ -282,12 +303,19 @@ def run_suite(args: argparse.Namespace) -> dict:
             "config": cfg.to_dict(),
         }
 
-        with (
-            MMapTokenDataset(p1_dir, shard_name="train_shard", verify_checksum=True) as p1_train_ds,
-            MMapTokenDataset(p1_dir, shard_name="val_shard", verify_checksum=True) as p1_val_ds,
-            MMapTokenDataset(p2_dir, shard_name="train_shard", verify_checksum=True) as p2_train_ds,
-            MMapTokenDataset(p2_dir, shard_name="val_shard", verify_checksum=True) as p2_val_ds,
-        ):
+        with contextlib.ExitStack() as ds_stack:
+            p1_train_ds = ds_stack.enter_context(MMapTokenDataset(p1_dir, shard_name="train_shard", verify_checksum=True))
+            p1_val_ds = ds_stack.enter_context(MMapTokenDataset(p1_dir, shard_name="val_shard", verify_checksum=True))
+            p2_train_ds = (
+                None
+                if foundation_mode
+                else ds_stack.enter_context(MMapTokenDataset(p2_dir, shard_name="train_shard", verify_checksum=True))
+            )
+            p2_val_ds = (
+                None
+                if foundation_mode
+                else ds_stack.enter_context(MMapTokenDataset(p2_dir, shard_name="val_shard", verify_checksum=True))
+            )
             # ------------------------------------------------------------------
             # Experiment 1: Pre-Allocation Footprint & MMap Streaming Audit
             # ------------------------------------------------------------------
@@ -313,10 +341,10 @@ def run_suite(args: argparse.Namespace) -> dict:
                 brk_init["live_buffer_params"],
             )
 
-            for ds_name, ds in [
-                ("p1_train", p1_train_ds), ("p1_val", p1_val_ds),
-                ("p2_train", p2_train_ds), ("p2_val", p2_val_ds),
-            ]:
+            audit_pairs = [("p1_train", p1_train_ds), ("p1_val", p1_val_ds)]
+            if p2_train_ds is not None and p2_val_ds is not None:
+                audit_pairs.extend([("p2_train", p2_train_ds), ("p2_val", p2_val_ds)])
+            for ds_name, ds in audit_pairs:
                 assert ds.verify_integrity() is True, f"Integrity check failed on {ds_name}"
 
             # Benchmark pure MMap streaming speed across Phase 1 train shard
@@ -331,6 +359,9 @@ def run_suite(args: argparse.Namespace) -> dict:
             exp1 = {
                 "max_train_params": int(est["max_train_params"]),
                 "frozen_w0_params": int(est["frozen_w0_params"]),
+                "deployed_w0_params": int(est["deployed_w0_params"]),
+                "active_params_per_token": int(est["active_params_per_token"]),
+                "training_state_elements": int(est["training_state_elements"]),
                 "exact_live_buffer_params_at_max": int(est["exact_live_buffer_params_at_max"]),
                 "actual_live_buffer_params": int(brk_init["live_buffer_params"]),
                 "est_total_train_with_kahan_mb": float(est["total_train_with_kahan_mb"]),
@@ -338,16 +369,16 @@ def run_suite(args: argparse.Namespace) -> dict:
                 "est_frozen_w0_mb": float(est["frozen_w0_mb"]),
                 "p1_train_tokens": int(p1_train_ds.total_stored_tokens),
                 "p1_val_tokens": int(p1_val_ds.total_stored_tokens),
-                "p2_train_tokens": int(p2_train_ds.total_stored_tokens),
-                "p2_val_tokens": int(p2_val_ds.total_stored_tokens),
+                "p2_train_tokens": int(p2_train_ds.total_stored_tokens) if p2_train_ds is not None else 0,
+                "p2_val_tokens": int(p2_val_ds.total_stored_tokens) if p2_val_ds is not None else 0,
                 "all_shards_integrity_verified": True,
                 "mmap_stream_tok_s": float(stream_tok_s),
                 "mmap_meta_ram_kb": float((p1_dir / "train_shard.meta.json").stat().st_size / 1024.0),
             }
             results["experiment_1_audit"] = exp1
             print(
-                f"  * Params Match    : Train {exp1['max_train_params']:,} | Frozen W0 {exp1['frozen_w0_params']:,} | "
-                f"Exact Buffers {exp1['actual_live_buffer_params']:,} == Est {exp1['exact_live_buffer_params_at_max']:,}"
+                f"  * Params Match    : Train {exp1['max_train_params']:,} | Deployed W0 {exp1['deployed_w0_params']:,} "
+                f"(Active/Tok {exp1['active_params_per_token']:,}) | Exact Buffers {exp1['actual_live_buffer_params']:,} == Est {exp1['exact_live_buffer_params_at_max']:,}"
             )
             print(
                 f"  * Live RAM/VRAM   : {exp1['actual_total_live_mb']:.2f} MB (Est {exp1['est_total_train_with_kahan_mb']:.2f} MB) | "
@@ -432,76 +463,91 @@ def run_suite(args: argparse.Namespace) -> dict:
             # ------------------------------------------------------------------
             # Experiment 3: Sleep Consolidation & Phase 2 Continual Retraining
             # ------------------------------------------------------------------
-            print("\n[Experiment 3] Dual-Stage Sleep Consolidation & Phase 2 Continual Knowledge Retraining")
-            p2_before_metrics = evaluate_validation_batches(trainer.model, p2_val_ds, pad_id=tok.pad_id, batch_size=batch_size)
-            sleep_info = trainer.model.sleep_consolidate(phase_id=1)
-            rejuv_after_sleep = [len(slots) for slots in trainer.model.rejuvenated_slots]
-            p1_post_sleep_metrics = evaluate_validation_batches(trainer.model, p1_val_ds, pad_id=tok.pad_id, batch_size=batch_size)
+            if foundation_mode:
+                base_ppl = float(getattr(args, "foundation_baseline_ppl", 79.20))
+                ppl_delta_pct = ((exp2["val_ppl"] - base_ppl) / max(base_ppl, 1e-6)) * 100.0
+                results["experiment_3_sleep_continual"] = {
+                    "skipped_foundation_mode": True,
+                    "sleep_every_epochs": 0,
+                    "v3_1_3_baseline_ppl": base_ppl,
+                    "v4_val_ppl": float(exp2["val_ppl"]),
+                    "ppl_delta_vs_v3_1_3_pct": float(ppl_delta_pct),
+                }
+                print(
+                    f"\n[Experiment 3] Unified Foundation Mode (--sleep-every-epochs 0) | "
+                    f"Val PPL vs v3.1.3 ({base_ppl:.2f}): {exp2['val_ppl']:.2f} ({ppl_delta_pct:+.1f}%)"
+                )
+            else:
+                print("\n[Experiment 3] Dual-Stage Sleep Consolidation & Phase 2 Continual Knowledge Retraining")
+                p2_before_metrics = evaluate_validation_batches(trainer.model, p2_val_ds, pad_id=tok.pad_id, batch_size=batch_size)
+                sleep_info = trainer.model.sleep_consolidate(phase_id=1)
+                rejuv_after_sleep = [len(slots) for slots in trainer.model.rejuvenated_slots]
+                p1_post_sleep_metrics = evaluate_validation_batches(trainer.model, p1_val_ds, pad_id=tok.pad_id, batch_size=batch_size)
 
-            # Reset peak VRAM & track Phase 2 in dedicated sub-vault so Phase 1 checkpoint remains intact
-            trainer.vault = AtomicCheckpointVault(vault_p2)
-            trainer.best_val_acc = -1.0
-            trainer.best_val_ppl = float("inf")
-            has_p2_ckpt = trainer.vault.latest_path.exists() or trainer.vault.backup_path.exists()
-            p2_start_epoch = max(int(trainer.model.current_epoch), p1_epochs) + 1
-            p2_target_epoch = p2_start_epoch + p2_epochs - 1
+                # Reset peak VRAM & track Phase 2 in dedicated sub-vault so Phase 1 checkpoint remains intact
+                trainer.vault = AtomicCheckpointVault(vault_p2)
+                trainer.best_val_acc = -1.0
+                trainer.best_val_ppl = float("inf")
+                has_p2_ckpt = trainer.vault.latest_path.exists() or trainer.vault.backup_path.exists()
+                p2_start_epoch = max(int(trainer.model.current_epoch), p1_epochs) + 1
+                p2_target_epoch = p2_start_epoch + p2_epochs - 1
 
-            _sync_device(device)
-            t_p2 = time.perf_counter()
-            p2_res = trainer.fit(
-                train_dataset=p2_train_ds,
-                val_batches=p2_val_ds,
-                epochs=p2_target_epoch,
-                start_epoch=p2_start_epoch,
-                batch_size=batch_size,
-                pad_id=tok.pad_id,
-                auto_resume=has_p2_ckpt,
-                stop_after_steps=(
-                    int(trainer.global_step) + int(args.max_steps_per_phase)
-                    if args.max_steps_per_phase is not None
-                    else None
-                ),
-                save_on_stop_after_steps=bool(args.max_steps_per_phase),
-            )
-            _sync_device(device)
-            p2_wall_s = max(time.perf_counter() - t_p2, 1e-6)
-            rejuv_after_p2 = [len(slots) for slots in trainer.model.rejuvenated_slots]
-            rejuv_revived = sum(rejuv_after_sleep) - sum(rejuv_after_p2)
-            p2_stiff = _active_stiffness_stats(trainer.model)
+                _sync_device(device)
+                t_p2 = time.perf_counter()
+                p2_res = trainer.fit(
+                    train_dataset=p2_train_ds,
+                    val_batches=p2_val_ds,
+                    epochs=p2_target_epoch,
+                    start_epoch=p2_start_epoch,
+                    batch_size=batch_size,
+                    pad_id=tok.pad_id,
+                    auto_resume=has_p2_ckpt,
+                    stop_after_steps=(
+                        int(trainer.global_step) + int(args.max_steps_per_phase)
+                        if args.max_steps_per_phase is not None
+                        else None
+                    ),
+                    save_on_stop_after_steps=bool(args.max_steps_per_phase),
+                )
+                _sync_device(device)
+                p2_wall_s = max(time.perf_counter() - t_p2, 1e-6)
+                rejuv_after_p2 = [len(slots) for slots in trainer.model.rejuvenated_slots]
+                rejuv_revived = sum(rejuv_after_sleep) - sum(rejuv_after_p2)
+                p2_stiff = _active_stiffness_stats(trainer.model)
 
-            p1_post_p2_metrics = evaluate_validation_batches(trainer.model, p1_val_ds, pad_id=tok.pad_id, batch_size=batch_size)
-            p2_post_p2_metrics = evaluate_validation_batches(trainer.model, p2_val_ds, pad_id=tok.pad_id, batch_size=batch_size)
+                p1_post_p2_metrics = evaluate_validation_batches(trainer.model, p1_val_ds, pad_id=tok.pad_id, batch_size=batch_size)
+                p2_post_p2_metrics = evaluate_validation_batches(trainer.model, p2_val_ds, pad_id=tok.pad_id, batch_size=batch_size)
 
-            exp3 = {
-                "sleep_merged_total": int(sleep_info["merged_total"]),
-                "sleep_pruned_total": int(sleep_info["pruned_total"]),
-                "sleep_locked_total": int(sleep_info["locked_total"]),
-                "sleep_recycled_total": int(sleep_info["recycled_total"]),
-                "rejuvenated_slots_after_sleep": int(sum(rejuv_after_sleep)),
-                "rejuvenated_slots_remaining_after_p2": int(sum(rejuv_after_p2)),
-                "rejuvenated_slots_revived": int(rejuv_revived),
-                "p2_tok_s": float(p2_res["tok_s"]),
-                "p2_wall_s": float(p2_wall_s),
-                "p1_val_before_sleep_acc": float(p1_val_metrics["acc_pct"]),
-                "p1_val_post_sleep_acc": float(p1_post_sleep_metrics["acc_pct"]),
-                "p1_val_post_p2_acc": float(p1_post_p2_metrics["acc_pct"]),
-                "p1_val_post_p2_ppl": float(p1_post_p2_metrics["ppl"]),
-                "p2_val_zero_shot_acc": float(p2_before_metrics["acc_pct"]),
-                "p2_val_post_p2_acc": float(p2_post_p2_metrics["acc_pct"]),
-                "p2_val_post_p2_ppl": float(p2_post_p2_metrics["ppl"]),
-                "k_locked_mean": p2_stiff["k_locked_mean"],
-                "k_unlocked_mean": p2_stiff["k_unlocked_mean"],
-                "allocated_dims_after_p2": list(trainer.model.get_allocated_dimensions()),
-            }
-            results["experiment_3_sleep_continual"] = exp3
-            print(
-                f"  * Sleep Consolidated : merged={exp3['sleep_merged_total']} | pruned={exp3['sleep_pruned_total']} | "
-                f"locked={exp3['sleep_locked_total']} | pool={exp3['rejuvenated_slots_after_sleep']} -> revived={exp3['rejuvenated_slots_revived']}"
-            )
-            print(
-                f"  * Continual Scores   : Phase 1 Retention={exp3['p1_val_post_p2_acc']:.2f}% (PPL {exp3['p1_val_post_p2_ppl']:.2f}) | "
-                f"Phase 2 Knowledge={exp3['p2_val_zero_shot_acc']:.2f}% -> {exp3['p2_val_post_p2_acc']:.2f}% (PPL {exp3['p2_val_post_p2_ppl']:.2f})"
-            )
+                exp3 = {
+                    "sleep_merged_total": int(sleep_info["merged_total"]),
+                    "sleep_pruned_total": int(sleep_info["pruned_total"]),
+                    "sleep_locked_total": int(sleep_info["locked_total"]),
+                    "sleep_recycled_total": int(sleep_info["recycled_total"]),
+                    "rejuvenated_slots_after_sleep": int(sum(rejuv_after_sleep)),
+                    "rejuvenated_slots_remaining_after_p2": int(sum(rejuv_after_p2)),
+                    "rejuvenated_slots_revived": int(rejuv_revived),
+                    "p2_tok_s": float(p2_res["tok_s"]),
+                    "p2_wall_s": float(p2_wall_s),
+                    "p1_val_before_sleep_acc": float(p1_val_metrics["acc_pct"]),
+                    "p1_val_post_sleep_acc": float(p1_post_sleep_metrics["acc_pct"]),
+                    "p1_val_post_p2_acc": float(p1_post_p2_metrics["acc_pct"]),
+                    "p1_val_post_p2_ppl": float(p1_post_p2_metrics["ppl"]),
+                    "p2_val_zero_shot_acc": float(p2_before_metrics["acc_pct"]),
+                    "p2_val_post_p2_acc": float(p2_post_p2_metrics["acc_pct"]),
+                    "p2_val_post_p2_ppl": float(p2_post_p2_metrics["ppl"]),
+                    "k_locked_mean": p2_stiff["k_locked_mean"],
+                    "k_unlocked_mean": p2_stiff["k_unlocked_mean"],
+                    "allocated_dims_after_p2": list(trainer.model.get_allocated_dimensions()),
+                }
+                results["experiment_3_sleep_continual"] = exp3
+                print(
+                    f"  * Sleep Consolidated : merged={exp3['sleep_merged_total']} | pruned={exp3['sleep_pruned_total']} | "
+                    f"locked={exp3['sleep_locked_total']} | pool={exp3['rejuvenated_slots_after_sleep']} -> revived={exp3['rejuvenated_slots_revived']}"
+                )
+                print(
+                    f"  * Continual Scores   : Phase 1 Retention={exp3['p1_val_post_p2_acc']:.2f}% (PPL {exp3['p1_val_post_p2_ppl']:.2f}) | "
+                    f"Phase 2 Knowledge={exp3['p2_val_zero_shot_acc']:.2f}% -> {exp3['p2_val_post_p2_acc']:.2f}% (PPL {exp3['p2_val_post_p2_ppl']:.2f})"
+                )
 
             # ------------------------------------------------------------------
             # Experiment 4: Production Freeze & Non-Destructive CPU Export
@@ -527,10 +573,14 @@ def run_suite(args: argparse.Namespace) -> dict:
                         nd_max_diff = max(nd_max_diff, diff)
 
             # Save final compacted W0 checkpoint into vault root
-            final_w0_path = out_dir / "final_50m_frozen_w0.pt"
+            final_w0_path = out_dir / ("final_50m_v4_foundation_w0.pt" if foundation_mode else "final_50m_frozen_w0.pt")
             torch.save(nd_state, final_w0_path)
             p1_frozen_val = evaluate_validation_batches(trainer.model, p1_val_ds, pad_id=tok.pad_id, batch_size=batch_size)
-            p2_frozen_val = evaluate_validation_batches(trainer.model, p2_val_ds, pad_id=tok.pad_id, batch_size=batch_size)
+            p2_frozen_val = (
+                None
+                if p2_val_ds is None
+                else evaluate_validation_batches(trainer.model, p2_val_ds, pad_id=tok.pad_id, batch_size=batch_size)
+            )
 
             exp4 = {
                 "before_live_mb": float(pre_freeze_brk["total_live_mb"]),
@@ -543,8 +593,8 @@ def run_suite(args: argparse.Namespace) -> dict:
                 "nondestructive_export_diff": float(nd_max_diff),
                 "p1_frozen_val_acc": float(p1_frozen_val["acc_pct"]),
                 "p1_frozen_val_ppl": float(p1_frozen_val["ppl"]),
-                "p2_frozen_val_acc": float(p2_frozen_val["acc_pct"]),
-                "p2_frozen_val_ppl": float(p2_frozen_val["ppl"]),
+                "p2_frozen_val_acc": float(p2_frozen_val["acc_pct"]) if p2_frozen_val is not None else 0.0,
+                "p2_frozen_val_ppl": float(p2_frozen_val["ppl"]) if p2_frozen_val is not None else 0.0,
                 "final_w0_disk_mb": float(final_w0_path.stat().st_size / (1024 * 1024)),
             }
             results["experiment_4_freeze"] = exp4
@@ -552,10 +602,15 @@ def run_suite(args: argparse.Namespace) -> dict:
                 f"  * Memory Pruned     : {exp4['before_live_mb']:.2f} MB (Kahan {exp4['before_kahan_mb']:.2f} MB) -> "
                 f"{exp4['after_frozen_mb']:.2f} MB (-{exp4['memory_saved_pct']:.1f}%) | Export Diff={nd_max_diff:.2e}"
             )
-            print(
-                f"  * Frozen W0 Scores  : P1 Val={exp4['p1_frozen_val_acc']:.2f}% (PPL {exp4['p1_frozen_val_ppl']:.2f}) | "
-                f"P2 Val={exp4['p2_frozen_val_acc']:.2f}% (PPL {exp4['p2_frozen_val_ppl']:.2f})"
-            )
+            if p2_frozen_val is not None:
+                print(
+                    f"  * Frozen W0 Scores  : P1 Val={exp4['p1_frozen_val_acc']:.2f}% (PPL {exp4['p1_frozen_val_ppl']:.2f}) | "
+                    f"P2 Val={exp4['p2_frozen_val_acc']:.2f}% (PPL {exp4['p2_frozen_val_ppl']:.2f})"
+                )
+            else:
+                print(
+                    f"  * Frozen W0 Scores  : P1 Foundation Val={exp4['p1_frozen_val_acc']:.2f}% (PPL {exp4['p1_frozen_val_ppl']:.2f})"
+                )
 
         # ------------------------------------------------------------------
         # Experiment 5: O(1) Stateful Cache vs O(T^2) Rollout (+64 & +128)
@@ -609,13 +664,28 @@ def run_suite(args: argparse.Namespace) -> dict:
             )
 
         sample_gen_ids = trainer.model.generate(
-            prompt_ids, max_new_tokens=32, eos_id=tok.eos_id, use_fast_cache=True
+            prompt_ids, max_new_tokens=48 if foundation_mode else 32, eos_id=tok.eos_id, use_fast_cache=True
         )
         sample_decoded = tok.decode(sample_gen_ids, skip_special_tokens=True)
+        foundation_prompts = [
+            "Once upon a time there was a",
+            "Lily wanted to help her",
+            "The little brown dog ran into",
+        ]
+        foundation_samples = []
+        if foundation_mode:
+            for fp_prompt in foundation_prompts:
+                fp_ids = tok.encode(fp_prompt, add_bos=True, add_eos=False)
+                fp_out = trainer.model.generate(fp_ids, max_new_tokens=48, eos_id=tok.eos_id, use_fast_cache=True)
+                foundation_samples.append({
+                    "prompt": fp_prompt,
+                    "generated": tok.decode(fp_out, skip_special_tokens=True),
+                })
         results["experiment_5_inference"] = {
             "prompt": prompt_text,
             "horizons": exp5_horizons,
             "sample_natural_rollout": sample_decoded,
+            "foundation_samples": foundation_samples,
         }
 
         # ------------------------------------------------------------------
@@ -651,20 +721,37 @@ def run_suite(args: argparse.Namespace) -> dict:
         json_path = out_dir / "bench_50m_results.json"
         json_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        md_lines = [
-            "# SS-ENN v3.1.0 Scale-50M Scientific GPU Benchmark Report",
-            f"- **Accelerator:** `{gpu_name}` (`device={device}`, `dtype={dtype}`, `kahan_mode={kahan_mode}`)",
-            f"- **AST Zero-Autograd:** `PASS ({file_cnt} files)`",
-            f"- **Model Params:** `{exp1['max_train_params']:,}` max train -> `{exp4['after_params']:,}` frozen W0",
-            "",
-            "| Experiment | Key Metric | Value |",
-            "| :--- | :--- | :--- |",
-            f"| **1. Audit & MMap** | Live Buffers / Stream Speed | `{exp1['actual_live_buffer_params']:,}` exact match / `{exp1['mmap_stream_tok_s']:,.0f} tok/s` |",
-            f"| **2. Phase 1 Stories** | GPU Train Speed / VRAM Peak / Val Acc | `{exp2['tok_s']:,.1f} tok/s` / `{exp2['vram_peak_mb']:.1f} MB` / `{exp2['val_acc_pct']:.2f}% (PPL {exp2['val_ppl']:.2f})` |",
-            f"| **3. Sleep + Phase 2** | Merged/Pruned/Locked / P1 Retention / P2 Val | `{exp3['sleep_merged_total']}/{exp3['sleep_pruned_total']}/{exp3['sleep_locked_total']}` / `{exp3['p1_val_post_p2_acc']:.2f}%` / `{exp3['p2_val_post_p2_acc']:.2f}%` |",
-            f"| **4. Frozen W0** | Memory Saved / Non-Destructive Diff | `{exp4['before_live_mb']:.2f} -> {exp4['after_frozen_mb']:.2f} MB (-{exp4['memory_saved_pct']:.1f}%)` / `{exp4['nondestructive_export_diff']:.2e}` |",
-            f"| **5. O(1) vs O(T^2)** | Max Horizon Speedup & Match | `{exp5_horizons[-1]['speedup_x']:.2f}x ({exp5_horizons[-1]['o1_tok_s']:.1f} tok/s)` / `{exp5_horizons[-1]['sequence_match_pct']:.2f}%` |",
-        ]
+        if foundation_mode:
+            exp3_meta = results["experiment_3_sleep_continual"]
+            md_lines = [
+                "# SS-ENN v4.0 Scale-50M Unified Foundation Training Report",
+                f"- **Accelerator:** `{gpu_name}` (`device={device}`, `dtype={dtype}`, `kahan_mode={kahan_mode}`)",
+                f"- **AST Zero-Autograd:** `PASS ({file_cnt} files)`",
+                f"- **Model Params:** `Train {exp1['max_train_params']:,}` | `Deployed W0 {exp1['deployed_w0_params']:,}` | `Active/Tok {exp1['active_params_per_token']:,}` -> `{exp4['after_params']:,}` pruned W0",
+                "",
+                "| Experiment | Key Metric | Value |",
+                "| :--- | :--- | :--- |",
+                f"| **1. Audit & MMap** | Live Buffers / Stream Speed | `{exp1['actual_live_buffer_params']:,}` exact match / `{exp1['mmap_stream_tok_s']:,.0f} tok/s` |",
+                f"| **2. Foundation P1** | GPU Speed / VRAM Peak / Val Acc & PPL | `{exp2['tok_s']:,.1f} tok/s` / `{exp2['vram_peak_mb']:.1f} MB` / `{exp2['val_acc_pct']:.2f}% (PPL {exp2['val_ppl']:.2f})` |",
+                f"| **3. v4.0 vs v3.1.3** | Unified `sleep=0` PPL Delta | `{exp3_meta['v3_1_3_baseline_ppl']:.2f} -> {exp3_meta['v4_val_ppl']:.2f}` (`{exp3_meta['ppl_delta_vs_v3_1_3_pct']:+.1f}%`) |",
+                f"| **4. Frozen W0** | Memory Saved / Non-Destructive Diff | `{exp4['before_live_mb']:.2f} -> {exp4['after_frozen_mb']:.2f} MB (-{exp4['memory_saved_pct']:.1f}%)` / `{exp4['nondestructive_export_diff']:.2e}` |",
+                f"| **5. O(1) vs O(T^2)** | Max Horizon Speedup & Match | `{exp5_horizons[-1]['speedup_x']:.2f}x ({exp5_horizons[-1]['o1_tok_s']:.1f} tok/s)` / `{exp5_horizons[-1]['sequence_match_pct']:.2f}%` |",
+            ]
+        else:
+            md_lines = [
+                "# SS-ENN v3.1.0 Scale-50M Scientific GPU Benchmark Report",
+                f"- **Accelerator:** `{gpu_name}` (`device={device}`, `dtype={dtype}`, `kahan_mode={kahan_mode}`)",
+                f"- **AST Zero-Autograd:** `PASS ({file_cnt} files)`",
+                f"- **Model Params:** `{exp1['max_train_params']:,}` max train -> `{exp4['after_params']:,}` frozen W0",
+                "",
+                "| Experiment | Key Metric | Value |",
+                "| :--- | :--- | :--- |",
+                f"| **1. Audit & MMap** | Live Buffers / Stream Speed | `{exp1['actual_live_buffer_params']:,}` exact match / `{exp1['mmap_stream_tok_s']:,.0f} tok/s` |",
+                f"| **2. Phase 1 Stories** | GPU Train Speed / VRAM Peak / Val Acc | `{exp2['tok_s']:,.1f} tok/s` / `{exp2['vram_peak_mb']:.1f} MB` / `{exp2['val_acc_pct']:.2f}% (PPL {exp2['val_ppl']:.2f})` |",
+                f"| **3. Sleep + Phase 2** | Merged/Pruned/Locked / P1 Retention / P2 Val | `{exp3['sleep_merged_total']}/{exp3['sleep_pruned_total']}/{exp3['sleep_locked_total']}` / `{exp3['p1_val_post_p2_acc']:.2f}%` / `{exp3['p2_val_post_p2_acc']:.2f}%` |",
+                f"| **4. Frozen W0** | Memory Saved / Non-Destructive Diff | `{exp4['before_live_mb']:.2f} -> {exp4['after_frozen_mb']:.2f} MB (-{exp4['memory_saved_pct']:.1f}%)` / `{exp4['nondestructive_export_diff']:.2e}` |",
+                f"| **5. O(1) vs O(T^2)** | Max Horizon Speedup & Match | `{exp5_horizons[-1]['speedup_x']:.2f}x ({exp5_horizons[-1]['o1_tok_s']:.1f} tok/s)` / `{exp5_horizons[-1]['sequence_match_pct']:.2f}%` |",
+            ]
         md_path = out_dir / "bench_50m_report.md"
         md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
         print(f"\nSaved scientific artifacts:\n  - {json_path}\n  - {md_path}")
@@ -675,7 +762,7 @@ def run_suite(args: argparse.Namespace) -> dict:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="SS-ENN v3.1.3 50M GPU Scientific Benchmark Suite (Zero-Autograd)")
+    p = argparse.ArgumentParser(description="SS-ENN v4.0 / v3.1.3 50M GPU Scientific Benchmark Suite (Zero-Autograd)")
     p.add_argument("--phase1-dir", type=str, default="/content/local_50m/shards_phase1_stories", help="Phase 1 stories shard dir.")
     p.add_argument("--phase2-dir", type=str, default="/content/local_50m/shards_phase2_knowledge", help="Phase 2 knowledge shard dir.")
     p.add_argument("--output-dir", type=str, default="/content/drive/MyDrive/SS_ENN_Workspace/exp_50m_scientific/results_v3_1_3", help="Output vault & report directory.")
@@ -686,7 +773,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=64, help="Training/validation minibatch size.")
     p.add_argument("--ckpt-every-steps", type=int, default=100, help="Periodic checkpoint interval in steps.")
     p.add_argument("--max-steps-per-phase", type=int, default=None, help="Optional step cap per phase for quick runs.")
-    p.add_argument("--smoke-test", action="store_true", help="Run fast self-contained CPU smoke audit of all 6 experiments.")
+    p.add_argument("--foundation-v4", action="store_true", help="Run unified v4.0 foundation pretraining (--sleep-every-epochs 0) comparing PPL vs v3.1.3.")
+    p.add_argument("--v3-legacy", action="store_true", help="Disable v4.0 upgrades (legacy v3 baseline).")
+    p.add_argument("--foundation-baseline-ppl", type=float, default=79.20, help="Reference v3.1.3 Phase 1 Val PPL baseline for comparison.")
+    p.add_argument("--smoke-test", action="store_true", help="Run fast self-contained CPU smoke audit.")
     return p.parse_args(argv)
 
 

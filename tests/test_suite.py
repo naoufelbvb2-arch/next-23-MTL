@@ -1072,5 +1072,101 @@ class TestSpringMVPArchitecture(unittest.TestCase):
             self.assertIn(k_req, sl_res)
 
 
+    def test_15_v4_0_trainable_embeddings_and_mirrored_dfa_ppl_drop(self):
+        """Verify v4.0 trainable embeddings, mirrored DFA & unified W0 metrics cut Perplexity with zero-diff export."""
+        from benchmarks.bench_scale_english_cpu import build_minibatch_tensors, evaluate_batches
+        from benchmarks.english_dataset import build_english_tinystories_corpus
+        from engine import EnglishSubwordTokenizer
+
+        torch.set_grad_enabled(False)
+        corpus = build_english_tinystories_corpus(target_min_tokens=6000, train_ratio=0.88, seed=7)
+        all_stories = corpus["train_stories"] + corpus["val_stories"]
+        tok = EnglishSubwordTokenizer(max_vocab_size=512).fit(all_stories, pad_to_max_vocab=True)
+        pad_id = tok.pad_id
+        train_batches, train_seqs, _ = build_minibatch_tensors(corpus["train_stories"], tok, seq_len=32, batch_size=24)
+        val_batches, _, _ = build_minibatch_tensors(corpus["val_stories"], tok, seq_len=32, batch_size=24)
+
+        common_kw = dict(
+            vocab_size=tok.vocab_size,
+            num_layers=4,
+            d_init=64,
+            d_max=128,
+            delta_d=16,
+            block_size=16,
+            top_k_blocks=2,
+            max_seq_len=48,
+            attn_top_k=8,
+            salient_anchor_slots=1,
+            dtype="float32",
+            kahan_mode="off",
+            device="cpu",
+            seed=42,
+        )
+        cfg_legacy = SSENNConfig(
+            trainable_embeddings=False,
+            embedding_lr_scale=0.0,
+            weight_tie_embedding_pull=0.0,
+            mirrored_dfa=False,
+            dfa_mirror_blend=0.0,
+            impulse_schedule=False,
+            **common_kw,
+        )
+        cfg_v4 = SSENNConfig(**common_kw)
+
+        fp = cfg_v4.estimate_memory_footprint()
+        self.assertIn("deployed_w0_params", fp)
+        self.assertIn("active_params_per_token", fp)
+        self.assertIn("training_state_elements", fp)
+        self.assertGreater(fp["deployed_w0_params"], 0)
+        self.assertGreater(fp["active_params_per_token"], 0)
+        self.assertLessEqual(fp["active_params_per_token"], fp["deployed_w0_params"])
+        self.assertGreater(fp["training_state_elements"], fp["deployed_w0_params"])
+
+        def _train_and_eval(cfg: SSENNConfig, epochs: int = 8) -> tuple[SSENNProductionModel, dict, float]:
+            m = SSENNProductionModel(cfg)
+            m.set_training_horizon(epochs)
+            m.calibrate_salience_from_tokens(train_seqs, pad_id=pad_id, bos_id=tok.bos_id, eos_id=tok.eos_id)
+            emb_before = m.token_embedding.clone()
+            for ep in range(1, epochs + 1):
+                losses = [m.train_minibatch(xb, yb, pad_id=pad_id)["ce_loss"] for xb, yb in train_batches]
+                m.end_epoch(epoch=ep, mean_ce_loss=sum(losses) / max(len(losses), 1))
+            emb_shift = float((m.token_embedding - emb_before).abs().max().item())
+            return m, evaluate_batches(m, val_batches, pad_id=pad_id), emb_shift
+
+        m_leg, leg_pre_val, leg_emb_shift = _train_and_eval(cfg_legacy)
+        m_v4, v4_pre_val, v4_emb_shift = _train_and_eval(cfg_v4)
+
+        self.assertEqual(leg_emb_shift, 0.0, "Legacy v3 config must keep token embeddings frozen.")
+        self.assertGreater(v4_emb_shift, 0.0, "v4.0 config must locally train token embeddings.")
+        self.assertLess(v4_pre_val["ppl"], leg_pre_val["ppl"], f"Pre-freeze PPL did not drop: {v4_pre_val} vs {leg_pre_val}")
+
+        # Non-destructive W0 export must match live production_freeze(prune_dormant=True) bit-for-bit
+        nd_pkg, _ = m_v4.export_frozen_w0_state_nondestructive(map_location="cpu")
+        self.assertFalse(m_v4.frozen)
+        m_v4.production_freeze(prune_dormant=True)
+        live_pkg = m_v4.export_frozen_w0_state()
+        max_nd_diff = 0.0
+        for tkey, nd_val in nd_pkg["w0_tensors"].items():
+            ref_val = live_pkg["w0_tensors"][tkey]
+            if isinstance(nd_val, torch.Tensor):
+                max_nd_diff = max(max_nd_diff, float((nd_val.float() - ref_val.detach().cpu().float()).abs().max().item()))
+            elif isinstance(nd_val, list):
+                for l_idx, nd_lt in enumerate(nd_val):
+                    max_nd_diff = max(max_nd_diff, float((nd_lt.float() - ref_val[l_idx].detach().cpu().float()).abs().max().item()))
+        self.assertEqual(max_nd_diff, 0.0)
+
+        m_leg.production_freeze(prune_dormant=True)
+        leg_frozen_val = evaluate_batches(m_leg, val_batches, pad_id=pad_id)
+        v4_frozen_val = evaluate_batches(m_v4, val_batches, pad_id=pad_id)
+        self.assertLess(v4_frozen_val["ce_loss"], leg_frozen_val["ce_loss"])
+        self.assertLess(v4_frozen_val["ppl"], leg_frozen_val["ppl"])
+
+        # O(1) stateful cache must match O(T^2) rollout 100% after v4.0 embedding training & freeze
+        prompt_ids = tok.encode("Once upon a time", add_bos=True, add_eos=False)
+        out_fast = m_v4.generate(prompt_ids, max_new_tokens=16, eos_id=-1, use_fast_cache=True)
+        out_slow = m_v4.generate(prompt_ids, max_new_tokens=16, eos_id=-1, use_fast_cache=False)
+        self.assertEqual(out_fast, out_slow)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

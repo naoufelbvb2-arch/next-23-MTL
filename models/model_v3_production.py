@@ -218,6 +218,7 @@ class SSENNProductionModel(nn.Module):
         self._is_training_step: bool = False
         self._in_fast_generate: bool = False
         self.current_epoch: int = 0
+        self._planned_total_epochs: int = int(config.impulse_total_epochs)
         self.reward_baseline: float = 0.0
         self.attn_armor_locked: bool = False
         self.attn_locked_dim: int = 0
@@ -286,6 +287,9 @@ class SSENNProductionModel(nn.Module):
         self._last_v_z: torch.Tensor | None = None
         self._last_v_mask: torch.Tensor | None = None
         self._last_q_prev: torch.Tensor | None = None
+        self._last_emb_input_ids: torch.Tensor | None = None
+        self._last_tok_emb: torch.Tensor | None = None
+        self._last_cap_states: torch.Tensor | None = None
 
         for p in self.parameters():
             p.requires_grad_(False)
@@ -555,11 +559,27 @@ class SSENNProductionModel(nn.Module):
         self._reset_step_cache()
         return self
 
+    def set_training_horizon(self, total_epochs: int) -> None:
+        self._planned_total_epochs = max(1, int(total_epochs))
+
+    def current_impulse_scale(self) -> float:
+        """Smooth cosine annealing impulse factor from impulse_start -> impulse_end."""
+        cfg = self.config
+        if not cfg.impulse_schedule:
+            return 1.0
+        denom = float(max(self._planned_total_epochs - 1, 1))
+        prog = min(1.0, max(0.0, float(self.current_epoch) / denom))
+        cos_w = 0.5 * (1.0 + math.cos(math.pi * prog))
+        return float(cfg.impulse_end + (cfg.impulse_start - cfg.impulse_end) * cos_w)
+
     def _reset_step_cache(self) -> None:
         self._last_v_prev = None
         self._last_v_z = None
         self._last_v_mask = None
         self._last_q_prev = None
+        self._last_emb_input_ids = None
+        self._last_tok_emb = None
+        self._last_cap_states = None
         for layer in self.spring_layers:
             layer._last_a_prev = None
             layer._last_z = None
@@ -797,6 +817,11 @@ class SSENNProductionModel(nn.Module):
         if seq_len > 2:
             lag2[:, 2:, :] = F.linear(tok_emb[:, :-2, :], self.lag2_proj[:d_eff, :d_eff])
 
+        if store_attn_cache and self.config.trainable_embeddings:
+            self._last_emb_input_ids = input_ids.detach()
+            self._last_tok_emb = tok_emb.detach()
+            self._last_cap_states = c_states.detach()
+
         return attended + alibi_ctx + 1.65 * cap_ctx + lag1 + lag2
 
     @torch.no_grad()
@@ -971,6 +996,7 @@ class SSENNProductionModel(nn.Module):
         e_highway: torch.Tensor,
         d_eff: int,
         n_total: float,
+        lr_scale: float = 1.0,
     ) -> None:
         if self.attn_armor_locked:
             return
@@ -989,6 +1015,8 @@ class SSENNProductionModel(nn.Module):
         drv_v = torch.matmul(v_delta.t(), x_flat).div_(max(n_total, 1.0))
 
         d_lock = min(self.attn_locked_dim, d_eff) if self.attn_locked_dim > 0 else 0
+        eta_attn_w = cfg.lr_attn_w * float(lr_scale)
+        eta_attn_0 = cfg.lr_attn_0
 
         v_w_sub = self.v_w[:d_eff, :d_eff]
         v_w0_sub = self.v_w0[:d_eff, :d_eff]
@@ -998,8 +1026,8 @@ class SSENNProductionModel(nn.Module):
             w0=v_w0_sub,
             k=self.v_k[:d_eff, :d_eff],
             driving_signal=drv_v,
-            eta_w=cfg.lr_attn_w,
-            eta_0=cfg.lr_attn_0,
+            eta_w=eta_attn_w,
+            eta_0=eta_attn_0,
             gamma=cfg.gamma_attn,
             beta_k_eff=cfg.beta_k_attn,
             stiff_ceil=1.0,
@@ -1022,8 +1050,8 @@ class SSENNProductionModel(nn.Module):
                 w0=w0_sub,
                 k=getattr(self, f"{prefix}_k")[:d_eff, :d_eff],
                 driving_signal=drv_qk,
-                eta_w=cfg.lr_attn_w,
-                eta_0=cfg.lr_attn_0,
+                eta_w=eta_attn_w,
+                eta_0=eta_attn_0,
                 gamma=cfg.gamma_attn,
                 beta_k_eff=cfg.beta_k_attn,
                 stiff_ceil=1.0,
@@ -1034,6 +1062,137 @@ class SSENNProductionModel(nn.Module):
             if qk_lock_anchor is not None:
                 w0_sub[:d_lock, :d_lock].copy_(qk_lock_anchor)
                 w_sub[:d_lock, :d_lock].copy_(qk_lock_anchor)
+
+    @torch.no_grad()
+    def _update_frontend_proj(
+        self,
+        proj_buf: torch.Tensor,
+        drv_fp32: torch.Tensor,
+        lr_fe: float,
+        d_eff: int,
+        comp_key: str,
+    ) -> None:
+        """Local Zero-Autograd update for context projection matrix with optional Kahan FP32."""
+        dev = self.model_device
+        w_f = proj_buf[:d_eff, :d_eff].float()
+        use_full_kahan = (
+            self.compensator is not None
+            and self.compensator.mode == "full"
+            and proj_buf.dtype in (torch.float16, torch.bfloat16)
+        )
+        rw0_fe = None
+        if use_full_kahan:
+            _, rw0_fe, _ = self.compensator.get_residuals(comp_key, (self.d_max, self.d_max), dev)
+            w_f = w_f + rw0_fe[:d_eff, :d_eff]
+
+        w_f.add_(drv_fp32, alpha=lr_fe)
+        row_norms = w_f.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-6)
+        w_f.mul_((2.0 / row_norms).clamp(max=1.0))
+
+        w_cast = w_f.to(proj_buf.dtype)
+        proj_buf[:d_eff, :d_eff].copy_(w_cast)
+        if rw0_fe is not None:
+            rw0_fe[:d_eff, :d_eff].copy_(w_f - w_cast.float())
+
+    @torch.no_grad()
+    def _update_embeddings_and_frontend(
+        self,
+        delta_ctx: torch.Tensor,
+        valid_rows: torch.Tensor,
+        pad_id: int,
+        d_eff: int,
+        d_last: int,
+        n_valid: float,
+        impulse: float,
+    ) -> None:
+        """
+        Zero-Autograd local plasticity for token embeddings (with index_add_, Kahan FP32,
+        Row-Norm Clipping, and soft weight-tie pull to head_w0) plus cap/lag1/lag2 projections.
+        """
+        if self._last_emb_input_ids is None or self._last_tok_emb is None or self._last_cap_states is None:
+            return
+        if self.sleep_logs or self.attn_armor_locked:
+            return
+
+        cfg = self.config
+        dev = self.model_device
+        bsz, seq_len = self._last_emb_input_ids.shape
+        inputs_flat = self._last_emb_input_ids.reshape(-1)
+        tok_valid = valid_rows & (inputs_flat != pad_id)
+        if not tok_valid.any():
+            return
+
+        delta_work = delta_ctx.float()
+        ctx_rms = float(delta_work.pow(2).mean().sqrt().item())
+        if ctx_rms < 1e-7:
+            return
+        delta_work = delta_work / max(ctx_rms, 1.0)
+
+        active_ids = inputs_flat[tok_valid]
+        active_grads = delta_work[tok_valid]
+        unique_ids, inv_idx = torch.unique(active_ids, return_inverse=True)
+
+        counts = torch.zeros(unique_ids.numel(), device=dev, dtype=torch.float32)
+        counts.index_add_(0, inv_idx, torch.ones_like(inv_idx, dtype=torch.float32))
+        grad_acc = torch.zeros((unique_ids.numel(), d_eff), device=dev, dtype=torch.float32)
+        grad_acc.index_add_(0, inv_idx, active_grads)
+        grad_mean = grad_acc / counts.unsqueeze(-1).clamp(min=1.0)
+
+        emb_u = self.token_embedding[:, :d_eff][unique_ids].float()
+        use_full_kahan = (
+            self.compensator is not None
+            and self.compensator.mode == "full"
+            and self.token_embedding.dtype in (torch.float16, torch.bfloat16)
+        )
+        rw0_emb = None
+        if use_full_kahan:
+            _, rw0_emb, _ = self.compensator.get_residuals("tok_embed", (self.vocab_size, self.d_max), dev)
+            emb_u = emb_u + rw0_emb[:, :d_eff][unique_ids]
+
+        target_emb_norm = math.sqrt(float(d_eff) / 3.0)
+        lr_emb = float(cfg.lr_attn_w) * float(cfg.embedding_lr_scale) * float(impulse) * target_emb_norm
+        emb_u.add_(grad_mean, alpha=lr_emb)
+
+        if cfg.weight_tie_embedding_pull > 0.0 and self.current_epoch >= 1:
+            d_tie = min(d_eff, d_last)
+            tie_norm = math.sqrt(float(d_tie) / 3.0)
+            target_dir = F.normalize(self.head_w0[unique_ids, :d_tie].float(), p=2, dim=-1, eps=1e-6) * tie_norm
+            pull_alpha = min(0.05, float(cfg.weight_tie_embedding_pull) * float(cfg.lr_attn_0) * float(impulse))
+            emb_u[:, :d_tie] = emb_u[:, :d_tie].lerp(target_dir, pull_alpha)
+
+        # Row-Norm Clipping to maintain exact physical variance without explosion
+        max_emb_norm = 1.60 * target_emb_norm
+        row_norms = emb_u.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-6)
+        emb_u.mul_((max_emb_norm / row_norms).clamp(max=1.0))
+
+        emb_cast = emb_u.to(self.token_embedding.dtype)
+        self.token_embedding[:, :d_eff][unique_ids] = emb_cast
+        if rw0_emb is not None:
+            rw0_emb[:, :d_eff][unique_ids] = emb_u - emb_cast.float()
+
+        # Update causal context projections (cap_proj, lag1_proj, lag2_proj)
+        lr_fe = float(cfg.lr_attn_w) * float(cfg.embedding_lr_scale) * float(impulse) * 0.50
+        delta_valid_bt = (delta_work * tok_valid.float().unsqueeze(-1)).reshape(bsz, seq_len, d_eff)
+        denom = max(n_valid, 1.0)
+        drv_cap = torch.matmul(
+            (delta_valid_bt * 1.65).reshape(-1, d_eff).t(),
+            self._last_cap_states.reshape(-1, d_eff).float(),
+        ) / denom
+        self._update_frontend_proj(self.cap_proj, drv_cap, lr_fe, d_eff, "fe_cap_proj")
+
+        if seq_len > 1:
+            drv_lag1 = torch.matmul(
+                delta_valid_bt[:, 1:].reshape(-1, d_eff).t(),
+                self._last_tok_emb[:, :-1].reshape(-1, d_eff).float(),
+            ) / denom
+            self._update_frontend_proj(self.lag1_proj, drv_lag1, lr_fe, d_eff, "fe_lag1_proj")
+
+        if seq_len > 2:
+            drv_lag2 = torch.matmul(
+                delta_valid_bt[:, 2:].reshape(-1, d_eff).t(),
+                self._last_tok_emb[:, :-2].reshape(-1, d_eff).float(),
+            ) / denom
+            self._update_frontend_proj(self.lag2_proj, drv_lag2, lr_fe, d_eff, "fe_lag2_proj")
 
     @torch.no_grad()
     def train_minibatch(
@@ -1089,17 +1248,25 @@ class SSENNProductionModel(nn.Module):
         probs.mul_(step_salience.unsqueeze(-1))
         salient_err = probs if probs.dtype == self.weight_dtype else probs.to(self.weight_dtype)
 
+        cfg = self.config
+        impulse = self.current_impulse_scale()
         maturity_gain = 2.0 if self.current_epoch <= 2 else min(280.0, 32.0 * float(self.current_epoch - 1))
         depth_dfa_scale = ((4.0 / float(max(self.num_layers, 4))) ** 0.25) if self.num_layers > 4 else 1.0
 
-        # Project vocab error ONCE into highway space [N, d_last]
+        # Project vocab error ONCE into highway space [N, d_last] (with Weight-Mirrored DFA when enabled)
         head_w_active = self.head_w[:, :d_last]
-        e_highway = self.factorized_dfa.project_vocab_to_highway(salient_err, head_w_active)
+        e_highway = self.factorized_dfa.project_vocab_to_highway(
+            salient_err,
+            head_w_active,
+            head_w0_active=(self.head_w0[:, :d_last] if cfg.mirrored_dfa else None),
+            mirror_blend=(cfg.dfa_mirror_blend if cfg.mirrored_dfa else 0.0),
+        )
 
         # Update Attention Q/K/V springs via compact [D, D] highway adapter
-        self._update_attention_springs(e_highway, d_eff=d_eff, n_total=float(n_total))
+        self._update_attention_springs(e_highway, d_eff=d_eff, n_total=float(n_total), lr_scale=impulse)
 
         # Update Hidden Block-Sparse Layers + Factorized Highway Adapters
+        delta_ctx_for_emb: torch.Tensor | None = None
         for l_idx, layer in enumerate(self.spring_layers):
             d_act = layer.d_active
             delta_l = self.factorized_dfa.broadcast_layer_error(
@@ -1108,6 +1275,18 @@ class SSENNProductionModel(nn.Module):
                 d_act=d_act,
                 depth_scale=depth_dfa_scale,
             )
+            if l_idx == 0 and cfg.trainable_embeddings and not (self.sleep_logs or self.attn_armor_locked):
+                eff_d0 = delta_l.float()
+                if layer._last_z is not None and layer._last_mask is not None:
+                    g0 = torch.ones_like(layer._last_z, dtype=torch.float32)
+                    g0.masked_fill_(layer._last_z <= 0.0, layer.negative_slope)
+                    eff_d0 = eff_d0 * g0
+                    eff_d0.view(eff_d0.shape[0], -1, self.block_size).mul_(layer._last_mask.unsqueeze(-1))
+                delta_ctx_for_emb = torch.matmul(eff_d0, layer.w[:d_act, :d_eff].float())
+                res_scale = cfg.alpha_res / math.sqrt(float(self.num_layers))
+                d_hwy = min(d_eff, d_last)
+                delta_ctx_for_emb[:, :d_hwy].add_(e_highway[:, :d_hwy].float(), alpha=res_scale)
+
             stiff_mult, stiff_ceil = self.stiff_schedule[l_idx]
             k_blk = min(self.layer_top_k_blocks[l_idx], max(1, d_act // self.block_size))
             batch_active_block_union_update(
@@ -1122,6 +1301,7 @@ class SSENNProductionModel(nn.Module):
                 scratch=self._kernel_scratch,
                 compensator=self.compensator,
                 comp_key=f"layer_{l_idx}",
+                lr_scale=impulse,
             )
 
             dorm_idx = self._rejuv_idx_tensors[l_idx]
@@ -1145,17 +1325,27 @@ class SSENNProductionModel(nn.Module):
                     unlocked_row_gate=unlocked_gate,
                 )
 
+        if delta_ctx_for_emb is not None:
+            self._update_embeddings_and_frontend(
+                delta_ctx=delta_ctx_for_emb,
+                valid_rows=valid_rows,
+                pad_id=pad_id,
+                d_eff=d_eff,
+                d_last=d_last,
+                n_valid=n_valid,
+                impulse=impulse,
+            )
+
         # In-place batch-averaged output head update
         scale_factor = float(n_total) / max(n_valid, 1.0)
         salient_err.mul_(scale_factor)
         driving_head = torch.matmul(salient_err.t(), a_head).div_(float(max(n_total, 1)))
-        cfg = self.config
         fused_spring_update_inplace(
             w=self.head_w[:, :d_last],
             w0=self.head_w0[:, :d_last],
             k=self.head_k[:, :d_last],
             driving_signal=driving_head,
-            eta_w=cfg.lr_head_w,
+            eta_w=cfg.lr_head_w * impulse,
             eta_0=cfg.lr_head_0,
             gamma=cfg.gamma_head,
             beta_k_eff=cfg.beta_k_head,
@@ -2055,6 +2245,7 @@ class SSENNProductionModel(nn.Module):
             "metadata": {
                 "frozen": bool(self.frozen),
                 "current_epoch": int(self.current_epoch),
+                "planned_total_epochs": int(self._planned_total_epochs),
                 "reward_baseline": float(self.reward_baseline),
                 "attn_armor_locked": bool(self.attn_armor_locked),
                 "attn_locked_dim": int(self.attn_locked_dim),
@@ -2141,6 +2332,7 @@ class SSENNProductionModel(nn.Module):
 
         self.frozen = is_ckpt_frozen
         self.current_epoch = int(meta["current_epoch"])
+        self._planned_total_epochs = int(meta.get("planned_total_epochs", self.config.impulse_total_epochs))
         self.reward_baseline = float(meta["reward_baseline"])
         self.attn_armor_locked = bool(meta["attn_armor_locked"])
         self.attn_locked_dim = int(meta.get("attn_locked_dim", 0))

@@ -101,6 +101,17 @@ class SSENNConfig:
     refractory_adj_penalty: float = 4.5
     refractory_loop_penalty: float = 6.0
 
+    # v4.0 Foundation Training: Trainable Embeddings, Weight-Mirrored DFA & Cosine Impulse Schedule
+    trainable_embeddings: bool = True
+    embedding_lr_scale: float = 0.50
+    weight_tie_embedding_pull: float = 0.02
+    mirrored_dfa: bool = True
+    dfa_mirror_blend: float = 0.35
+    impulse_schedule: bool = True
+    impulse_start: float = 1.12
+    impulse_end: float = 0.88
+    impulse_total_epochs: int = 16
+
     # Reproducibility seed
     seed: int = 42
 
@@ -192,6 +203,20 @@ class SSENNConfig:
             raise ValueError(
                 f"Unsupported device '{self.device}'. Prefix must be one of {_VALID_DEVICE_PREFIXES}"
             )
+        if self.embedding_lr_scale < 0.0:
+            raise ValueError(f"embedding_lr_scale must be >= 0, got {self.embedding_lr_scale}")
+        if not (0.0 <= self.weight_tie_embedding_pull <= 1.0):
+            raise ValueError(
+                f"weight_tie_embedding_pull must be in [0, 1], got {self.weight_tie_embedding_pull}"
+            )
+        if not (0.0 <= self.dfa_mirror_blend <= 1.0):
+            raise ValueError(f"dfa_mirror_blend must be in [0, 1], got {self.dfa_mirror_blend}")
+        if self.impulse_start <= 0.0 or self.impulse_end <= 0.0:
+            raise ValueError(
+                f"impulse_start ({self.impulse_start}) and impulse_end ({self.impulse_end}) must be > 0"
+            )
+        if self.impulse_total_epochs <= 0:
+            raise ValueError(f"impulse_total_epochs must be > 0, got {self.impulse_total_epochs}")
 
         if self.lr_w <= 0 or self.lr_w0 < 0 or self.gamma_restore < 0 or self.beta_k < 0:
             raise ValueError("Spring plasticity rates must satisfy lr_w > 0 and lr_w0, gamma, beta_k >= 0")
@@ -308,6 +333,12 @@ class SSENNConfig:
         frozen_at_init_params = init_frontend + init_spring_w
         frozen_at_max_params = max_frontend + max_spring_w
 
+        # Unified v4.0 size metrics comparable against standard dense/MoE Transformers
+        B = int(self.block_size)
+        active_hidden_per_tok = sum(min(Dm, int(k_blk) * B) * Dm for k_blk in self.get_layer_top_k_blocks())
+        active_params_per_token = Dm + (6 * Dm * Dm) + active_hidden_per_tok + (V * Dm)
+        training_state_elements = (3 * max_spring_w) + max_dfa
+
         # Exact registered live buffers breakdown (adds alibi_pos_encoding, alibi_causal_weights,
         # 7x 1D vocab stat/armor vectors, and 3x L layer win tracking vectors)
         def _extra_live_buffers(d: int) -> int:
@@ -342,6 +373,9 @@ class SSENNConfig:
             "frozen_w0_at_init_params": frozen_at_init_params,
             "frozen_w0_at_init_mb": (frozen_at_init_params * b) / mb,
             "frozen_w0_params": frozen_at_max_params,
+            "deployed_w0_params": frozen_at_max_params,
+            "active_params_per_token": active_params_per_token,
+            "training_state_elements": training_state_elements,
             "frozen_w0_mb": (frozen_at_max_params * b) / mb,
             "frozen_w0_gb": (frozen_at_max_params * b) / gb,
         }
