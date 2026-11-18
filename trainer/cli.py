@@ -72,6 +72,7 @@ def _add_model_config_args(p: argparse.ArgumentParser, *, default_vocab: int | N
     p.add_argument("--max-seq-len", type=int, default=1024, help="Maximum causal context length T_max.")
     p.add_argument("--attn-top-k", type=int, default=12, help="Causal attention Top-K slots.")
     p.add_argument("--salient-anchor-slots", type=int, default=2, help="Salient entity anchor slots.")
+    p.add_argument("--num-attn-heads", type=int, default=1, help="Multi-head sparse attention count (GCD-aligned with d_eff).")
     p.add_argument(
         "--dtype",
         choices=("float32", "bfloat16", "float16"),
@@ -109,6 +110,7 @@ def cmd_estimate(args: argparse.Namespace) -> int:
         max_seq_len=args.max_seq_len,
         attn_top_k=args.attn_top_k,
         salient_anchor_slots=args.salient_anchor_slots,
+        num_attn_heads=args.num_attn_heads,
         dtype=args.dtype,
         kahan_mode=args.kahan_mode,
         device=args.device,
@@ -298,6 +300,7 @@ def cmd_train(args: argparse.Namespace) -> int:
             max_seq_len=max_seq_len,
             attn_top_k=args.attn_top_k,
             salient_anchor_slots=args.salient_anchor_slots,
+            num_attn_heads=args.num_attn_heads,
             dtype=args.dtype,
             kahan_mode=args.kahan_mode,
             device=args.device,
@@ -425,6 +428,9 @@ def cmd_generate(args: argparse.Namespace) -> int:
         temperature=float(args.temperature),
         top_k=int(args.top_k),
         top_p=float(args.top_p),
+        frequency_penalty=float(args.frequency_penalty),
+        presence_penalty=float(args.presence_penalty),
+        penalty_window=int(args.penalty_window),
     )
     elapsed_s = max(time.perf_counter() - t0, 1e-6)
     gen_tokens = max(0, len(out_ids) - len(prompt_ids))
@@ -557,6 +563,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_gen.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 = greedy argmax).")
     p_gen.add_argument("--top-k", type=int, default=0, help="Top-k sampling filter when temperature > 0.")
     p_gen.add_argument("--top-p", type=float, default=1.0, help="Nucleus top-p sampling cutoff when temperature > 0.")
+    p_gen.add_argument("--frequency-penalty", type=float, default=0.0, help="Windowed cumulative frequency penalty (0.0 disables).")
+    p_gen.add_argument("--presence-penalty", type=float, default=0.0, help="Windowed token presence penalty (0.0 disables).")
+    p_gen.add_argument("--penalty-window", type=int, default=64, help="Trailing token window length for repetition penalties.")
     p_gen.set_defaults(func=cmd_generate)
 
     return parser

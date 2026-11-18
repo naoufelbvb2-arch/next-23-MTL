@@ -619,7 +619,8 @@ class FactorizedHighwayDFA(nn.Module):
         # Settled weight-mirrored Jacobian combining live head_w and anchor head_w0 with stable RMS scaling
         w_mir_t = (0.55 * head_w_active.float() + 0.45 * head_w0_active.float()).t()
         mean_col_norm = w_mir_t.pow(2).sum(dim=-1).mean().sqrt().clamp(min=1e-6)
-        e_mirror = F.linear(error_vec.float(), w_mir_t) * (self.target_row_norm / float(mean_col_norm.item()))
+        # Pure tensor scalar scale keeps GPU stream asynchronous without .item() sync
+        e_mirror = F.linear(error_vec.float(), w_mir_t) * (self.target_row_norm / mean_col_norm)
         return ((1.0 - b) * e_base.float() + b * e_mirror).to(error_vec.dtype)
 
     @torch.no_grad()
@@ -715,6 +716,7 @@ class SpringInferenceCache:
         context_dim: int,
         device: torch.device,
         dtype: torch.dtype = torch.float32,
+        num_heads: int = 1,
     ) -> None:
         self.batch_size = batch_size
         self.max_seq_len = max_seq_len
@@ -722,7 +724,9 @@ class SpringInferenceCache:
         self.context_dim = context_dim
         self.device = device
         self.dtype = dtype
+        self.num_heads = max(1, int(num_heads))
         self.step: int = 0
+        self.pos_indices = torch.arange(max_seq_len, device=device, dtype=torch.float32)
 
         # Dual-Horizon Attention fixed K/V/Salience storage (O(1) slice per step)
         self.k_cache = torch.zeros(batch_size, max_seq_len, d_max, device=device, dtype=dtype)

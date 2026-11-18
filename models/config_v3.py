@@ -20,6 +20,7 @@ Zero autograd / zero backward().
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import math
 import torch
 
 
@@ -48,6 +49,7 @@ class SSENNConfig:
     max_seq_len: int = 512
     attn_top_k: int = 8
     salient_anchor_slots: int = 2
+    num_attn_heads: int = 1
     head_scale: float = 1.0
     negative_slope: float = 0.10
 
@@ -101,7 +103,7 @@ class SSENNConfig:
     refractory_adj_penalty: float = 4.5
     refractory_loop_penalty: float = 6.0
 
-    # v4.0 Foundation Training: Trainable Embeddings, Weight-Mirrored DFA & Cosine Impulse Schedule
+    # v4.0 / v4.1 Foundation Training: Trainable Embeddings, Weight-Mirrored DFA, Impulse & Early Neurogenesis
     trainable_embeddings: bool = True
     embedding_lr_scale: float = 0.50
     weight_tie_embedding_pull: float = 0.02
@@ -111,6 +113,8 @@ class SSENNConfig:
     impulse_start: float = 1.12
     impulse_end: float = 0.88
     impulse_total_epochs: int = 16
+    stop_neurogenesis_last_epoch: bool = True
+    neurogenesis_cutoff_ratio: float = 0.75
 
     # Reproducibility seed
     seed: int = 42
@@ -217,6 +221,12 @@ class SSENNConfig:
             )
         if self.impulse_total_epochs <= 0:
             raise ValueError(f"impulse_total_epochs must be > 0, got {self.impulse_total_epochs}")
+        if self.num_attn_heads <= 0:
+            raise ValueError(f"num_attn_heads must be > 0, got {self.num_attn_heads}")
+        if not (0.0 < self.neurogenesis_cutoff_ratio <= 1.0):
+            raise ValueError(
+                f"neurogenesis_cutoff_ratio must be in (0, 1], got {self.neurogenesis_cutoff_ratio}"
+            )
 
         if self.lr_w <= 0 or self.lr_w0 < 0 or self.gamma_restore < 0 or self.beta_k < 0:
             raise ValueError("Spring plasticity rates must satisfy lr_w > 0 and lr_w0, gamma, beta_k >= 0")
@@ -253,6 +263,10 @@ class SSENNConfig:
 
     def resolve_torch_device(self) -> torch.device:
         return torch.device(self.device)
+
+    def resolve_effective_attn_heads(self, d_eff: int) -> int:
+        """Returns largest valid divisor of `d_eff` shared with `num_attn_heads` (GCD)."""
+        return math.gcd(max(1, int(d_eff)), max(1, int(self.num_attn_heads)))
 
     def get_layer_top_k_blocks(self) -> list[int]:
         if self.layer_top_k_blocks is not None:

@@ -225,6 +225,14 @@ class SSENNProductionModel(nn.Module):
         self._post_sleep_continual: bool = False
         self.has_multiword_entities: bool = False
         self.attn_v_topk: int = min(8, self.d_init)
+        self._head_slopes_cache: dict[int, torch.Tensor] = {}
+        self._emb_counts_scratch: torch.Tensor | None = None
+        self._last_attn_probs: torch.Tensor | None = None
+        self._last_q_h: torch.Tensor | None = None
+        self._last_k_h: torch.Tensor | None = None
+        self._last_v_h: torch.Tensor | None = None
+        self._last_eff_heads: int = 1
+        self._last_attn_bsz_seq: tuple[int, int] = (1, 1)
 
         # Kernel scratch & FP32 Kahan residual compensator (deterministic string keys)
         self._kernel_scratch: SpringScratchBuffer | None = None if _skip_train_alloc else SpringScratchBuffer()
@@ -555,12 +563,34 @@ class SSENNProductionModel(nn.Module):
         if self._kernel_scratch is not None:
             self._kernel_scratch = SpringScratchBuffer()
 
+        self._head_slopes_cache.clear()
+        self._emb_counts_scratch = None
         self._sync_rejuv_idx_tensors()
         self._reset_step_cache()
         return self
 
     def set_training_horizon(self, total_epochs: int) -> None:
         self._planned_total_epochs = max(1, int(total_epochs))
+
+    def _get_head_alibi_slopes(self, eff_heads: int) -> torch.Tensor:
+        """Cached geometric per-head ALiBi decay slopes for multi-head sparse causal attention."""
+        cached = self._head_slopes_cache.get(eff_heads)
+        if cached is not None and cached.device == self.model_device:
+            return cached
+        slopes = torch.pow(
+            2.0,
+            -torch.linspace(2.0, 6.0, int(eff_heads), device=self.model_device, dtype=torch.float32),
+        )
+        self._head_slopes_cache[eff_heads] = slopes
+        return slopes
+
+    def _get_emb_counts_scratch(self) -> torch.Tensor:
+        """Reusable non-buffer 1-D occurrence counter avoiding torch.unique GPU stream syncs."""
+        if self._emb_counts_scratch is None or self._emb_counts_scratch.device != self.model_device:
+            self._emb_counts_scratch = torch.zeros(
+                self.vocab_size, device=self.model_device, dtype=torch.float32
+            )
+        return self._emb_counts_scratch
 
     def current_impulse_scale(self) -> float:
         """Smooth cosine annealing impulse factor from impulse_start -> impulse_end."""
@@ -580,6 +610,12 @@ class SSENNProductionModel(nn.Module):
         self._last_emb_input_ids = None
         self._last_tok_emb = None
         self._last_cap_states = None
+        self._last_attn_probs = None
+        self._last_q_h = None
+        self._last_k_h = None
+        self._last_v_h = None
+        self._last_eff_heads = 1
+        self._last_attn_bsz_seq = (1, 1)
         for layer in self.spring_layers:
             layer._last_a_prev = None
             layer._last_z = None
@@ -784,17 +820,62 @@ class SSENNProductionModel(nn.Module):
         if store_attn_cache:
             self._last_q_prev = x_flat.detach()
 
-        scale = 1.0 / math.sqrt(float(d_eff))
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        eff_heads = self.config.resolve_effective_attn_heads(d_eff)
         key_sal = self.token_salience[input_ids].unsqueeze(1)  # [B, 1, T]
-        scores = scores + (1.35 * (key_sal - 1.0)).to(scores.dtype)
-
         causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=input_ids.device, dtype=torch.bool))
-        scores = scores.masked_fill(~causal_mask.unsqueeze(0), float("-inf"))
-        scores = self._apply_dual_horizon_topk(scores, key_sal, causal_mask=causal_mask)
 
-        attn_weights = F.softmax(scores.float(), dim=-1) * causal_mask.unsqueeze(0).float()
-        attended = torch.matmul(attn_weights.to(v.dtype), v) + x
+        if eff_heads == 1:
+            scale = 1.0 / math.sqrt(float(d_eff))
+            scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            scores = scores + (1.35 * (key_sal - 1.0)).to(scores.dtype)
+            scores = scores.masked_fill(~causal_mask.unsqueeze(0), float("-inf"))
+            scores = self._apply_dual_horizon_topk(scores, key_sal, causal_mask=causal_mask)
+            attn_weights = F.softmax(scores.float(), dim=-1) * causal_mask.unsqueeze(0).float()
+            attended = torch.matmul(attn_weights.to(v.dtype), v) + x
+            if store_attn_cache:
+                self._last_eff_heads = 1
+                self._last_attn_probs = None
+                self._last_q_h = None
+                self._last_k_h = None
+                self._last_v_h = None
+        else:
+            head_dim = d_eff // eff_heads
+            scale = 1.0 / math.sqrt(float(head_dim))
+            q_h = q.view(bsz, seq_len, eff_heads, head_dim).transpose(1, 2)
+            k_h = k.view(bsz, seq_len, eff_heads, head_dim).transpose(1, 2)
+            v_h = v.view(bsz, seq_len, eff_heads, head_dim).transpose(1, 2)
+
+            scores = torch.matmul(q_h, k_h.transpose(-2, -1)) * scale  # [B, H, T, T]
+            pos_idx = torch.arange(seq_len, device=input_ids.device, dtype=torch.float32)
+            rel_dist = (pos_idx.view(1, seq_len) - pos_idx.view(seq_len, 1)).clamp(max=0.0).view(1, 1, seq_len, seq_len)
+            slopes = self._get_head_alibi_slopes(eff_heads).view(1, eff_heads, 1, 1)
+            alibi_bias = slopes * rel_dist
+            key_sal_h = key_sal.unsqueeze(1)  # [B, 1, 1, T]
+            scores = scores + (1.35 * (key_sal_h - 1.0)).to(scores.dtype) + alibi_bias.to(scores.dtype)
+            scores = scores.masked_fill(~causal_mask.view(1, 1, seq_len, seq_len), float("-inf"))
+
+            sal_flat = key_sal_h.expand(bsz, eff_heads, 1, seq_len).reshape(bsz * eff_heads, 1, seq_len)
+            scores_sp = self._apply_dual_horizon_topk(
+                scores.reshape(bsz * eff_heads, seq_len, seq_len), sal_flat, causal_mask=causal_mask
+            )
+            attn_weights = (
+                F.softmax(scores_sp.float(), dim=-1).view(bsz, eff_heads, seq_len, seq_len)
+                * causal_mask.view(1, 1, seq_len, seq_len).float()
+            )
+            attended = (
+                torch.matmul(attn_weights.to(v_h.dtype), v_h)
+                .transpose(1, 2)
+                .contiguous()
+                .view(bsz, seq_len, d_eff)
+                + x
+            )
+            if store_attn_cache:
+                self._last_eff_heads = eff_heads
+                self._last_attn_bsz_seq = (bsz, seq_len)
+                self._last_attn_probs = attn_weights.detach()
+                self._last_q_h = q_h.detach()
+                self._last_k_h = k_h.detach()
+                self._last_v_h = v_h.detach()
 
         # Salience-Gated EMA Context Capacitor
         alphas = self.capacitor_alpha[input_ids].unsqueeze(-1).to(tok_emb.dtype)
@@ -1011,8 +1092,49 @@ class SSENNProductionModel(nn.Module):
 
         g_prime = torch.ones_like(v_z)
         g_prime.masked_fill_(v_z <= 0.0, self.negative_slope)
-        v_delta = attn_err * g_prime * v_mask
-        drv_v = torch.matmul(v_delta.t(), x_flat).div_(max(n_total, 1.0))
+
+        eff_heads = self._last_eff_heads
+        if eff_heads > 1 and self._last_attn_probs is not None:
+            bsz, seq_len = self._last_attn_bsz_seq
+            head_dim = d_eff // eff_heads
+            attn_probs = self._last_attn_probs
+            attn_err_h = attn_err.view(bsz, seq_len, eff_heads, head_dim).transpose(1, 2)
+
+            err_v_h = torch.matmul(attn_probs.transpose(-2, -1), attn_err_h.float())
+            err_v_flat = err_v_h.transpose(1, 2).contiguous().view(x_flat.shape[0], d_eff)
+            v_err_eff = (0.50 * attn_err.float() + 0.50 * err_v_flat).to(v_z.dtype)
+            v_delta = v_err_eff * g_prime * v_mask
+            drv_v = torch.matmul(v_delta.t(), x_flat).div_(max(n_total, 1.0))
+
+            # Local Zero-Autograd multi-head attention score Jacobian for Q & K specialization
+            dA_h = torch.matmul(attn_err_h.float(), self._last_v_h.float().transpose(-2, -1))
+            dA_dot = (attn_probs * dA_h).sum(dim=-1, keepdim=True)
+            dScores_h = attn_probs * (dA_h - dA_dot)
+            scale_h = 1.0 / math.sqrt(float(head_dim))
+            dq_flat = (
+                (torch.matmul(dScores_h, self._last_k_h.float()) * scale_h)
+                .transpose(1, 2)
+                .contiguous()
+                .view(x_flat.shape[0], d_eff)
+            )
+            dk_flat = (
+                (torch.matmul(dScores_h.transpose(-2, -1), self._last_q_h.float()) * scale_h)
+                .transpose(1, 2)
+                .contiguous()
+                .view(x_flat.shape[0], d_eff)
+            )
+            target_qk_rms = attn_err.float().pow(2).mean().sqrt().clamp(min=1e-6) * 0.25
+            q_err = (dq_flat * (target_qk_rms / dq_flat.pow(2).mean().sqrt().clamp(min=1e-6))).to(x_flat.dtype)
+            k_err = (dk_flat * (target_qk_rms / dk_flat.pow(2).mean().sqrt().clamp(min=1e-6))).to(x_flat.dtype)
+            drv_q = torch.matmul(q_err.t(), x_flat).div_(max(n_total, 1.0))
+            drv_k = torch.matmul(k_err.t(), x_flat).div_(max(n_total, 1.0))
+            drv_qk_map = {"q": drv_q, "k": drv_k}
+        else:
+            v_delta = attn_err * g_prime * v_mask
+            drv_v = torch.matmul(v_delta.t(), x_flat).div_(max(n_total, 1.0))
+            qk_err = attn_err * 0.25
+            drv_qk = torch.matmul(qk_err.t(), x_flat).div_(max(n_total, 1.0))
+            drv_qk_map = {"q": drv_qk, "k": drv_qk}
 
         d_lock = min(self.attn_locked_dim, d_eff) if self.attn_locked_dim > 0 else 0
         eta_attn_w = cfg.lr_attn_w * float(lr_scale)
@@ -1039,8 +1161,6 @@ class SSENNProductionModel(nn.Module):
             v_w0_sub[:d_lock, :d_lock].copy_(v_lock_anchor)
             v_w_sub[:d_lock, :d_lock].copy_(v_lock_anchor)
 
-        qk_err = attn_err * 0.25
-        drv_qk = torch.matmul(qk_err.t(), x_flat).div_(max(n_total, 1.0))
         for prefix in ("q", "k"):
             w_sub = getattr(self, f"{prefix}_w")[:d_eff, :d_eff]
             w0_sub = getattr(self, f"{prefix}_w0")[:d_eff, :d_eff]
@@ -1049,7 +1169,7 @@ class SSENNProductionModel(nn.Module):
                 w=w_sub,
                 w0=w0_sub,
                 k=getattr(self, f"{prefix}_k")[:d_eff, :d_eff],
-                driving_signal=drv_qk,
+                driving_signal=drv_qk_map[prefix],
                 eta_w=eta_attn_w,
                 eta_0=eta_attn_0,
                 gamma=cfg.gamma_attn,
@@ -1118,61 +1238,66 @@ class SSENNProductionModel(nn.Module):
         dev = self.model_device
         bsz, seq_len = self._last_emb_input_ids.shape
         inputs_flat = self._last_emb_input_ids.reshape(-1)
-        tok_valid = valid_rows & (inputs_flat != pad_id)
-        if not tok_valid.any():
-            return
+        tok_valid_f = (valid_rows & (inputs_flat != pad_id)).float()
 
+        # Sync-free GPU/CPU tensor normalization & O(1) index_add_ (eliminates torch.unique sync)
         delta_work = delta_ctx.float()
-        ctx_rms = float(delta_work.pow(2).mean().sqrt().item())
-        if ctx_rms < 1e-7:
-            return
-        delta_work = delta_work / max(ctx_rms, 1.0)
+        ctx_rms = delta_work.pow(2).mean().sqrt().clamp(min=1.0)
+        delta_work = delta_work / ctx_rms
+        grad_valid = delta_work * tok_valid_f.unsqueeze(-1)
 
-        active_ids = inputs_flat[tok_valid]
-        active_grads = delta_work[tok_valid]
-        unique_ids, inv_idx = torch.unique(active_ids, return_inverse=True)
+        row_counts = self._get_emb_counts_scratch()
+        row_counts.zero_()
+        row_counts.index_add_(0, inputs_flat, tok_valid_f)
 
-        counts = torch.zeros(unique_ids.numel(), device=dev, dtype=torch.float32)
-        counts.index_add_(0, inv_idx, torch.ones_like(inv_idx, dtype=torch.float32))
-        grad_acc = torch.zeros((unique_ids.numel(), d_eff), device=dev, dtype=torch.float32)
-        grad_acc.index_add_(0, inv_idx, active_grads)
-        grad_mean = grad_acc / counts.unsqueeze(-1).clamp(min=1.0)
+        target_emb_norm = math.sqrt(float(d_eff) / 3.0)
+        lr_emb = float(cfg.lr_attn_w) * float(cfg.embedding_lr_scale) * float(impulse) * target_emb_norm
+        per_tok_lr = (lr_emb * tok_valid_f) / row_counts[inputs_flat].clamp(min=1.0)
+        visited_col = (row_counts > 0.0).unsqueeze(-1)
+        max_emb_norm = 1.60 * target_emb_norm
 
-        emb_u = self.token_embedding[:, :d_eff][unique_ids].float()
         use_full_kahan = (
             self.compensator is not None
             and self.compensator.mode == "full"
             and self.token_embedding.dtype in (torch.float16, torch.bfloat16)
         )
-        rw0_emb = None
+        emb_act = self.token_embedding[:, :d_eff]
         if use_full_kahan:
             _, rw0_emb, _ = self.compensator.get_residuals("tok_embed", (self.vocab_size, self.d_max), dev)
-            emb_u = emb_u + rw0_emb[:, :d_eff][unique_ids]
-
-        target_emb_norm = math.sqrt(float(d_eff) / 3.0)
-        lr_emb = float(cfg.lr_attn_w) * float(cfg.embedding_lr_scale) * float(impulse) * target_emb_norm
-        emb_u.add_(grad_mean, alpha=lr_emb)
-
-        if cfg.weight_tie_embedding_pull > 0.0 and self.current_epoch >= 1:
-            d_tie = min(d_eff, d_last)
-            tie_norm = math.sqrt(float(d_tie) / 3.0)
-            target_dir = F.normalize(self.head_w0[unique_ids, :d_tie].float(), p=2, dim=-1, eps=1e-6) * tie_norm
-            pull_alpha = min(0.05, float(cfg.weight_tie_embedding_pull) * float(cfg.lr_attn_0) * float(impulse))
-            emb_u[:, :d_tie] = emb_u[:, :d_tie].lerp(target_dir, pull_alpha)
-
-        # Row-Norm Clipping to maintain exact physical variance without explosion
-        max_emb_norm = 1.60 * target_emb_norm
-        row_norms = emb_u.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-6)
-        emb_u.mul_((max_emb_norm / row_norms).clamp(max=1.0))
-
-        emb_cast = emb_u.to(self.token_embedding.dtype)
-        self.token_embedding[:, :d_eff][unique_ids] = emb_cast
-        if rw0_emb is not None:
-            rw0_emb[:, :d_eff][unique_ids] = emb_u - emb_cast.float()
+            rw0_slice = rw0_emb[:, :d_eff]
+            rw0_slice.index_add_(0, inputs_flat, grad_valid * per_tok_lr.unsqueeze(-1))
+            w_sum = emb_act.float() + rw0_slice
+            if cfg.weight_tie_embedding_pull > 0.0 and self.current_epoch >= 1:
+                d_tie = min(d_eff, d_last)
+                tie_norm = math.sqrt(float(d_tie) / 3.0)
+                target_dir = F.normalize(self.head_w0[:, :d_tie].float(), p=2, dim=-1, eps=1e-6) * tie_norm
+                pull_alpha = min(0.05, float(cfg.weight_tie_embedding_pull) * float(cfg.lr_attn_0) * float(impulse))
+                w_sum[:, :d_tie] = torch.where(
+                    visited_col, w_sum[:, :d_tie].lerp(target_dir, pull_alpha), w_sum[:, :d_tie]
+                )
+            row_norms = w_sum.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-6)
+            clip_scale = torch.where(visited_col, (max_emb_norm / row_norms).clamp(max=1.0), 1.0)
+            w_sum.mul_(clip_scale)
+            emb_cast = torch.where(visited_col, w_sum.to(self.token_embedding.dtype), emb_act)
+            emb_act.copy_(emb_cast)
+            rw0_slice.copy_(torch.where(visited_col, w_sum - emb_cast.float(), rw0_slice))
+        else:
+            upd = grad_valid * per_tok_lr.unsqueeze(-1)
+            emb_act.index_add_(0, inputs_flat, upd if emb_act.dtype == torch.float32 else upd.to(emb_act.dtype))
+            if cfg.weight_tie_embedding_pull > 0.0 and self.current_epoch >= 1:
+                d_tie = min(d_eff, d_last)
+                tie_norm = math.sqrt(float(d_tie) / 3.0)
+                target_dir = F.normalize(self.head_w0[:, :d_tie].float(), p=2, dim=-1, eps=1e-6) * tie_norm
+                pull_alpha = min(0.05, float(cfg.weight_tie_embedding_pull) * float(cfg.lr_attn_0) * float(impulse))
+                pulled = emb_act[:, :d_tie].float().lerp(target_dir, pull_alpha).to(emb_act.dtype)
+                emb_act[:, :d_tie] = torch.where(visited_col, pulled, emb_act[:, :d_tie])
+            row_norms = emb_act.float().norm(p=2, dim=-1, keepdim=True).clamp(min=1e-6)
+            clip_scale = torch.where(visited_col, (max_emb_norm / row_norms).clamp(max=1.0), 1.0).to(emb_act.dtype)
+            emb_act.mul_(clip_scale)
 
         # Update causal context projections (cap_proj, lag1_proj, lag2_proj)
         lr_fe = float(cfg.lr_attn_w) * float(cfg.embedding_lr_scale) * float(impulse) * 0.50
-        delta_valid_bt = (delta_work * tok_valid.float().unsqueeze(-1)).reshape(bsz, seq_len, d_eff)
+        delta_valid_bt = grad_valid.reshape(bsz, seq_len, d_eff)
         denom = max(n_valid, 1.0)
         drv_cap = torch.matmul(
             (delta_valid_bt * 1.65).reshape(-1, d_eff).t(),
@@ -1395,6 +1520,21 @@ class SSENNProductionModel(nn.Module):
             return {"woke_total": 0, "grew": False, "dims": self.get_allocated_dimensions()}
 
         cfg = self.config
+        total_ep = max(1, int(self._planned_total_epochs))
+        early_window_active = bool(
+            cfg.stop_neurogenesis_last_epoch and (not self.sleep_logs) and total_ep >= 3
+        )
+        if early_window_active:
+            early_cutoff = min(
+                total_ep - 1,
+                max(1, int(math.floor(float(cfg.neurogenesis_cutoff_ratio) * float(total_ep)))),
+            )
+            if self.current_epoch >= early_cutoff:
+                return {"woke_total": 0, "grew": False, "dims": self.get_allocated_dimensions()}
+            eff_cooldown = 1 if early_cutoff <= 4 else min(cfg.neurogenesis_cooldown, max(1, early_cutoff // 2))
+        else:
+            eff_cooldown = cfg.neurogenesis_cooldown
+
         woke_total = 0
         rejuv_modified = False
         old_max_d = max(layer.d_active for layer in self.spring_layers)
@@ -1403,7 +1543,7 @@ class SSENNProductionModel(nn.Module):
         for l_idx, layer in enumerate(self.spring_layers):
             if layer.d_active >= self.d_max and not self.rejuvenated_slots[l_idx]:
                 continue
-            if (self.current_epoch - layer.last_growth_epoch) < cfg.neurogenesis_cooldown:
+            if (self.current_epoch - layer.last_growth_epoch) < eff_cooldown:
                 continue
 
             d_act = layer.d_active
@@ -1518,11 +1658,51 @@ class SSENNProductionModel(nn.Module):
                 layer.w0[:d_act, :d_eff][active_un] = (layer.w0[:d_act, :d_eff][active_un].float() * scale).to(layer.w0.dtype)
 
     @torch.no_grad()
+    def _apply_final_w0_ema_pull(self) -> None:
+        """Confidence-weighted soft EMA pull from live `w` into anchor `w0` at horizon end."""
+        if self.frozen:
+            return
+        d_eff, d_last = self._effective_dims()
+        if not self.attn_armor_locked:
+            for p in ("q", "k", "v"):
+                w_t = getattr(self, f"{p}_w")[:d_eff, :d_eff]
+                w0_t = getattr(self, f"{p}_w0")[:d_eff, :d_eff]
+                k_t = getattr(self, f"{p}_k")[:d_eff, :d_eff]
+                pull_w = (0.40 + 0.45 * k_t.float().clamp(0.0, 1.0)).to(w0_t.dtype)
+                w0_t.add_((w_t - w0_t) * pull_w)
+
+        for l_idx, layer in enumerate(self.spring_layers):
+            d_act = layer.d_active
+            settle_mask = ~self.armor_locked_masks[l_idx][:d_act].clone()
+            if self.rejuvenated_slots[l_idx]:
+                settle_mask[self.rejuvenated_slots[l_idx]] = False
+            if settle_mask.any():
+                w_s = layer.w[:d_act, :d_eff][settle_mask]
+                w0_s = layer.w0[:d_act, :d_eff][settle_mask]
+                k_s = layer.k[:d_act, :d_eff][settle_mask]
+                pull_l = (0.40 + 0.45 * (k_s.float() / 0.85).clamp(0.0, 1.0)).to(layer.w0.dtype)
+                layer.w0[:d_act, :d_eff][settle_mask] = w0_s + (w_s - w0_s) * pull_l
+
+        if not self.head_armor_mask.any():
+            hw0_sub = self.head_w0[:, :d_last]
+            hw_sub = self.head_w[:, :d_last]
+            hk_sub = self.head_k[:, :d_last]
+            pull_h = (0.40 + 0.45 * (hk_sub.float() / 0.78).clamp(0.0, 1.0)).to(hw0_sub.dtype)
+            hw0_sub.add_((hw_sub - hw0_sub) * pull_h)
+
+    @torch.no_grad()
     def end_epoch(self, epoch: int | None = None, mean_ce_loss: float | None = None) -> dict:
         self.current_epoch = int(epoch) if epoch is not None else (self.current_epoch + 1)
         growth_info = self.step_neurogenesis(mean_ce_loss=mean_ce_loss)
         if self.sleep_logs:
             self._calibrate_post_sleep_capsule_norms()
+        elif (
+            self.config.stop_neurogenesis_last_epoch
+            and (not self.frozen)
+            and self._planned_total_epochs >= 2
+            and self.current_epoch >= self._planned_total_epochs
+        ):
+            self._apply_final_w0_ema_pull()
         for l_idx, layer in enumerate(self.spring_layers):
             self._last_epoch_block_wins[l_idx].copy_(self.epoch_block_win_counts[l_idx])
             self.epoch_block_win_counts[l_idx].zero_()
@@ -1845,6 +2025,7 @@ class SSENNProductionModel(nn.Module):
     ) -> SpringInferenceCache:
         """Pre-allocates an O(1) stateful cache matching current effective dimensions & dtype."""
         d_eff, d_last = self._effective_dims()
+        eff_heads = self.config.resolve_effective_attn_heads(d_eff)
         req_len = int(max_seq_len if max_seq_len is not None else self.max_seq_len)
         cache = SpringInferenceCache(
             batch_size=batch_size,
@@ -1853,9 +2034,11 @@ class SSENNProductionModel(nn.Module):
             context_dim=d_eff,
             device=self.model_device,
             dtype=self.weight_dtype,
+            num_heads=eff_heads,
         )
         cache._cached_d_eff = d_eff
         cache._cached_d_last = d_last
+        cache._cached_eff_heads = eff_heads
         cache._cached_head_w = self.head_w0 if self.frozen else self.head_w[:, :d_last]
         return cache
 
@@ -1913,12 +2096,37 @@ class SSENNProductionModel(nn.Module):
             v_pre = cache.v_cache[:, :k_len, :d_eff]
             sal_pre = cache.sal_cache[:, :k_len].unsqueeze(1)  # [1, 1, k_len]
 
-            scale = 1.0 / math.sqrt(float(d_eff))
-            scores = torch.bmm(q_t.unsqueeze(1), k_pre.transpose(1, 2)) * scale  # [1, 1, k_len]
-            scores = scores + (1.35 * (sal_pre - 1.0)).to(scores.dtype)
-            scores = self._apply_dual_horizon_topk(scores, sal_pre, causal_mask=None)
-            attn_w = F.softmax(scores.float(), dim=-1).to(v_pre.dtype)
-            attended = torch.bmm(attn_w, v_pre).squeeze(1) + x_t
+            eff_heads = getattr(cache, "_cached_eff_heads", None)
+            if eff_heads is None:
+                eff_heads = self.config.resolve_effective_attn_heads(d_eff)
+
+            if eff_heads == 1:
+                scale = 1.0 / math.sqrt(float(d_eff))
+                scores = torch.bmm(q_t.unsqueeze(1), k_pre.transpose(1, 2)) * scale  # [1, 1, k_len]
+                scores = scores + (1.35 * (sal_pre - 1.0)).to(scores.dtype)
+                scores = self._apply_dual_horizon_topk(scores, sal_pre, causal_mask=None)
+                attn_w = F.softmax(scores.float(), dim=-1).to(v_pre.dtype)
+                attended = torch.bmm(attn_w, v_pre).squeeze(1) + x_t
+            else:
+                head_dim = d_eff // eff_heads
+                scale = 1.0 / math.sqrt(float(head_dim))
+                q_h = q_t.view(1, eff_heads, 1, head_dim)
+                k_pre_h = k_pre.view(1, k_len, eff_heads, head_dim).transpose(1, 2)
+                v_pre_h = v_pre.view(1, k_len, eff_heads, head_dim).transpose(1, 2)
+                scores = torch.matmul(q_h, k_pre_h.transpose(-2, -1)) * scale
+                rel_dist = (cache.pos_indices[:k_len] - float(t)).view(1, 1, 1, k_len)
+                slopes = self._get_head_alibi_slopes(eff_heads).view(1, eff_heads, 1, 1)
+                alibi_bias = slopes * rel_dist
+                sal_pre_h = sal_pre.unsqueeze(1)
+                scores = scores + (1.35 * (sal_pre_h - 1.0)).to(scores.dtype) + alibi_bias.to(scores.dtype)
+                sal_flat = sal_pre_h.expand(1, eff_heads, 1, k_len).reshape(eff_heads, 1, k_len)
+                scores_sp = self._apply_dual_horizon_topk(
+                    scores.reshape(eff_heads, 1, k_len), sal_flat, causal_mask=None
+                )
+                attn_w = F.softmax(scores_sp.float(), dim=-1).view(1, eff_heads, 1, k_len).to(v_pre_h.dtype)
+                attended = (
+                    torch.matmul(attn_w, v_pre_h).transpose(1, 2).contiguous().view(1, d_eff) + x_t
+                )
 
             if t == 0:
                 alibi_num = cache.alibi_u + 0.30 * cache.x_pos_0
@@ -2029,6 +2237,30 @@ class SSENNProductionModel(nn.Module):
         return int(torch.multinomial(probs, num_samples=1).item())
 
     @torch.no_grad()
+    def _apply_repetition_penalties_logits(
+        self,
+        logits: torch.Tensor,
+        seq: list[int],
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        penalty_window: int = 64,
+    ) -> torch.Tensor:
+        """Applies windowed frequency and presence penalties to prevent cumulative token loops."""
+        if (frequency_penalty <= 0.0 and presence_penalty <= 0.0) or not seq:
+            return logits
+        win = seq[-max(1, int(penalty_window)) :]
+        counts: dict[int, int] = {}
+        for tid in win:
+            if 0 <= tid < self.vocab_size:
+                counts[tid] = counts.get(tid, 0) + 1
+        if counts:
+            ids_t = torch.tensor(list(counts.keys()), dtype=torch.long, device=logits.device)
+            cnt_t = torch.tensor(list(counts.values()), dtype=logits.dtype, device=logits.device)
+            penalties = float(presence_penalty) + float(frequency_penalty) * cnt_t
+            logits.index_add_(0, ids_t, -penalties)
+        return logits
+
+    @torch.no_grad()
     def generate(
         self,
         prompt_ids: list[int],
@@ -2039,6 +2271,9 @@ class SSENNProductionModel(nn.Module):
         temperature: float = 0.0,
         top_k: int = 0,
         top_p: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        penalty_window: int = 64,
     ) -> list[int]:
         out = list(prompt_ids)
         if not out:
@@ -2060,6 +2295,13 @@ class SSENNProductionModel(nn.Module):
                     l_work = logits.float().clone() if logits.dtype != torch.float32 else logits.clone()
                     if enable_refractory_gate:
                         l_work = self._apply_refractory_gate_logits(l_work, out, cache=cache)
+                    l_work = self._apply_repetition_penalties_logits(
+                        l_work,
+                        out,
+                        frequency_penalty=frequency_penalty,
+                        presence_penalty=presence_penalty,
+                        penalty_window=penalty_window,
+                    )
                     nxt = self._sample_next_token(l_work, temperature=temperature, top_k=top_k, top_p=top_p)
                     out.append(nxt)
                     if nxt == eos_id or step_i + 1 >= steps_to_gen:
@@ -2074,6 +2316,13 @@ class SSENNProductionModel(nn.Module):
             l_work = logits.float().clone() if logits.dtype != torch.float32 else logits.clone()
             if enable_refractory_gate:
                 l_work = self._apply_refractory_gate_logits(l_work, out, cache=None)
+            l_work = self._apply_repetition_penalties_logits(
+                l_work,
+                out,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                penalty_window=penalty_window,
+            )
             nxt = self._sample_next_token(l_work, temperature=temperature, top_k=top_k, top_p=top_p)
             out.append(nxt)
             if nxt == eos_id:

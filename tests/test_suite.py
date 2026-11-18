@@ -1167,6 +1167,107 @@ class TestSpringMVPArchitecture(unittest.TestCase):
         out_slow = m_v4.generate(prompt_ids, max_new_tokens=16, eos_id=-1, use_fast_cache=False)
         self.assertEqual(out_fast, out_slow)
 
+    def test_16_v4_1_multihead_sparse_attention_o1_parity_and_early_settling(self):
+        """Verify v4.1 multi-head O(1) parity (H=4,8), GCD fallback, early cutoff, repetition penalty & PPL gain."""
+        from benchmarks.bench_scale_english_cpu import build_minibatch_tensors, evaluate_batches
+        from benchmarks.english_dataset import build_english_tinystories_corpus
+        from engine import EnglishSubwordTokenizer
+
+        torch.set_grad_enabled(False)
+        # 1. GCD head divisibility fallback
+        cfg_gcd = SSENNConfig(
+            vocab_size=128, num_layers=2, d_init=48, d_max=64, delta_d=16,
+            block_size=16, top_k_blocks=2, max_seq_len=32, attn_top_k=4,
+            salient_anchor_slots=1, num_attn_heads=12, dtype="float32", device="cpu", seed=42,
+        )
+        self.assertEqual(cfg_gcd.resolve_effective_attn_heads(48), 12)
+        self.assertEqual(cfg_gcd.resolve_effective_attn_heads(40), 4)
+
+        # 2. Exact 100.00% O(1) vs O(T^2) parity at H=4 and H=8 (live + frozen + repetition penalties)
+        for n_heads in (4, 8):
+            cfg_mh = SSENNConfig(
+                vocab_size=256, num_layers=3, d_init=64, d_max=96, delta_d=16,
+                block_size=16, top_k_blocks=2, max_seq_len=64, attn_top_k=8,
+                salient_anchor_slots=2, num_attn_heads=n_heads, dtype="float32",
+                kahan_mode="off", device="cpu", seed=17 + n_heads,
+            )
+            m_mh = SSENNProductionModel(cfg_mh)
+            prompt = [1, 11, 22, 33, 11, 44, 55]
+            logits_full = m_mh.forward(prompt)
+            cache = m_mh.init_inference_cache(batch_size=1, max_seq_len=64)
+            for tid in prompt[:-1]:
+                m_mh.forward_step_cached(tid, cache, compute_logits=False)
+            logits_o1 = m_mh.forward_step_cached(prompt[-1], cache, compute_logits=True)
+            self.assertLess(float((logits_full - logits_o1).abs().max().item()), 1e-4)
+
+            g_fast = m_mh.generate(
+                prompt, max_new_tokens=20, eos_id=-1, use_fast_cache=True,
+                frequency_penalty=0.45, presence_penalty=0.20, penalty_window=32,
+            )
+            g_slow = m_mh.generate(
+                prompt, max_new_tokens=20, eos_id=-1, use_fast_cache=False,
+                frequency_penalty=0.45, presence_penalty=0.20, penalty_window=32,
+            )
+            self.assertEqual(g_fast, g_slow)
+
+            m_mh.production_freeze(prune_dormant=True)
+            gf_fast = m_mh.generate(
+                prompt, max_new_tokens=16, eos_id=-1, use_fast_cache=True,
+                frequency_penalty=0.45, presence_penalty=0.20, penalty_window=32,
+            )
+            gf_slow = m_mh.generate(
+                prompt, max_new_tokens=16, eos_id=-1, use_fast_cache=False,
+                frequency_penalty=0.45, presence_penalty=0.20, penalty_window=32,
+            )
+            self.assertEqual(gf_fast, gf_slow)
+
+        # 3. Verify windowed repetition penalty explicitly penalizes recent tokens
+        raw_logits = torch.zeros(256, dtype=torch.float32)
+        pen_logits = m_mh._apply_repetition_penalties_logits(
+            raw_logits.clone(), [5, 7, 5, 9, 5], frequency_penalty=0.5, presence_penalty=0.25, penalty_window=4
+        )
+        # Trailing window of 4 is [7, 5, 9, 5] -> tok 5 appears twice (0.25 + 2*0.5 = 1.25), tok 7 once (0.75)
+        self.assertAlmostEqual(float(pen_logits[5].item()), -1.25, places=5)
+        self.assertAlmostEqual(float(pen_logits[7].item()), -0.75, places=5)
+        self.assertAlmostEqual(float(pen_logits[42].item()), 0.0, places=5)
+
+        # 4. Compare v4.1 (H=8 + Early Neurogenesis Cutoff) vs v4.0 (H=1 + no cutoff) on TinyStories
+        corpus = build_english_tinystories_corpus(target_min_tokens=7000, train_ratio=0.88, seed=11)
+        all_stories = corpus["train_stories"] + corpus["val_stories"]
+        tok = EnglishSubwordTokenizer(max_vocab_size=512).fit(all_stories, pad_to_max_vocab=True)
+        pad_id = tok.pad_id
+        train_batches, train_seqs, _ = build_minibatch_tensors(corpus["train_stories"], tok, seq_len=32, batch_size=24)
+        val_batches, _, _ = build_minibatch_tensors(corpus["val_stories"], tok, seq_len=32, batch_size=24)
+
+        common = dict(
+            vocab_size=tok.vocab_size, num_layers=4, d_init=64, d_max=128, delta_d=16,
+            block_size=16, top_k_blocks=2, max_seq_len=48, attn_top_k=8,
+            salient_anchor_slots=2, dtype="float32", kahan_mode="off", device="cpu", seed=42,
+        )
+        m_v40 = SSENNProductionModel(SSENNConfig(num_attn_heads=1, stop_neurogenesis_last_epoch=False, **common))
+        m_v41 = SSENNProductionModel(SSENNConfig(num_attn_heads=8, stop_neurogenesis_last_epoch=True, **common))
+
+        epochs = 4
+        for m in (m_v40, m_v41):
+            m.set_training_horizon(epochs)
+            m.calibrate_salience_from_tokens(train_seqs, pad_id=pad_id, bos_id=tok.bos_id, eos_id=tok.eos_id)
+
+        v41_growth_epochs: list[int] = []
+        for ep in range(1, epochs + 1):
+            for m in (m_v40, m_v41):
+                losses = [m.train_minibatch(xb, yb, pad_id=pad_id)["ce_loss"] for xb, yb in train_batches]
+                g = m.end_epoch(epoch=ep, mean_ce_loss=sum(losses) / max(len(losses), 1))
+                if m is m_v41 and g["grew"]:
+                    v41_growth_epochs.append(ep)
+
+        self.assertTrue(all(ep < epochs for ep in v41_growth_epochs), f"Last epoch grew unexpectedly: {v41_growth_epochs}")
+
+        m_v40.production_freeze(prune_dormant=True)
+        m_v41.production_freeze(prune_dormant=True)
+        ev40 = evaluate_batches(m_v40, val_batches, pad_id=pad_id)
+        ev41 = evaluate_batches(m_v41, val_batches, pad_id=pad_id)
+        self.assertLess(ev41["ppl"], ev40["ppl"], f"v4.1 PPL {ev41['ppl']:.2f} did not beat v4.0 {ev40['ppl']:.2f}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

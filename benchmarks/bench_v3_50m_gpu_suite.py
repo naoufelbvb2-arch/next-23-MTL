@@ -221,8 +221,11 @@ def run_suite(args: argparse.Namespace) -> dict:
 
     device, dtype, kahan_mode, gpu_name = _resolve_device_and_dtype(args.device, args.dtype)
     foundation_mode = bool(getattr(args, "foundation_v4", False))
+    v3_leg = bool(getattr(args, "v3_legacy", False))
+    req_heads = getattr(args, "num_attn_heads", None)
+    eff_num_heads = int(req_heads) if req_heads is not None else (8 if (foundation_mode and not v3_leg) else 1)
     suite_title = (
-        "SS-ENN v4.0 SCALE-50M UNIFIED FOUNDATION PPL SUITE (Zero-Autograd, sleep_every_epochs=0)"
+        f"SS-ENN v4.1 SCALE-50M UNIFIED FOUNDATION PPL SUITE (Heads={eff_num_heads}, sleep=0)"
         if foundation_mode
         else "SS-ENN v3.1.0 SCIENTIFIC GPU BENCHMARK SUITE (Zero-Autograd 6-Experiment Audit)"
     )
@@ -242,9 +245,11 @@ def run_suite(args: argparse.Namespace) -> dict:
                 mirrored_dfa=False,
                 dfa_mirror_blend=0.0,
                 impulse_schedule=False,
+                num_attn_heads=1,
+                stop_neurogenesis_last_epoch=False,
             )
-            if getattr(args, "v3_legacy", False)
-            else {}
+            if v3_leg
+            else dict(num_attn_heads=eff_num_heads)
         )
         if args.smoke_test:
             tmp_root = pathlib.Path(temp_ctx.name)
@@ -663,8 +668,17 @@ def run_suite(args: argparse.Namespace) -> dict:
                 f"O(T^2) {slow_tok_s:8.1f} tok/s ({speedup_x:.2f}x speedup) | Parity: {match_pct:.2f}%"
             )
 
+        freq_pen = float(getattr(args, "frequency_penalty", 0.35)) if foundation_mode else 0.0
+        pres_pen = float(getattr(args, "presence_penalty", 0.15)) if foundation_mode else 0.0
+        pen_win = int(getattr(args, "penalty_window", 64))
         sample_gen_ids = trainer.model.generate(
-            prompt_ids, max_new_tokens=48 if foundation_mode else 32, eos_id=tok.eos_id, use_fast_cache=True
+            prompt_ids,
+            max_new_tokens=48 if foundation_mode else 32,
+            eos_id=tok.eos_id,
+            use_fast_cache=True,
+            frequency_penalty=freq_pen,
+            presence_penalty=pres_pen,
+            penalty_window=pen_win,
         )
         sample_decoded = tok.decode(sample_gen_ids, skip_special_tokens=True)
         foundation_prompts = [
@@ -676,7 +690,15 @@ def run_suite(args: argparse.Namespace) -> dict:
         if foundation_mode:
             for fp_prompt in foundation_prompts:
                 fp_ids = tok.encode(fp_prompt, add_bos=True, add_eos=False)
-                fp_out = trainer.model.generate(fp_ids, max_new_tokens=48, eos_id=tok.eos_id, use_fast_cache=True)
+                fp_out = trainer.model.generate(
+                    fp_ids,
+                    max_new_tokens=48,
+                    eos_id=tok.eos_id,
+                    use_fast_cache=True,
+                    frequency_penalty=freq_pen,
+                    presence_penalty=pres_pen,
+                    penalty_window=pen_win,
+                )
                 foundation_samples.append({
                     "prompt": fp_prompt,
                     "generated": tok.decode(fp_out, skip_special_tokens=True),
@@ -724,8 +746,8 @@ def run_suite(args: argparse.Namespace) -> dict:
         if foundation_mode:
             exp3_meta = results["experiment_3_sleep_continual"]
             md_lines = [
-                "# SS-ENN v4.0 Scale-50M Unified Foundation Training Report",
-                f"- **Accelerator:** `{gpu_name}` (`device={device}`, `dtype={dtype}`, `kahan_mode={kahan_mode}`)",
+                f"# SS-ENN v4.1 Scale-50M Unified Foundation Training Report (Heads={eff_num_heads})",
+                f"- **Accelerator:** `{gpu_name}` (`device={device}`, `dtype={dtype}`, `kahan_mode={kahan_mode}`, `num_attn_heads={eff_num_heads}`)",
                 f"- **AST Zero-Autograd:** `PASS ({file_cnt} files)`",
                 f"- **Model Params:** `Train {exp1['max_train_params']:,}` | `Deployed W0 {exp1['deployed_w0_params']:,}` | `Active/Tok {exp1['active_params_per_token']:,}` -> `{exp4['after_params']:,}` pruned W0",
                 "",
@@ -733,7 +755,7 @@ def run_suite(args: argparse.Namespace) -> dict:
                 "| :--- | :--- | :--- |",
                 f"| **1. Audit & MMap** | Live Buffers / Stream Speed | `{exp1['actual_live_buffer_params']:,}` exact match / `{exp1['mmap_stream_tok_s']:,.0f} tok/s` |",
                 f"| **2. Foundation P1** | GPU Speed / VRAM Peak / Val Acc & PPL | `{exp2['tok_s']:,.1f} tok/s` / `{exp2['vram_peak_mb']:.1f} MB` / `{exp2['val_acc_pct']:.2f}% (PPL {exp2['val_ppl']:.2f})` |",
-                f"| **3. v4.0 vs v3.1.3** | Unified `sleep=0` PPL Delta | `{exp3_meta['v3_1_3_baseline_ppl']:.2f} -> {exp3_meta['v4_val_ppl']:.2f}` (`{exp3_meta['ppl_delta_vs_v3_1_3_pct']:+.1f}%`) |",
+                f"| **3. v4.1 vs Baseline** | Unified `sleep=0` PPL Delta | `{exp3_meta['v3_1_3_baseline_ppl']:.2f} -> {exp3_meta['v4_val_ppl']:.2f}` (`{exp3_meta['ppl_delta_vs_v3_1_3_pct']:+.1f}%`) |",
                 f"| **4. Frozen W0** | Memory Saved / Non-Destructive Diff | `{exp4['before_live_mb']:.2f} -> {exp4['after_frozen_mb']:.2f} MB (-{exp4['memory_saved_pct']:.1f}%)` / `{exp4['nondestructive_export_diff']:.2e}` |",
                 f"| **5. O(1) vs O(T^2)** | Max Horizon Speedup & Match | `{exp5_horizons[-1]['speedup_x']:.2f}x ({exp5_horizons[-1]['o1_tok_s']:.1f} tok/s)` / `{exp5_horizons[-1]['sequence_match_pct']:.2f}%` |",
             ]
@@ -773,8 +795,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=64, help="Training/validation minibatch size.")
     p.add_argument("--ckpt-every-steps", type=int, default=100, help="Periodic checkpoint interval in steps.")
     p.add_argument("--max-steps-per-phase", type=int, default=None, help="Optional step cap per phase for quick runs.")
-    p.add_argument("--foundation-v4", action="store_true", help="Run unified v4.0 foundation pretraining (--sleep-every-epochs 0) comparing PPL vs v3.1.3.")
-    p.add_argument("--v3-legacy", action="store_true", help="Disable v4.0 upgrades (legacy v3 baseline).")
+    p.add_argument("--foundation-v4", action="store_true", help="Run unified v4.x foundation pretraining (--sleep-every-epochs 0) comparing PPL vs baseline.")
+    p.add_argument("--num-attn-heads", type=int, default=None, help="Multi-head sparse attention heads (default: 8 in --foundation-v4, else 1).")
+    p.add_argument("--frequency-penalty", type=float, default=0.35, help="Cumulative frequency penalty for --foundation-v4 generation samples.")
+    p.add_argument("--presence-penalty", type=float, default=0.15, help="Token presence penalty for --foundation-v4 generation samples.")
+    p.add_argument("--penalty-window", type=int, default=64, help="Trailing penalty window size.")
+    p.add_argument("--v3-legacy", action="store_true", help="Disable v4.x upgrades (legacy v3 baseline).")
     p.add_argument("--foundation-baseline-ppl", type=float, default=79.20, help="Reference v3.1.3 Phase 1 Val PPL baseline for comparison.")
     p.add_argument("--smoke-test", action="store_true", help="Run fast self-contained CPU smoke audit.")
     return p.parse_args(argv)
